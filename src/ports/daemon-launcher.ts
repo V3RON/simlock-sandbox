@@ -84,6 +84,25 @@ export interface NodeDaemonLauncherOptions {
   readonly simlockHome: string;
 }
 
+function hasCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+async function ensureDirectory(parent: string): Promise<void> {
+  try {
+    await mkdir(parent, { recursive: true });
+  } catch (error: unknown) {
+    // why: Node on Windows rejects a recursive `mkdir` of a drive root with EPERM though it exists, so an existing parent is not a failure.
+    const exists =
+      hasCode(error, "EPERM") &&
+      (await stat(parent).then(
+        (s) => s.isDirectory(),
+        () => false,
+      ));
+    if (!exists) throw error;
+  }
+}
+
 /**
  * why: the log lives in the data directory, and on a fresh machine this launch is what first
  * creates it, so it and the data root above it (`SIMLOCK_HOME`) are made owner-only here
@@ -91,27 +110,11 @@ export interface NodeDaemonLauncherOptions {
  * import), their parents left to the default and an existing one left as it is. `chmod` because the umask can only take bits from `mkdir`'s mode.
  */
 async function createDataDirectory(directory: string): Promise<void> {
-  const parent = dirname(directory);
-  try {
-    await mkdir(parent, { recursive: true });
-  } catch (error: unknown) {
-    // why: Node on Windows rejects a recursive `mkdir` of a drive root with EPERM though it exists, so an existing parent is not a failure.
-    const isPermission =
-      typeof error === "object" && error !== null && "code" in error && error.code === "EPERM";
-    if (
-      !isPermission ||
-      !(await stat(parent).then(
-        (entry) => entry.isDirectory(),
-        () => false,
-      ))
-    )
-      throw error;
-  }
+  await ensureDirectory(dirname(directory));
   try {
     await mkdir(directory, { mode: 0o700 });
   } catch (error: unknown) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST")
-      return;
+    if (hasCode(error, "EEXIST")) return;
     throw error;
   }
   await chmod(directory, 0o700);
