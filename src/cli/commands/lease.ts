@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   awaitWithin,
   RELEASE_TIMEOUT_MS,
+  slimCategoriesOff,
   startLeaseRenewal,
   startReconnect,
   UNREACHABLE_GIVE_UP_MS,
@@ -20,6 +21,7 @@ import { checkedFarmOrigin, connectDaemonClient } from "../connect.js";
 import { commandArgs, requiredPositional, UsageError, withHelpHint, writeResult } from "../args.js";
 import { parseDuration } from "../duration.js";
 import { checkedRunId } from "./run-id.js";
+import { escapeControl } from "../escape.js";
 import { writeError } from "../errors.js";
 import { reconnectToFarm } from "../remote-reconnect.js";
 import { waitForTermination } from "../termination.js";
@@ -394,6 +396,12 @@ async function runLease(
     const result = { ...grant, role: client.role };
     if (values["export-env"] === true) writeExportEnv(environment, result);
     else writeResult((value) => environment.stdout.write(value), result);
+    const categoriesOff = await slimCategoriesOff(client, grant.device, environment.clock);
+    if (categoriesOff.length > 0) {
+      environment.stderr.write(
+        `${JSON.stringify({ notice: `slim: ${categoriesOff.map(escapeControl).join(", ")} off; use --except <name> or --mode full` })}\n`,
+      );
+    }
     if (termination === undefined) return 0;
     if (connectionLost) return ERROR_TABLE.DAEMON_CONNECTION_LOST.cliExitCode;
     const grantedLease = grant.lease;

@@ -98,11 +98,19 @@ export const SLIM_HINT_TIMEOUT_MS = 2_000;
  * `slimCategories` minus the categories the lease kept. Never throws; `[]` means no line.
  */
 export async function slimCategoriesOff(
-  _client: Pick<SimlockClient, "getCatalog">,
-  _device: { readonly mode?: string; readonly except?: readonly string[] },
-  _clock: Clock,
+  client: Pick<SimlockClient, "getCatalog">,
+  device: { readonly mode?: string | undefined; readonly except?: readonly string[] | undefined },
+  clock: Clock,
 ): Promise<readonly string[]> {
-  return [];
+  if (device.mode !== "slim") return [];
+  const catalog = await awaitWithin(
+    clock,
+    SLIM_HINT_TIMEOUT_MS,
+    client.getCatalog({ platform: "ios" }),
+    "the catalog read for the slim hint timed out",
+  );
+  const categories = catalog.platforms.find((entry) => entry.platform === "ios")?.slimCategories;
+  return (categories ?? []).filter((name) => !(device.except ?? []).includes(name));
 }
 
 /**
