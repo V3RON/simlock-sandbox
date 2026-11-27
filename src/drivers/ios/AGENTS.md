@@ -8,7 +8,7 @@ Flows: [device selection](../../../docs/internal/flows/device-selection.md), [dr
 The device set:
 
 - Under `drivers.ios.deviceSet: simlock`, never `simctl` without `--set`, except three unscoped calls: `findLegacy`, `destroyLegacy`, and the read-only `simctl list -j devices` of `listComponents`.
-- Under `default` (ADR 0048) the set is Xcode's own: never `--set`, no owned root, and never act on a device whose durable mark does not name this instance. `listManaged` lists only those, and `findLegacy` answers `undefined`.
+- Under `default` (ADR 0048) the set is Xcode's own: never `--set`, no owned root, and never act on a device whose durable mark does not name this instance. `listManaged` lists only those; `findLegacy` answers `undefined`.
 - `ios.simulator.headless: false` needs `default`: the `simlock` set has no DeviceHub, so iOS is refused (`invalid-device-set`). Simulators left in the set given up refuse iOS too (`device-set-changed`); that check reads files only.
 - The erasable mark is written before the durable one, never both at once. Under `default` a failed mark write deletes the new simulator first.
 
@@ -17,12 +17,11 @@ Resolve and boot:
 - A slim spec is returned only for a slim request the driver will slim. The registry alone records a device's mode.
 - `RuntimeMissingError` is only for what a download can fix: an OS outside the device type's range, an installed runtime not paired with the type, and anything below iOS 16 are refused instead.
 - A boot is `simctl rename` (prepare only: label, else stored name), `simctl boot`, `bootstatus -b`, then `listapps` until it succeeds, on one deadline: bootstatus can finish before the installer is ready.
-- Slim (ADR 0060), on `prepare` of a slim spec only: the managed labels are merged into the simulator's `disabled.plist` before the boot (other entries kept; a failed write is logged), and `launchctl print-disabled system` is read back after it. A label not as written is `full`; a failed readback is `slim`; both call `onSlimSkipped`, logged only. All as written and the write ok: `slim`, and `onSlimmed` is `device.slimmed`. Nothing written off and no kept category: `full`, no readback.
+- Slim (ADR 0060), on `prepare` of a slim spec only: the managed labels are merged into the simulator's `disabled.plist` before the boot (other entries kept; a failed write is logged), and `launchctl print-disabled system` is read back after it. A label not as written is `full`; a failed readback is `slim`; both call `onSlimSkipped` (logged only). All as written: `slim`, and `onSlimmed` is `device.slimmed`. Nothing written off and no kept category: `full`, no readback.
 - Named services (ADR 0083): `exclude` beats `include` beats a category; `simlock-managed.json` records the names, so one dropped from both is written back on. A baseline saved before it keeps a dropped name off; `include` it.
 - Slim `except` (ADR 0066): an excepted category's labels are written `false`; an unknown name is `BAD_REQUEST`; a kept label not read back throws `KeptCategoriesError`.
 - A recovery boot writes no slim overrides and reads nothing back. DeviceHub clipboard isolation is set, read back, before preparation and recovery boots (not `false`: refused); ready default-set simulators reboot under the claim before a grant.
 - `launchdOverridesRoot` is outside the device set: `destroy` and each seed deletion remove their folder after `simctl delete`.
-- After every boot and before the readback, `runAfterBoot` (`boot-courtesies.ts`) runs the volume step, then the window step.
 - Volume (`ios.simulator.audio: false`): apps play at volume 0. A baseline source is not silenced.
 - Window (`ios.simulator.headless: false`): DeviceHub is opened in the background and leaves started devices running when it quits. Only a non-zero exit of that open means it is missing: Simulator.app is then opened, detached. It overrides clipboard isolation.
 
@@ -35,7 +34,7 @@ Seeds (ADR 0061):
 - A settle (ADR 0090) swaps a ready quick seed for its idle copy; a simulator it cannot delete keeps a `making` row for the next start's sweep.
 - A `clone` or `create` waits `ios.simulator.createTimeoutMs`. At the limit it fails but `simctl` runs on: the UDID it later prints is deleted, the seed's deletion waits for it, and 5 silent minutes more kills and logs it.
 - A `making` row of another process is swept at the first `listSources`, with its throwaway; one of this process, once older than any make takes, at the next make of its kind, never a settle's (`settle_of`).
-- A seed `simctl delete` calls `Invalid device` is gone: its row is dropped. A ready seed whose UDID folder is not in the sources set this process uses is gone too (deleted by hand, or left in the other device set): the next provision of its kind drops its row, files rows and overrides folder with no `simctl` call and makes the seed again. `listSources` gives such a seed, or a baseline, a `staleReason` after the others, so `doctor` names it. `removeComponent` deletes the runtime's seeds first, then its settle rows.
+- A seed `simctl delete` calls `Invalid device`, or whose folder is not in the sources set, is gone: its row is dropped, with no `simctl` call for a missing folder, and its kind's next provision makes it again. `removeComponent` deletes the runtime's seeds first, then its settle rows.
 
 Physical, passthrough, screen:
 
@@ -59,7 +58,7 @@ Tunnels (`device-tcp.ts`):
 - **A cold slim lease takes a full cold boot;** MCP clients need a longer timeout.
 - **A screen stream can freeze after a reboot under its lease:** the capture checks the boot only at start; reopen the Screen tab.
 - **An iPhone's rotation has not run on hardware**; only a Duo's panel switch is proven.
-- **A foldable's stream follows SpringBoard's `DisplayContentMode` log** (ADR 0075): another wording leaves it, and taps, on the panel picked at open; a tap between a fold and the new size lands on the old panel.
+- **A foldable's stream follows SpringBoard's `DisplayContentMode` log** (ADR 0075): another wording leaves stream and taps on the panel picked at open; a tap between a fold and the new size hits the old panel.
 - **A capture killed by SIGKILL cannot stop its CoreDevice stream**, and neither can a stop while `startMediaStream` runs past its limit.
 - **A new Xcode major turns iPhone streams off** until `vendor/screen-capture/Stubs/` is checked against it and the pin moves.
 - **Untested on an iPhone:** DeviceHub or Xcode showing the same device during a stream; the holder's `devicectl` commands during one; `stop()` ending the stream.
