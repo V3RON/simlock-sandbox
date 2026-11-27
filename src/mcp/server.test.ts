@@ -638,6 +638,7 @@ describe("MCP server: lease_simulator on a slim iOS device", () => {
       name: string;
       grant: LeaseGrant;
       input?: Record<string, unknown>;
+      catalog?: () => Promise<CatalogGetOutput>;
       hint: string | undefined;
     }[] = [
       {
@@ -652,19 +653,46 @@ describe("MCP server: lease_simulator on a slim iOS device", () => {
         hint: hintFor(CATEGORIES.filter((name) => name !== "store")),
       },
       { name: "full", grant: sampleGrant(), hint: undefined },
+      {
+        name: "Android",
+        grant: { ...sampleGrant(), device: androidDevice() },
+        input: { platform: "android", model: "Pixel 9" },
+        hint: undefined,
+      },
+      {
+        name: "catalog read rejects",
+        grant: slimGrant(),
+        catalog: () => Promise.reject(new Error("catalog unavailable")),
+        hint: undefined,
+      },
+      {
+        name: "catalog read unanswered past 2 s",
+        grant: slimGrant(),
+        catalog: () => new Promise<CatalogGetOutput>(() => {}),
+        hint: undefined,
+      },
     ];
     for (const row of rows) {
       const client = new FakeSimlockClient();
       client.requestLeaseImpl = () => Promise.resolve(row.grant);
-      client.getCatalogImpl = () => Promise.resolve(catalogOf(CATEGORIES));
-      const { mcpClient, close } = await connectedServer(client);
+      client.getCatalogImpl = row.catalog ?? (() => Promise.resolve(catalogOf(CATEGORIES)));
+      const { clock, mcpClient, close } = await connectedServer(client);
       try {
-        const lease = await call(mcpClient, "lease_simulator", {
+        let settled = false;
+        const pending = call(mcpClient, "lease_simulator", {
           model: "iPhone 17 Pro",
           platform: "ios",
           ...row.input,
+        }).finally(() => {
+          settled = true;
         });
-        expect(lease.isError, row.name).not.toBe(true);
+        for (let tick = 0; tick < 100 && !settled; tick += 1) {
+          clock.advance(100);
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        expect(settled, `${row.name}: the call had not settled by 10 s`).toBe(true);
+        const lease = await pending;
+        expect(lease.isError ? text(lease) : "", row.name).toBe("");
         const { hint, ...rest } = leaseSimulatorOutputSchema.parse(lease.structuredContent);
         expect(hint, row.name).toBe(row.hint);
         expect(rest, row.name).toEqual(row.grant);
@@ -675,6 +703,11 @@ describe("MCP server: lease_simulator on a slim iOS device", () => {
     }
   });
 });
+
+function androidDevice(): LeaseGrant["device"] {
+  const { device } = sampleGrant();
+  return { ...device, spec: { ...device.spec, platform: "android" } };
+}
 
 function slimGrant(except?: string[]): LeaseGrant {
   const grant = sampleGrant();
