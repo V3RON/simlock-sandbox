@@ -43,14 +43,14 @@ export const leaseSimulatorInputSchema = leaseRequestFields.omit({
 export const leaseSimulatorCheckedInputSchema =
   leaseSimulatorInputSchema.superRefine(refuseModelWithClass());
 
+/** why: the longest `hint` the output carries; the session leaves out a longer line. */
+export const HINT_MAX_LENGTH = 1024;
+
 /**
  * why: `lease.request`'s output -- the device/lease/timing grant -- plus `hint`, this tool's own
  * word on a slim lease. It rides in the structured result because Codex hands only that to the
  * model; the daemon contract carries no such field.
  */
-/** why: the longest `hint` the output carries; the session leaves out a longer line. */
-export const HINT_MAX_LENGTH = 1024;
-
 export const leaseSimulatorOutputSchema = OPERATIONS["lease.request"].output.extend({
   hint: z.string().max(HINT_MAX_LENGTH).optional(),
 });

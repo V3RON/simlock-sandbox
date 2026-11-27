@@ -201,6 +201,9 @@ async function runLease(
     const offConnectionLost = target.onConnectionLost((error) => {
       // why: before the grant the request's own rejection starts the reconnect, which sends it again.
       if (farmOrigin !== undefined && ourLeaseId === undefined) return;
+      // why: a --detach command holds nothing after the grant, and only the slim hint read is left to
+      // wait on: a drop there loses nothing, so it ends neither with an error line nor a new exit code.
+      if (detached && ourLeaseId !== undefined) return;
       if (onDropped === undefined) {
         endHoldingLease("DAEMON_CONNECTION_LOST", "lost the daemon connection");
       } else if (error.code === "UNAUTHENTICATED") {

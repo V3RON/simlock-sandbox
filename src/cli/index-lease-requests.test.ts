@@ -6,7 +6,7 @@ import {
   MemoryIpcTransport,
   FakeSystemStats,
 } from "../ports/index.js";
-import { waitingRequestSchema } from "../contract/index.js";
+import { SimlockError, waitingRequestSchema, type AnySimlockError } from "../contract/index.js";
 import type { CatalogGetOutput, SimlockAdminClient } from "../admin/index.js";
 import type { DeviceRecoveredPush, DeviceUnhealthyPush } from "../simlock-client/client.js";
 import { runCli, type CliEnvironment } from "./index.js";
@@ -1070,6 +1070,7 @@ describe("simlock lease: a slim iOS lease says which categories are off", () => 
       catalog?: () => Promise<CatalogGetOutput>;
       expected: string;
       catalogCalls?: number;
+      dropDuringRead?: boolean;
     };
     const all = (): Promise<CatalogGetOutput> => Promise.resolve(catalogOf(CATEGORIES));
     const rows: Row[] = [
@@ -1134,14 +1135,31 @@ describe("simlock lease: a slim iOS lease says which categories are off", () => 
         catalog: () => new Promise<CatalogGetOutput>(() => {}),
         expected: "",
       },
+      {
+        name: "connection lost during the unanswered catalog read",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => new Promise<CatalogGetOutput>(() => {}),
+        expected: "",
+        dropDuringRead: true,
+      },
     ];
     for (const row of rows) {
       const output = outputCapture();
       let catalogCalls = 0;
+      let connectionLost: ((error: AnySimlockError) => void) | undefined;
       const client = fakeClient({
         requestLease: () => Promise.resolve(row.grant),
+        onConnectionLost: (listener) => {
+          connectionLost = listener;
+          return () => {};
+        },
         getCatalog: () => {
           catalogCalls += 1;
+          if (row.dropDuringRead === true) {
+            connectionLost?.(
+              new SimlockError("DAEMON_CONNECTION_LOST", "transport", "socket closed", {}),
+            );
+          }
           return (row.catalog ?? all)();
         },
       });
@@ -1161,6 +1179,11 @@ describe("simlock lease: a slim iOS lease says which categories are off", () => 
       expect(settled, `${row.name}: lease had not settled by 5 s`).toBe(true);
       expect(await exitCode, row.name).toBe(0);
       expect(slimLines(output.stderr), row.name).toBe(row.expected);
+      if (row.dropDuringRead === true) {
+        expect(output.stderr, `${row.name}: a --detach lease holds nothing to lose`).not.toContain(
+          "DAEMON_CONNECTION_LOST",
+        );
+      }
       expect(JSON.parse(output.stdout).lease.id, row.name).toBe("lse_1");
       if (row.catalogCalls !== undefined) expect(catalogCalls, row.name).toBe(row.catalogCalls);
     }
