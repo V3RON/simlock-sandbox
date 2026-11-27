@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { DriverCrashError } from "../../core/index.js";
 import { FakeClock, MemoryFilesystem, ScriptedProcessRunner } from "../../ports/index.js";
 import { plantBytes, readBytes } from "./testing.js";
-import { deviceRoot, driverData, plantManagedDevice, simctl } from "./test-slim.js";
+import { deviceRoot, driverData, inPosixForm, plantManagedDevice, simctl } from "./test-slim.js";
 import {
   RecordingLogger,
   createDriver,
@@ -280,6 +280,115 @@ describe("IosSimctlDriver copy swap", () => {
     expect(logger.warnings).toEqual([
       expect.stringMatching(new RegExp(`${copyUdid}.*Unable to delete device`)),
     ]);
+  });
+
+  it("a copy swaps the files and links its seed recorded even when the seed is deleted between its clone and its swap, by destroySource or by a stale remake", async () => {
+    class HeldBeforeSwap extends MemoryFilesystem {
+      reached!: () => void;
+      readonly arrived = new Promise<void>((resolve) => {
+        this.reached = resolve;
+      });
+      release!: () => void;
+      readonly #released = new Promise<void>((resolve) => {
+        this.release = resolve;
+      });
+
+      override async exists(path: string): Promise<boolean> {
+        if (inPosixForm(path) === `${deviceRoot}/${copyUdid}/data/var/db/lsd`) {
+          this.reached();
+          await this.#released;
+        }
+        return super.exists(path);
+      }
+    }
+    const newBuild = JSON.stringify({
+      ...(JSON.parse(listFixture) as object),
+      runtimes: (JSON.parse(listFixture) as { runtimes: { identifier: string }[] }).runtimes.map(
+        (runtime) =>
+          runtime.identifier === driverData.runtimeId
+            ? { ...runtime, buildversion: "23F2" }
+            : runtime,
+      ),
+    });
+    const seedDeletion = [
+      { match: sourcesSimctl("shutdown", seedUdid) },
+      { match: sourcesSimctl("delete", seedUdid) },
+    ];
+    const cases = [
+      {
+        label: "destroySource",
+        steps: [
+          { match: listInvocation, result: { code: 0, stderr: "", stdout: listFixture } },
+          ...seedDeletion,
+        ],
+        remove: async (driver: Awaited<ReturnType<typeof createDriver>>) => {
+          const [listed] = await driver.listSources();
+          await driver.destroySource(listed?.id ?? "");
+        },
+      },
+      {
+        label: "a provision that remakes the seed after a runtime build change",
+        steps: [
+          { match: listInvocation, result: { code: 0, stderr: "", stdout: newBuild } },
+          ...seedDeletion,
+          {
+            match: simctl(
+              "create",
+              "simlock-seed-device-1",
+              driverData.deviceTypeId,
+              driverData.runtimeId,
+            ),
+            result: { code: 1, stderr: "stopped by the test", stdout: "" },
+          },
+        ],
+        remove: async (driver: Awaited<ReturnType<typeof createDriver>>) => {
+          await driver.resolveSpec({ model: "iPhone 16", osVersion: "26.5", platform: "ios" });
+          await driver.provision(spec).catch(() => undefined);
+        },
+      },
+    ];
+    const linkTarget = (udid: string): string => `/Users/x/Library/Logs/CoreSimulator/${udid}`;
+    for (const attempt of cases) {
+      const database = await seededDatabase({
+        files: [
+          { kind: "file", relativePath: "data/kept.plist" },
+          { kind: "link", relativePath: "data/Logs" },
+        ],
+        lineage: [lineageUdid],
+        runtimeBuild: "23F1",
+      });
+      const runner = new ScriptedProcessRunner([
+        { match: listInvocation, result: { code: 0, stderr: "", stdout: listFixture } },
+        {
+          match: sourcesSimctl("clone", seedUdid, driverData.name, deviceRoot),
+          result: { code: 0, stderr: "", stdout: `${copyUdid}\n` },
+        },
+        ...attempt.steps,
+      ]);
+      const filesystem = new HeldBeforeSwap();
+      await plantManagedDevice(filesystem);
+      const kept = `${deviceRoot}/${copyUdid}/data/kept.plist`;
+      await plantBytes(filesystem, kept, Buffer.from(`/Devices/${lineageUdid}/data`));
+      filesystem.defineSymlink(`${deviceRoot}/${copyUdid}/data/Logs`, linkTarget(lineageUdid));
+      const driver = await createDriver(runner, new FakeClock(), filesystem, database);
+
+      const provision = driver.provision(spec);
+      await filesystem.arrived;
+      await attempt.remove(driver);
+      const seedDeleted = runner.calls.some((call) =>
+        call.args.join(" ").endsWith(`delete ${seedUdid}`),
+      );
+      filesystem.release();
+      await provision;
+
+      expect(seedDeleted, attempt.label).toBe(true);
+      expect((await readBytes(filesystem, kept)).toString(), attempt.label).toBe(
+        `/Devices/${copyUdid}/data`,
+      );
+      expect(await filesystem.readlink(`${deviceRoot}/${copyUdid}/data/Logs`), attempt.label).toBe(
+        linkTarget(copyUdid),
+      );
+    }
   });
 
   it("a LaunchServices database the seed recorded is dropped from the copy and is not swapped", async () => {
