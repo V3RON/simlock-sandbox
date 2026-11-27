@@ -7,6 +7,7 @@ import {
   FakeSystemStats,
 } from "../ports/index.js";
 import { waitingRequestSchema } from "../contract/index.js";
+import type { CatalogGetOutput, SimlockAdminClient } from "../admin/index.js";
 import type { DeviceRecoveredPush, DeviceUnhealthyPush } from "../simlock-client/client.js";
 import { runCli, type CliEnvironment } from "./index.js";
 import { buildCliEnvironment } from "./environment.js";
@@ -984,5 +985,113 @@ describe("simlock lease: a request names a model, a class, or nothing", () => {
     expect(output.stdout).toBe(
       "Request req_1: a, ios class phone >=18 <26, queued at 1, waiting 0s\n",
     );
+  });
+});
+
+describe("simlock lease: a slim iOS lease says which categories are off", () => {
+  const CATEGORIES = [
+    "widgets",
+    "siri",
+    "search",
+    "icloud",
+    "store",
+    "pim",
+    "web",
+    "family",
+    "health",
+    "photos",
+    "apps",
+    "messaging",
+    "connectivity",
+    "telemetry",
+    "mdm",
+    "other",
+  ];
+  const grantFor = (
+    device: { mode: "full" | "slim"; except?: string[] },
+    platform: "ios" | "android" = "ios",
+  ): Awaited<ReturnType<SimlockAdminClient["requestLease"]>> => ({
+    device: {
+      physical: false,
+      driverDeviceId: "dev_1",
+      id: "dev_1",
+      ...device,
+      spec: { physical: false, model: "iPhone 17", osVersion: "26.5", platform },
+    },
+    environment: {},
+    lease: {
+      deviceId: "dev_1",
+      grantedAt: 0,
+      id: "lse_1",
+      lastRenewedAt: 0,
+      idChosenByRequester: false,
+      ownerId: "test-requester",
+      requesterId: "test-requester",
+      ttlDeadline: 60_000,
+      ttlMs: 60_000,
+    },
+    timing: {
+      estimatedBootMs: 0,
+      estimatedProvisionMs: 0,
+      estimatedReadyMs: 0,
+      estimatedReclaimMs: 0,
+    },
+  });
+  const catalogOf = (slimCategories: string[] | undefined): CatalogGetOutput => ({
+    platforms: [
+      {
+        platform: "ios",
+        models: [],
+        runtimes: [],
+        modelRuntimes: {},
+        modelAliases: {},
+        modelClasses: {},
+        classDefaults: {},
+        ...(slimCategories !== undefined && { slimCategories }),
+      },
+    ],
+  });
+  const slimLines = (stderr: string): string =>
+    stderr
+      .split("\n")
+      .filter((line) => line.startsWith('{"notice":"slim:'))
+      .map((line) => `${line}\n`)
+      .join("");
+  const names = (list: readonly string[]): string => list.join(", ");
+  const hintLine = (list: readonly string[]): string =>
+    `${JSON.stringify({ notice: `slim: ${names(list)} off; use --except <name> or --mode full` })}\n`;
+
+  it("prints one stderr notice naming the categories the slim device has off, after the grant on stdout", async () => {
+    const rows: {
+      args: string[];
+      grant: ReturnType<typeof grantFor>;
+      expected: string;
+    }[] = [
+      {
+        args: ["--mode", "slim"],
+        grant: grantFor({ mode: "slim" }),
+        expected: hintLine(CATEGORIES),
+      },
+      {
+        args: ["--mode", "slim", "--except", "siri"],
+        grant: grantFor({ mode: "slim", except: ["siri"] }),
+        expected: hintLine(CATEGORIES.filter((name) => name !== "siri")),
+      },
+      { args: ["--mode", "full"], grant: grantFor({ mode: "full" }), expected: "" },
+    ];
+    for (const row of rows) {
+      const output = outputCapture();
+      const client = fakeClient({
+        requestLease: () => Promise.resolve(row.grant),
+        getCatalog: () => Promise.resolve(catalogOf(CATEGORIES)),
+      });
+      const exitCode = await runCli(
+        ["lease", "--platform", "ios", ...row.args, "--detach"],
+        output.environmentWith({ connectAdmin: async () => client }),
+      );
+      expect(exitCode, row.args.join(" ")).toBe(0);
+      expect(slimLines(output.stderr), row.args.join(" ")).toBe(row.expected);
+      expect(JSON.parse(output.stdout).device.mode, row.args.join(" ")).toBe(row.grant.device.mode);
+    }
   });
 });
