@@ -151,6 +151,8 @@ Use `simlock nuke` when leases or devices are stuck and you want to start over o
 
 With `--delete-devices` it also deletes every simulator and emulator Simlock created, and every baseline. It never touches devices Simlock did not create, and never deletes or unenrols a physical device.
 
+Add `--platform ios` or `--platform android` to reset one platform only. The other platform's held leases, devices, seeds, baselines and learned kinds stay in place. While the nuke runs, every waiting request of both platforms is still cancelled and refused with `killed`, and releases and renewals of both wait; the agent asks again afterwards.
+
 <Aside type="danger" title="Nuke ends every lease on this machine">
 Every agent holding a device here loses it at once, mid-task. With `--delete-devices`, every device Simlock created is deleted with its apps and data, and every baseline with it. There is no undo. Tell the agents using this machine first.
 </Aside>
@@ -158,6 +160,8 @@ Every agent holding a device here loses it at once, mid-task. With `--delete-dev
 ```sh
 simlock nuke --delete-devices
 ```
+
+With `--platform ios`, the question names the platform: `Nuke Simlock-managed ios devices? [y/N]`.
 
 ```text
 Nuke Simlock-managed devices? [y/N] y
