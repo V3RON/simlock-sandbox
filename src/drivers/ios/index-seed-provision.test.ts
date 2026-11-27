@@ -23,6 +23,7 @@ import {
   simctl,
   instanceId,
   unownedSourcesSet,
+  overridesFolder,
 } from "./test-slim.js";
 import {
   UNSCOPED_LEGACY_CALLS,
@@ -177,6 +178,8 @@ describe("IosSimctlDriver", () => {
       );
       const driver = await createDriver(runner, new FakeClock(), filesystem, database);
       if (gone === "seed") await filesystem.rm(`${sourcesSetPath}/${goneUdid}`);
+      const goneOverrides = overridesFolder(goneUdid);
+      await filesystem.mkdirp(goneOverrides);
       if (gone === "set") await filesystem.rm(sourcesSetPath);
 
       const grants = await Promise.all(
@@ -192,6 +195,7 @@ describe("IosSimctlDriver", () => {
         runner.calls.filter((call) => call.args.includes(goneUdid)),
         name,
       ).toEqual([]);
+      expect(await filesystem.exists(goneOverrides), name).toBe(gone === undefined);
       expect(database.prepare("SELECT state, udid FROM ios_source_data").all(), name).toEqual([
         { state: "ready", udid: seedUdid },
       ]);

@@ -778,6 +778,20 @@ describe("Dispatcher: nuke.run", () => {
     expect(registry.snapshot.leases).toHaveLength(0);
   });
 
+  it("rejects a platform that is neither ios nor android with BAD_REQUEST, releasing nothing", async () => {
+    const { dispatcher, registry } = await buildDispatcher({ includeNuke: true });
+    await dispatcher.dispatch(
+      "lease.request",
+      { model: "iPhone 17 Pro", osVersion: "26.5", platform: "ios" },
+      session({ principal: "tok_owner" }),
+    );
+
+    await expect(
+      dispatcher.dispatch("nuke.run", { platform: "windows" } as never, session({ role: "admin" })),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(registry.snapshot.leases).toHaveLength(1);
+  });
+
   it("throws NukeUnavailableError when the dispatcher was built with no Nuke wired -- an admin cannot bypass this", async () => {
     const { dispatcher } = await buildDispatcher();
     await expect(

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Nuke, type Platform } from "../core/index.js";
 import { FakeDriver } from "../core/testing.js";
 import { FakeClock } from "../ports/index.js";
-import { androidRequest, createHarness, flush, request } from "./test-create-leasing.js";
+import { androidRequest, createHarness, flush, request, seedReady } from "./test-create-leasing.js";
 
 describe("createLeasing: a platform nuke", () => {
   async function heldOnBothPlatforms() {
@@ -37,9 +37,29 @@ describe("createLeasing: a platform nuke", () => {
       ["ios", "android"],
       ["android", "ios"],
     ] as const) {
-      const { grants, harness, nuke } = await heldOnBothPlatforms();
+      const { android, grants, harness, ios } = await heldOnBothPlatforms();
+      const idle = await seedReady(
+        harness,
+        { ...(other === "ios" ? request : androidRequest), physical: false },
+        "full",
+        other === "ios" ? ios : android,
+      );
 
-      const report = await nuke(target);
+      // why: the other platform's idle device is deleted by another path while the nuke runs, so it is left out of the report.
+      const report = await new Nuke({
+        executor: {
+          nuke: async (deleteDevices, platform) => {
+            const result = await harness.engine.nuke(deleteDevices, platform);
+            expect(
+              harness.registry.snapshot.devices.find((device) => device.id === idle.id)?.state,
+              target,
+            ).toBe("ready");
+            await harness.registry.markDeviceMissing(idle.id, "test");
+            return result;
+          },
+        },
+        registry: harness.registry,
+      }).run({ deleteDevices: true, platform: target });
 
       expect(report.releasedLeaseIds, target).toEqual([grants[target].lease.id]);
       expect(report.deletedDevices, target).toEqual([grants[target].device.id]);
