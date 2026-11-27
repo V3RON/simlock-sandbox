@@ -240,9 +240,9 @@ export async function createDriver(
     processRunner: runner,
     simlockHome: "/home/.simlock",
   });
-  // why: a ready seed row names a simulator in the sources set, and a lease checks that its folder is there; planted after the driver checked the device root, which holds the sources set.
+  // why: a ready source row names a simulator in the sources set, and a lease checks that its folder is there; planted after the driver checked the device root, which holds the sources set.
   for (const row of sourceDatabase
-    .prepare("SELECT udid FROM ios_source_data WHERE kind = 'seed' AND state = 'ready'")
+    .prepare("SELECT udid FROM ios_source_data WHERE state = 'ready'")
     .all()) {
     await plantSeedClone(filesystem, sourcesSetPath, String(row.udid));
   }
