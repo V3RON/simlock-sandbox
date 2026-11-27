@@ -294,7 +294,7 @@ describe("IosSimctlDriver copy swap", () => {
       });
 
       override async exists(path: string): Promise<boolean> {
-        if (inPosixForm(path) === `${deviceRoot}/${copyUdid}/data/var/db/lsd`) {
+        if (inPosixForm(path) === inPosixForm(`${deviceRoot}/${copyUdid}/data/var/db/lsd`)) {
           this.reached();
           await this.#released;
         }
