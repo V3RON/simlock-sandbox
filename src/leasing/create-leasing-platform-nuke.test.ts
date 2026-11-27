@@ -148,4 +148,43 @@ describe("createLeasing: a platform nuke", () => {
       ]);
     }
   });
+
+  it("a platform nuke forgets only that platform's learned kinds, baseline kinds included", async () => {
+    for (const platform of ["ios", "android", undefined] as const) {
+      const harness = await createHarness();
+      for (const name of ["ios", "android"]) {
+        for (const baseline of ["", `${name}-base`]) {
+          harness.state.database
+            .prepare(
+              "INSERT INTO warm_kinds (platform, model, os_version, mode, image_tag, baseline, last_leased_at) VALUES (?, 'Phone', '1', 'full', '', ?, 1000)",
+            )
+            .run(name, baseline);
+        }
+      }
+      const kinds = () =>
+        harness.state.database
+          .prepare("SELECT platform, baseline FROM warm_kinds ORDER BY platform, baseline")
+          .all()
+          .map((row) => `${String(row.platform)}:${String(row.baseline)}`);
+      expect(kinds(), String(platform)).toEqual([
+        "android:",
+        "android:android-base",
+        "ios:",
+        "ios:ios-base",
+      ]);
+
+      await new Nuke({ executor: harness.engine, registry: harness.registry }).run({
+        deleteDevices: false,
+        platform,
+      });
+
+      expect(kinds(), String(platform)).toEqual(
+        {
+          android: ["ios:", "ios:ios-base"],
+          ios: ["android:", "android:android-base"],
+          undefined: [],
+        }[String(platform) as "android" | "ios" | "undefined"],
+      );
+    }
+  });
 });
