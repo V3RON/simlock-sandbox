@@ -1,0 +1,568 @@
+import type { EventBus } from "../bus/index.js";
+import type { Clock, Filesystem, Logger, SystemStats } from "../ports/index.js";
+import type { StateDatabase } from "../state/index.js";
+import {
+  buildCapacityFigures,
+  CapacityCoordinator,
+  servingOnly,
+  capacityDevices,
+  CapacityObserver,
+  createCapacityStrategy,
+} from "./capacity/index.js";
+import { CleanupExecutor, type CleanupActionExecutor } from "./cleanup-executor.js";
+import type { ComponentInstaller } from "./component-installer.js";
+import type { Config } from "./config.js";
+import type {
+  CapacityReader,
+  WarmKindForgetter,
+  WarmPoolReader,
+  CatalogReader,
+  LeaseExpirer,
+  MemoryPressureReader,
+  PassthroughResolver,
+} from "./core-ports.js";
+import { DeviceOperationClaims } from "./device-operation-claims.js";
+import { DeviceProvisioner } from "./device-provisioner.js";
+import {
+  Doctor,
+  type DoctorConfig,
+  type OptionalModuleFinding,
+  type ServiceCheck,
+} from "./doctor.js";
+import type { DeviceMode, Platform, TargetResolution, WaitingDemand } from "./domain.js";
+import type { DeviceRequest, Driver, DriverRejection, PrerequisiteCheck } from "./driver.js";
+import { DriverCatalog, type ModelPreferences } from "./driver-catalog.js";
+import { ManagedDeviceLifecycle } from "./managed-device-lifecycle.js";
+import { type AcquisitionMaintenance, type LeaseMaintenance, NukeService } from "./nuke-service.js";
+import { PhysicalAutoEnrollment } from "./physical-auto-enrollment.js";
+import { PhysicalEnrollment } from "./physical-enrollment.js";
+import { QuarantineCoordinator } from "./quarantine-coordinator.js";
+import { ReclaimCoordinator } from "./reclaim-coordinator.js";
+import type { Registry, ReleasedLease } from "./registry.js";
+import type { SerializedDecision } from "./serialized-decision.js";
+import { StartupConverger } from "./startup-converger.js";
+import { stableError } from "./stable-error.js";
+import { readStartup, type StartupRead } from "./startup-read.js";
+import { BaselineService } from "./baselines.js";
+import { createSeedSettler, type SeedSettler } from "./seed-settle/index.js";
+import { WarmPool } from "./warm-pool/index.js";
+import { errorMessage } from "../shared/index.js";
+
+export type CoreConfig = DoctorConfig &
+  Pick<Config, "capacity" | "devices" | "diskPressure" | "health" | "idle">;
+
+interface CoreOptions {
+  readonly clock: Clock;
+  /** why: the worker's memory pressure step; absent when host load is off, so a reader sees no step. */
+  readonly memoryPressure?: MemoryPressureReader;
+  /**
+   * why: The daemon's one `ComponentInstaller`, built and closed by the composition root. Warm-pool
+   * provisioning and startup convergence never install through it (safety rule 4); every device
+   * provisioned is claimed through it, so none is created on a component being removed (ADR 0010
+   * §8).
+   */
+  readonly components: Pick<ComponentInstaller, "claimProvision" | "install">;
+  readonly config: CoreConfig;
+  /**
+   * why: The one decision gate every registry write runs inside. Passed in rather than built here
+   * because `components` writes the registry too and must share it.
+   */
+  readonly decisions: SerializedDecision;
+  readonly drivers: readonly Driver[];
+  readonly driverRejections?: readonly DriverRejection[] | undefined;
+  readonly eventBus: EventBus;
+  /** why: the seed settler reads free disk, as the reaper does (ADR 0090 §2). */
+  readonly filesystem: Pick<Filesystem, "diskFree">;
+  /** why: the path the reaper reads free disk at, so both read the same disk. */
+  readonly diskPath?: string | undefined;
+  /**
+   * why: Where work core finishes off its callers' paths reports its failures. A backgrounded
+   * reclaim has no caller left to reject to, so without this its only trace is the device's own
+   * registry state.
+   */
+  readonly logger?: Logger | undefined;
+  readonly modelPreferences?: ModelPreferences | undefined;
+  readonly optionalModules?:
+    | (() => readonly OptionalModuleFinding[] | Promise<readonly OptionalModuleFinding[]>)
+    | undefined;
+  readonly prerequisiteChecks?: readonly PrerequisiteCheck[] | undefined;
+  readonly serviceCheck?: ServiceCheck | undefined;
+  readonly registry: Registry;
+  readonly state: StateDatabase;
+  readonly systemStats: SystemStats;
+}
+
+export interface CorePorts {
+  readonly leaseMaintenance: {
+    readonly acquisition: AcquisitionMaintenance;
+    readonly leases: LeaseMaintenance;
+  };
+  readonly leaseExpirer: LeaseExpirer;
+  /** why: ends a lease for a baseline save; core never imports leasing, so leasing supplies the verb. */
+  readonly leaseSave: {
+    releaseToSave<Result>(
+      leaseId: string,
+      save: (released: ReleasedLease) => Promise<Result>,
+    ): Promise<Result>;
+  };
+  readonly warmPoolDemand: {
+    readonly maintenanceActive: boolean;
+    waitingDemand(): readonly WaitingDemand[];
+    defaultMode(platform: Platform): DeviceMode;
+    resolve(request: DeviceRequest): Promise<TargetResolution>;
+  };
+  readonly notifyAvailability: () => void;
+  readonly physicalDeviceReady?: (deviceId: string) => void;
+}
+
+class CorePortMissingError extends Error {
+  constructor(readonly port: keyof CorePorts) {
+    super(`A core service was called before connect() supplied the "${port}" port`);
+    this.name = "CorePortMissingError";
+  }
+}
+
+export interface Core {
+  readonly memoryPressure: MemoryPressureReader;
+  readonly capacity: CapacityCoordinator;
+  readonly capacityReader: CapacityReader;
+  readonly warmPoolReader: WarmPoolReader;
+  readonly warmKinds: WarmKindForgetter;
+  readonly baselines: BaselineService;
+  readonly catalog: CatalogReader & PassthroughResolver;
+  readonly claims: DeviceOperationClaims;
+  readonly claimReader: Pick<DeviceOperationClaims, "isClaimed">;
+  readonly cleanup: CleanupActionExecutor;
+  readonly decisions: SerializedDecision;
+  readonly deviceLifecycle: ManagedDeviceLifecycle;
+  readonly doctor: Doctor;
+  readonly drivers: DriverCatalog;
+  readonly enrollment: PhysicalEnrollment;
+  readonly autoEnrollment: PhysicalAutoEnrollment;
+  readonly nuke: NukeService;
+  /** why: ADR 0090: the daemon stops it before the drivers are disposed, and the operator's `seed` command settles through it. */
+  readonly seedSettler: SeedSettler;
+  readonly provisioner: DeviceProvisioner;
+  readonly quarantine: QuarantineCoordinator;
+  readonly reclaim: ReclaimCoordinator;
+  readonly registry: Registry;
+  connect(ports: CorePorts): void;
+  readStartup(): Promise<StartupRead>;
+  converge(read: StartupRead): Promise<void>;
+  /**
+   * why: Runs a warm pool pass now. Leasing calls it once a backgrounded reclaim has given up its
+   * claim: `device.reclaimed` fires while that claim is still held, so the pass it triggers sees
+   * the device as busy, and this is the first moment the pool can act on it.
+   */
+  passWarmPool(): Promise<void>;
+  targetedDevices(): Promise<ReadonlySet<string>>;
+  settle(): Promise<void>;
+  drain(): Promise<void>;
+  /**
+   * why: Shuts down every ready virtual device (no lease, no claim held) so a stopping daemon leaves
+   * no idle simulator or emulator running. Run after `settle` and before the drivers are
+   * disposed. A device that fails to shut down is logged and the rest go on.
+   */
+  shutdownIdle(): Promise<void>;
+  /**
+   * why: closes the warm pool before leasing settles, so a reclaim
+   * that commits meanwhile cannot start a creation `drain` would then wait for.
+   */
+  closeWarmPool(): void;
+  dispose(): void;
+}
+
+const NO_MEMORY_PRESSURE: MemoryPressureReader = {
+  current: () => undefined,
+  onReading: () => () => undefined,
+};
+
+export function createCore(options: CoreOptions): Core {
+  const { decisions, registry } = options;
+  const memoryPressure = options.memoryPressure ?? NO_MEMORY_PRESSURE;
+  let ports: CorePorts | undefined;
+  const port = <Name extends keyof CorePorts>(name: Name): CorePorts[Name] => {
+    if (ports === undefined) throw new CorePortMissingError(name);
+    return ports[name];
+  };
+  const notifyAvailability = (): void => port("notifyAvailability")();
+  const physicalDeviceReady = (deviceId: string): void => ports?.physicalDeviceReady?.(deviceId);
+  const leaseMaintenance = {
+    acquisition: {
+      beginMaintenance: () => port("leaseMaintenance").acquisition.beginMaintenance(),
+      endMaintenance: () => port("leaseMaintenance").acquisition.endMaintenance(),
+    },
+    leases: {
+      beginMaintenance: () => port("leaseMaintenance").leases.beginMaintenance(),
+      endMaintenance: () => port("leaseMaintenance").leases.endMaintenance(),
+      releaseAllDuringMaintenance: (reason: "killed") =>
+        port("leaseMaintenance").leases.releaseAllDuringMaintenance(reason),
+    },
+  };
+
+  const capacity = new CapacityCoordinator(
+    servingOnly(
+      createCapacityStrategy(options.config.capacity, options.systemStats),
+      (platform) =>
+        options.drivers.some((driver) => driver.platform === platform) ||
+        (options.driverRejections ?? []).some((rejection) => rejection.platform === platform),
+    ),
+    () => capacityObserver.changed(),
+    memoryPressure,
+  );
+  const devices = () => capacityDevices(registry.snapshot.virtualDevices);
+  const capacityReader: CapacityReader = {
+    get runningCapacity() {
+      return capacity.runningCapacity(devices());
+    },
+    deviceLimit: (platform) => capacity.deviceLimit(platform),
+    atRamBudget: (platform) => capacity.atRamBudget(platform, devices()),
+    get ramBudget() {
+      return capacity.ramBudget(devices());
+    },
+  };
+  const capacityObserver: CapacityObserver = new CapacityObserver({
+    eventBus: options.eventBus,
+    figures: () => buildCapacityFigures(registry.snapshot.virtualDevices, capacityReader),
+  });
+  registry.onCommit(() => capacityObserver.changed());
+  const claims = new DeviceOperationClaims();
+  const drivers = new DriverCatalog(options.drivers, {
+    logger: options.logger,
+    preferences: options.modelPreferences,
+    virtualDevices: {
+      android: options.config.android.virtualDevices,
+      ios: options.config.ios.virtualDevices,
+    },
+  });
+  const deviceLifecycle = new ManagedDeviceLifecycle(
+    drivers,
+    registry,
+    decisions,
+    claims,
+    options.clock,
+  );
+  const quarantine = new QuarantineCoordinator({
+    claims,
+    clock: options.clock,
+    config: options.config.warmPool.quarantine,
+    decisions,
+    drivers,
+    eventBus: options.eventBus,
+    notifyAvailability,
+    physicalDeviceReady,
+    probeIntervalMs: options.config.health.probeIntervalMs,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    registry,
+  });
+  const reclaim = new ReclaimCoordinator({
+    claims,
+    clock: options.clock,
+    decisions,
+    drivers,
+    eventBus: options.eventBus,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    notifyAvailability,
+    physicalDeviceReady,
+    quarantine,
+    registry,
+  });
+  const baselines = new BaselineService({
+    claims,
+    clock: options.clock,
+    decisions,
+    drivers,
+    eventBus: options.eventBus,
+    leaseSave: () => port("leaseSave"),
+    lifecycle: deviceLifecycle,
+    logger: options.logger,
+    reclaim,
+    registry,
+    state: options.state,
+  });
+  const provisioner = new DeviceProvisioner({
+    baselines: () => baselines,
+    catalog: drivers,
+    claims,
+    clock: options.clock,
+    components: options.components,
+    decisions,
+    lifecycle: deviceLifecycle,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    registry,
+  });
+  // why: a waiting request is only planned again by an event; the step lifting is the one that frees it.
+  options.eventBus.subscribe("memory.pressure-changed", notifyAvailability);
+  // why: removing a runtime or image is what makes a baseline stale, so the check follows it.
+  options.eventBus.subscribe("component.removed", () => {
+    baselines.checkStale().catch((error: unknown) => {
+      options.logger?.warn(
+        `could not check baselines after a component was removed: ${errorMessage(error)}`,
+      );
+    });
+  });
+  const dropReplacedBaselines = (): Promise<void> =>
+    baselines.dropReplaced().catch((error: unknown) => {
+      options.logger?.warn(`could not drop a replaced baseline version: ${errorMessage(error)}`);
+    });
+  // why: the last device of a replaced version leaving, by any path, is what lets its source go.
+  options.eventBus.subscribe("device.deleted", () => {
+    void dropReplacedBaselines();
+  });
+  const enrollment = new PhysicalEnrollment({
+    claims,
+    decisions,
+    drivers,
+    physicalDeviceReady,
+    registry,
+  });
+  const autoEnrollment = new PhysicalAutoEnrollment({
+    clock: options.clock,
+    config: options.config,
+    drivers,
+    enrollment,
+    logger: options.logger,
+    notifyAvailability,
+    registry,
+  });
+  const cleanup = new CleanupExecutor({
+    eventBus: options.eventBus,
+    lifecycle: deviceLifecycle,
+    notifyAvailability,
+    registry,
+  });
+  const warmPool = new WarmPool({
+    baselines,
+    acquisition: {
+      kick: notifyAvailability,
+      get maintenanceActive() {
+        return port("warmPoolDemand").maintenanceActive;
+      },
+      resolve: (request) => port("warmPoolDemand").resolve(request),
+      waitingDemand: () => port("warmPoolDemand").waitingDemand(),
+      defaultMode: (platform) => port("warmPoolDemand").defaultMode(platform),
+    },
+    capacity,
+    catalog: drivers,
+    claims,
+    clock: options.clock,
+    config: options.config.warmPool,
+    decisions,
+    eventBus: options.eventBus,
+    hasDriver: (platform) => drivers.select(platform).length > 0,
+    servedModes: options.config.ios.modes,
+    idle: options.config.idle,
+    lifecycle: deviceLifecycle,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    memoryPressure,
+    provisioner,
+    registry,
+    state: options.state,
+  });
+  const seedSettler = createSeedSettler({
+    capacity,
+    clock: options.clock,
+    components: options.components,
+    decisions,
+    diskPressure: options.config.diskPressure,
+    drivers: options.drivers,
+    eventBus: options.eventBus,
+    filesystem: options.filesystem,
+    ...(options.diskPath === undefined ? {} : { diskPath: options.diskPath }),
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    memoryPressure,
+    registry,
+  });
+  const nuke = new NukeService({
+    acquisition: {
+      // why: closing acquisition first makes the pool skip every new action; then a boot or shutdown it
+      // already has in flight is waited for, so the reset sees a settled pool. A startup reclaim still
+      // running is waited for first: its commit can start a pool pass, and the device it holds in
+      // `reclaiming` is one the reset would skip.
+      beginMaintenance: async () => {
+        await leaseMaintenance.acquisition.beginMaintenance();
+        await reclaim.settle();
+        await warmPool.settle();
+      },
+      endMaintenance: async () => leaseMaintenance.acquisition.endMaintenance(),
+    },
+    baselines: { removeAll: () => baselines.removeAll() },
+    devices: deviceLifecycle,
+    drivers: options.drivers,
+    leases: leaseMaintenance.leases,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    registry,
+    seedSettler,
+    warmPool: { forget: () => warmPool.forget() },
+  });
+  const doctor = new Doctor({
+    baselines,
+    // why: Without this, a backgrounded reclaim -- which holds its device in `reclaiming` for a full
+    // erase, and is now how every release purges -- reads as a stalled transition.
+    claims,
+    clock: options.clock,
+    config: options.config,
+    decisions,
+    drivers: options.drivers,
+    driverRejections: options.driverRejections ?? [],
+    eventBus: options.eventBus,
+    leaseExpirer: { expire: async (leaseId) => port("leaseExpirer").expire(leaseId) },
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    ...(options.optionalModules === undefined ? {} : { optionalModules: options.optionalModules }),
+    prerequisiteChecks: options.prerequisiteChecks ?? [],
+    ...(options.serviceCheck === undefined ? {} : { serviceCheck: options.serviceCheck }),
+    quarantine,
+    registry,
+    warmPool: {
+      figures: () => warmPool.figures(),
+      runningCapacity: () => capacityReader.runningCapacity,
+    },
+  });
+  const startup = new StartupConverger({
+    claims,
+    decisions,
+    idleDeletion: {
+      // why: a failed shutdown or delete must not stop the daemon from starting: the device stays in the state it reached and the next start tries again (ADR 0084 §2).
+      deleteIdle: async (device) => {
+        try {
+          const stopped =
+            device.state === "ready"
+              ? await deviceLifecycle.shutdown(device, "virtual-devices-off", "cleanup")
+              : device;
+          if (stopped !== undefined) {
+            await deviceLifecycle.destroy(stopped, "virtual-devices-off", "cleanup");
+          }
+        } catch (error: unknown) {
+          options.logger?.warn("Could not delete an idle device at start", {
+            deviceId: device.id,
+            error: stableError(error),
+            platform: device.spec.platform,
+          });
+        }
+      },
+      platforms: (["ios", "android"] as const).filter(
+        (platform) => !drivers.virtualDevices(platform),
+      ),
+    },
+    interruptedReclaimRecovery: {
+      recoverInterruptedReclaim: async (device) => {
+        await reclaim.recoverInterrupted(device.id);
+      },
+    },
+    quarantineRestore: { restore: (include) => quarantine.restore(include) },
+    registry,
+    spentDeviceDeletion: {
+      // why: A failed delete must not stop the daemon from starting: the device stays `shutdown`
+      // and ungrantable, and the next start (or the idle delete rule) tries again.
+      deleteSpent: async (device) => {
+        try {
+          await reclaim.deleteSpent(device.id);
+        } catch (error: unknown) {
+          options.logger?.error("startup delete of a spent device failed", {
+            deviceId: device.id,
+            error: errorMessage(error),
+          });
+        }
+      },
+    },
+  });
+
+  return {
+    capacity,
+    capacityReader,
+    memoryPressure,
+    warmPoolReader: warmPool,
+    warmKinds: { forget: (match) => warmPool.forgetKinds(match) },
+    baselines,
+    catalog: drivers,
+    claims,
+    claimReader: claims,
+    cleanup,
+    decisions,
+    deviceLifecycle,
+    doctor,
+    drivers,
+    enrollment,
+    autoEnrollment,
+    nuke,
+    provisioner,
+    seedSettler,
+    quarantine,
+    reclaim,
+    registry,
+    connect(supplied) {
+      ports = supplied;
+    },
+    readStartup: () =>
+      readStartup({ clock: options.clock, drivers: options.drivers, logger: options.logger }),
+    async converge(read) {
+      await startup.converge(read);
+      await dropReplacedBaselines();
+      await listStartupSources(options.drivers, options.logger);
+      try {
+        await baselines.checkStale();
+      } catch (error: unknown) {
+        options.logger?.warn(`could not check baselines at startup: ${errorMessage(error)}`);
+      }
+      warmPool.start();
+      seedSettler.start();
+      capacityObserver.start();
+    },
+    async passWarmPool() {
+      await warmPool.pass();
+    },
+    async targetedDevices() {
+      return warmPool.targeted();
+    },
+    closeWarmPool() {
+      warmPool.close();
+    },
+    async drain() {
+      await warmPool.drain();
+    },
+    async shutdownIdle() {
+      const ready = registry.snapshot.virtualDevices.filter((device) => device.state === "ready");
+      await Promise.all(
+        ready.map(async (device) => {
+          try {
+            await deviceLifecycle.shutdown(device, "daemon-stop", "cleanup");
+          } catch (error: unknown) {
+            options.logger?.error("shutdown of an idle device at daemon stop failed", {
+              deviceId: device.id,
+              error: errorMessage(error),
+            });
+          }
+        }),
+      );
+    },
+    async settle() {
+      // why: a reclaim's commit can start a pool pass, so the reclaims are awaited first.
+      await reclaim.settle();
+      await warmPool.settle();
+    },
+    dispose() {
+      warmPool.dispose();
+      quarantine.dispose();
+    },
+  };
+}
+
+/**
+ * why: the first `listSources` of a process is where a driver sweeps what an earlier process left
+ * in its sources (ADR 0061 §1); a failed read is logged, never fatal, and the sweep runs again on
+ * the next call.
+ */
+async function listStartupSources(
+  drivers: readonly Driver[],
+  logger: Logger | undefined,
+): Promise<void> {
+  for (const driver of drivers) {
+    try {
+      await driver.listSources();
+    } catch (error: unknown) {
+      logger?.warn(`could not list ${driver.platform} sources at start`, {
+        error: stableError(error),
+      });
+    }
+  }
+}

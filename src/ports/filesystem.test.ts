@@ -1,0 +1,582 @@
+import { lstat, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  type Filesystem,
+  MemoryFilesystem,
+  NodeFilesystem,
+  ScriptedProcessRunner,
+} from "./index.js";
+
+// why: lets one test make a listed file vanish before it is sized, and see the options a delete is given; every other call goes to the real `lstat` and `rm`.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, lstat: vi.fn(actual.lstat), rm: vi.fn(actual.rm) };
+});
+
+// why: Per process: `afterEach` deletes it, so a shared name let two overlapping runs (two suites in
+// one checkout, Stryker's runners in one sandbox) delete each other's files mid-test.
+const temporaryDirectory = `${process.cwd()}/.simlock-ports-test-${process.pid}`;
+
+const implementations: Array<{
+  name: string;
+  create(): Filesystem;
+  link(filesystem: Filesystem, path: string, target: string): Promise<void>;
+}> = [
+  {
+    name: "memory filesystem",
+    create: () => new MemoryFilesystem(),
+    link: async (filesystem, path, target) => {
+      (filesystem as MemoryFilesystem).defineSymlink(path, target);
+    },
+  },
+  {
+    name: "node filesystem",
+    create: () => new NodeFilesystem(),
+    link: async (_filesystem, path, target) => {
+      await symlink(target, path);
+    },
+  },
+];
+
+afterEach(async () => {
+  await new NodeFilesystem().rm(temporaryDirectory);
+});
+
+describe("NodeFilesystem.writeFileAtomic encoding", () => {
+  it("writes UTF-16 little-endian bytes when asked and UTF-8 bytes otherwise", async () => {
+    const filesystem = new NodeFilesystem();
+    await filesystem.mkdirp(temporaryDirectory);
+    const wide = `${temporaryDirectory}/task.xml`;
+    const narrow = `${temporaryDirectory}/plain.txt`;
+    await filesystem.writeFileAtomic(wide, "\uFEFFé", { encoding: "utf16le" });
+    await filesystem.writeFileAtomic(narrow, "é");
+
+    expect([...(await readFile(wide))]).toEqual([0xff, 0xfe, 0xe9, 0x00]);
+    expect([...(await readFile(narrow))]).toEqual([0xc3, 0xa9]);
+  });
+});
+
+// why: the real filesystem on Windows has no mode bits, no owner ids and a different errno for some failures, so a test of those facts runs on the memory filesystem only there.
+const posixOnly = (name: string) => name === "node filesystem" && process.platform === "win32";
+
+// why: the memory filesystem keeps a link target as a `/` path without a drive, and the real one as the host spells it.
+const targetOf = (path: string) => path.replace(/^[A-Za-z]:/, "").replaceAll("\\", "/");
+
+describe.each(implementations)("Filesystem contract: $name", ({ name, create, link }) => {
+  it("atomically writes and overwrites a complete file", async () => {
+    const filesystem = create();
+    const file = `${temporaryDirectory}/devices/registry.json`;
+
+    await filesystem.mkdirp(`${temporaryDirectory}/devices`);
+    await filesystem.writeFileAtomic(file, "first version");
+    await filesystem.writeFileAtomic(file, "complete replacement");
+
+    await expect(filesystem.readFile(file)).resolves.toBe("complete replacement");
+    await expect(filesystem.readdir(`${temporaryDirectory}/devices`)).resolves.toEqual([
+      "registry.json",
+    ]);
+  });
+
+  it("writes a file in place: the same file, emptied or filled, ending at the mode it is given", async () => {
+    const filesystem = create();
+    const file = `${temporaryDirectory}/emulator.log`;
+
+    await filesystem.mkdirp(temporaryDirectory);
+    await filesystem.writeFileAtomic(file, "old output", { mode: 0o644 });
+    const before = (await filesystem.stat(file)).identity;
+    await filesystem.writeFileInPlace(file, "", { mode: 0o600 });
+
+    await expect(filesystem.readFile(file)).resolves.toBe("");
+    expect((await filesystem.stat(file)).identity).toBe(before);
+    if (!posixOnly(name)) expect((await filesystem.stat(file)).mode).toBe(0o600);
+
+    await filesystem.writeFileInPlace(`${temporaryDirectory}/new.log`, "text", { mode: 0o600 });
+    await expect(filesystem.readFile(`${temporaryDirectory}/new.log`)).resolves.toBe("text");
+  });
+
+  it("copies a file's contents over the target and leaves the source", async () => {
+    const filesystem = create();
+    await filesystem.mkdirp(temporaryDirectory);
+    await filesystem.writeFileAtomic(`${temporaryDirectory}/source`, "kept");
+    await filesystem.writeFileAtomic(`${temporaryDirectory}/target`, "replaced");
+
+    await filesystem.copyFile(`${temporaryDirectory}/source`, `${temporaryDirectory}/target`);
+
+    await expect(filesystem.readFile(`${temporaryDirectory}/target`)).resolves.toBe("kept");
+    await expect(filesystem.readFile(`${temporaryDirectory}/source`)).resolves.toBe("kept");
+  });
+
+  it("reads a file from a byte offset, and nothing past its end", async () => {
+    const filesystem = create();
+    const file = `${temporaryDirectory}/daemon.log`;
+    await filesystem.mkdirp(temporaryDirectory);
+    await filesystem.writeFileAtomic(file, "é line one\nline two\n");
+
+    // why: "é" is two bytes: the offset counts bytes, not characters.
+    await expect(filesystem.readFileFrom(file, 12)).resolves.toBe("line two\n");
+    await expect(filesystem.readFileFrom(file, 0)).resolves.toBe("é line one\nline two\n");
+    await expect(filesystem.readFileFrom(file, 21)).resolves.toBe("");
+    await expect(filesystem.readFileFrom(file, 500)).resolves.toBe("");
+  });
+
+  it("keeps a file's identity across a rename and gives a new file at the same path another", async () => {
+    const filesystem = create();
+    const file = `${temporaryDirectory}/daemon.log`;
+    await filesystem.mkdirp(temporaryDirectory);
+    await filesystem.writeFileAtomic(file, "old\n");
+    const original = (await filesystem.stat(file)).identity;
+
+    await filesystem.rename(file, `${file}.1`);
+    await filesystem.writeFileAtomic(file, "new\n");
+
+    expect((await filesystem.stat(`${file}.1`)).identity).toBe(original);
+    expect((await filesystem.stat(file)).identity).not.toBe(original);
+  });
+
+  it("creates nested directories idempotently", async () => {
+    const filesystem = create();
+    const directory = `${temporaryDirectory}/devices/ready`;
+
+    await filesystem.mkdirp(directory);
+    await filesystem.mkdirp(directory);
+
+    await expect(filesystem.stat(directory)).resolves.toMatchObject({ kind: "directory" });
+  });
+
+  it("gives every directory it creates, parents included, the mode it asks for, past the umask, and leaves an existing directory alone", async () => {
+    // why: under umask 0o077 Node's own default for a new directory is 0o700, so a mode of 0o750
+    // the umask would strip to 0o700 shows the adapter set the bits after mkdir, on the parent too.
+    const previousUmask = process.umask(0o077);
+    try {
+      const filesystem = create();
+      const directory = `${temporaryDirectory}/home/gateway`;
+      const existing = `${temporaryDirectory}/existing`;
+      await filesystem.mkdirp(existing);
+      await filesystem.chmod(existing, 0o755);
+
+      await filesystem.mkdirp(directory, { mode: 0o750 });
+      await filesystem.mkdirp(directory, { mode: 0o750 });
+      await filesystem.mkdirp(existing, { mode: 0o750 });
+
+      expect((await filesystem.stat(directory)).kind).toBe("directory");
+      expect((await filesystem.stat(`${temporaryDirectory}/home`)).kind).toBe("directory");
+      // why: the real filesystem on Windows has no mode bits, so only the memory one can show them.
+      if (!posixOnly(name)) {
+        expect((await filesystem.stat(directory)).mode).toBe(0o750);
+        expect((await filesystem.stat(`${temporaryDirectory}/home`)).mode).toBe(0o750);
+        expect((await filesystem.stat(existing)).mode).toBe(0o755);
+      }
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it("writes a file exclusively, refusing the second writer rather than replacing", async () => {
+    const filesystem = create();
+    const file = `${temporaryDirectory}/instance.json`;
+
+    await filesystem.mkdirp(temporaryDirectory);
+    await filesystem.writeFileExclusive(file, "first writer");
+
+    await expect(filesystem.writeFileExclusive(file, "second writer")).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+    await expect(filesystem.readFile(file)).resolves.toBe("first writer");
+  });
+
+  it("creates an exclusively written file with the mode it is given, and Node's default without one", async () => {
+    // why: #685: the exclusive create publishes by hard-linking a temp file, so a mode that
+    // did not ride on that file's create would leave the winner's file world-readable. A
+    // restrictive umask here would mask what the code asks for, so pin the one a host starts
+    // from and pin both halves: the mode a caller asks for, and the default it gets for free.
+    const previousUmask = process.umask(0o022);
+    try {
+      const filesystem = create();
+      const asked = `${temporaryDirectory}/asked.json`;
+      const unasked = `${temporaryDirectory}/unasked.json`;
+
+      await filesystem.mkdirp(temporaryDirectory);
+      await filesystem.writeFileExclusive(asked, "{}", { mode: 0o600 });
+      await filesystem.writeFileExclusive(unasked, "{}");
+
+      await expect(filesystem.readFile(asked)).resolves.toBe("{}");
+      await expect(filesystem.readFile(unasked)).resolves.toBe("{}");
+      // why: the real filesystem on Windows has no mode bits, so only the memory one can show them.
+      if (!posixOnly(name)) {
+        expect((await filesystem.stat(asked)).mode).toBe(0o600);
+        expect((await filesystem.stat(unasked)).mode).toBe(0o644);
+      }
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
+
+  it("moves a directory and everything under it in one step", async () => {
+    const filesystem = create();
+    const staging = `${temporaryDirectory}/.ios.staging`;
+
+    await filesystem.mkdirp(`${staging}/nested`);
+    await filesystem.writeFileAtomic(`${staging}/nested/marker.json`, "{}");
+    await filesystem.rename(staging, `${temporaryDirectory}/ios`);
+
+    await expect(filesystem.readFile(`${temporaryDirectory}/ios/nested/marker.json`)).resolves.toBe(
+      "{}",
+    );
+    await expect(filesystem.exists(staging)).resolves.toBe(false);
+  });
+
+  it("refuses to move a directory onto one that holds something", async () => {
+    const filesystem = create();
+    const staging = `${temporaryDirectory}/.ios.staging`;
+    const occupied = `${temporaryDirectory}/ios`;
+
+    await filesystem.mkdirp(staging);
+    await filesystem.mkdirp(occupied);
+    await filesystem.writeFileAtomic(`${occupied}/someone-elses-work.txt`, "");
+
+    const refused = expect(filesystem.rename(staging, occupied)).rejects;
+    // why: Windows refuses with EPERM where POSIX says ENOTEMPTY, so only the refusal is common.
+    await (posixOnly(name) ? refused.toThrow() : refused.toMatchObject({ code: "ENOTEMPTY" }));
+    await expect(filesystem.exists(`${occupied}/someone-elses-work.txt`)).resolves.toBe(true);
+  });
+
+  it("reports whether a path is there", async () => {
+    const filesystem = create();
+
+    await filesystem.mkdirp(temporaryDirectory);
+    await filesystem.writeFileAtomic(`${temporaryDirectory}/instance.json`, "{}");
+
+    await expect(filesystem.exists(`${temporaryDirectory}/instance.json`)).resolves.toBe(true);
+    await expect(filesystem.exists(`${temporaryDirectory}/absent.json`)).resolves.toBe(false);
+  });
+
+  it("answers about what a symlink points at, not about the link", async () => {
+    const filesystem = create();
+
+    await filesystem.mkdirp(`${temporaryDirectory}/real`);
+    await link(filesystem, `${temporaryDirectory}/live`, `${temporaryDirectory}/real`);
+    await link(filesystem, `${temporaryDirectory}/dangling`, `${temporaryDirectory}/gone`);
+
+    await expect(filesystem.exists(`${temporaryDirectory}/live`)).resolves.toBe(true);
+    await expect(filesystem.exists(`${temporaryDirectory}/dangling`)).resolves.toBe(false);
+  });
+
+  it("reports a symlink as a symlink, and resolves it to what it points at", async () => {
+    const filesystem = create();
+    await filesystem.mkdirp(`${temporaryDirectory}/devices/real`);
+    await link(
+      filesystem,
+      `${temporaryDirectory}/devices/ios`,
+      `${temporaryDirectory}/devices/real`,
+    );
+
+    await expect(filesystem.lstat(`${temporaryDirectory}/devices/ios`)).resolves.toMatchObject({
+      kind: "symlink",
+    });
+    await expect(filesystem.stat(`${temporaryDirectory}/devices/ios`)).resolves.toMatchObject({
+      kind: "directory",
+    });
+    await expect(filesystem.realpath(`${temporaryDirectory}/devices/ios`)).resolves.toBe(
+      await filesystem.realpath(`${temporaryDirectory}/devices/real`),
+    );
+  });
+
+  it("reads where a link points, repoints it, and writes bytes into a file at an offset without truncating it or touching its modification time, and refuses to read a file as a link or write into a file that is not there", async () => {
+    const filesystem = create();
+    const dir = temporaryDirectory;
+    await filesystem.mkdirp(dir);
+    await filesystem.writeFileAtomic(`${dir}/file`, "abcdef");
+    // why: the memory filesystem has no disk file to age, and its write never touches the time.
+    if (filesystem instanceof NodeFilesystem) await utimes(`${dir}/file`, 1_000_000, 1_000_000);
+    const modifiedBefore = (await filesystem.stat(`${dir}/file`)).modifiedAtMs;
+    await link(filesystem, `${dir}/link`, `${dir}/old`);
+
+    expect(targetOf(await filesystem.readlink(`${dir}/link`))).toBe(targetOf(`${dir}/old`));
+    await filesystem.replaceSymlink(`${dir}/link`, `${dir}/new`);
+    expect(targetOf(await filesystem.readlink(`${dir}/link`))).toBe(targetOf(`${dir}/new`));
+    await filesystem.writeAt(`${dir}/file`, 2, new TextEncoder().encode("XY"));
+    await expect(filesystem.readFile(`${dir}/file`)).resolves.toBe("abXYef");
+    expect((await filesystem.stat(`${dir}/file`)).modifiedAtMs).toBe(modifiedBefore);
+
+    await expect(filesystem.readlink(`${dir}/file`)).rejects.toThrow();
+    await expect(filesystem.writeAt(`${dir}/missing`, 0, new Uint8Array(1))).rejects.toThrow();
+  });
+
+  it("refuses to answer for a path that runs through a file", async () => {
+    // why: A mistyped device root -- `<home>/notes.txt/ios` -- is a different problem from one
+    // that is simply not there yet, and callers can only tell them apart by the errno.
+    const filesystem = create();
+
+    await filesystem.mkdirp(temporaryDirectory);
+    await filesystem.writeFileAtomic(`${temporaryDirectory}/notes.txt`, "");
+
+    // why: Windows reports a path that runs through a file as ENOENT, the same errno as a missing
+    // one, so the claim cannot hold there.
+    if (posixOnly(name)) return;
+    await expect(filesystem.exists(`${temporaryDirectory}/notes.txt/ios`)).rejects.toMatchObject({
+      code: "ENOTDIR",
+    });
+  });
+
+  it("sizes a directory as the bytes of the files under it, subdirectories included, without following a symlink", async () => {
+    const filesystem = create();
+    const root = `${temporaryDirectory}/image`;
+    await filesystem.mkdirp(`${root}/data`);
+    await filesystem.mkdirp(`${temporaryDirectory}/outside`);
+    await filesystem.writeFileAtomic(`${root}/system.img`, "abcd");
+    await filesystem.writeFileAtomic(`${root}/data/userdata.img`, "0123456789");
+    await filesystem.writeFileAtomic(`${temporaryDirectory}/outside/big.img`, "x".repeat(100));
+    await link(filesystem, `${root}/linked`, `${temporaryDirectory}/outside`);
+
+    await expect(filesystem.directorySize(root)).resolves.toBe(14);
+  });
+
+  it("refuses to size a directory that is not there", async () => {
+    const filesystem = create();
+
+    await expect(filesystem.directorySize(`${temporaryDirectory}/missing`)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+});
+
+describe.each(implementations)("Filesystem ownership contract: $name", ({ name, create }) => {
+  it("reports what a path is, who owns it, and how exposed it is", async () => {
+    const filesystem = create();
+    const root = `${temporaryDirectory}/devices/ios`;
+
+    await filesystem.mkdirp(root);
+    await filesystem.chmod(root, 0o700);
+
+    // why: the real filesystem on Windows has no mode bits or owner ids, so only its kind is common.
+    if (posixOnly(name))
+      await expect(filesystem.lstat(root)).resolves.toMatchObject({ kind: "directory" });
+    else
+      await expect(filesystem.lstat(root)).resolves.toEqual({
+        kind: "directory",
+        mode: 0o700,
+        uid: process.getuid?.() ?? 0,
+      });
+  });
+
+  it("reports the permission bits a path was last given, not the ones it was created with", async () => {
+    const filesystem = create();
+    const root = `${temporaryDirectory}/devices/ios`;
+
+    await filesystem.mkdirp(`${temporaryDirectory}/devices`);
+    await filesystem.mkdir(root, { mode: 0o777 });
+    await filesystem.chmod(root, 0o700);
+
+    // why: the real filesystem on Windows has no mode bits, so only its kind is common.
+    await expect(filesystem.lstat(root)).resolves.toMatchObject(
+      posixOnly(name) ? { kind: "directory" } : { mode: 0o700 },
+    );
+  });
+
+  it("refuses to create a directory that already exists", async () => {
+    const filesystem = create();
+    const root = `${temporaryDirectory}/devices/ios`;
+
+    await filesystem.mkdirp(root);
+
+    await expect(filesystem.mkdir(root)).rejects.toMatchObject({ code: "EEXIST" });
+  });
+
+  it("creates only the final path segment", async () => {
+    const filesystem = create();
+
+    await expect(filesystem.mkdir(`${temporaryDirectory}/devices/ios`)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("resolves a path to one that resolves to itself", async () => {
+    const filesystem = create();
+    const root = `${temporaryDirectory}/devices/ios`;
+
+    await filesystem.mkdirp(root);
+    const resolved = await filesystem.realpath(root);
+
+    expect(targetOf(resolved).endsWith("/devices/ios")).toBe(true);
+    await expect(filesystem.realpath(resolved)).resolves.toBe(resolved);
+  });
+});
+
+describe("NodeFilesystem.rm", () => {
+  it("retries a delete that hits a file another process still holds, and removes the folder once it is free (#1765)", async () => {
+    const filesystem = new NodeFilesystem();
+    const root = `${temporaryDirectory}/busy`;
+    await filesystem.mkdirp(`${root}/inner`);
+    await filesystem.writeFileAtomic(`${root}/inner/disk.img`, "x");
+
+    await filesystem.rm(root);
+
+    const options = vi.mocked(rm).mock.calls.at(-1)?.[1];
+    // why: a busy file (EBUSY on Windows) cannot be made on every host, so the retries Node is asked for are what a held file's release is waited on with: 10 tries at 100 ms cover the 0.5 to 0.7 s a killed emulator's qemu child holds its disks.
+    expect(options).toMatchObject({
+      force: true,
+      maxRetries: 10,
+      recursive: true,
+      retryDelay: 100,
+    });
+    await expect(filesystem.exists(root)).resolves.toBe(false);
+  });
+});
+
+describe("NodeFilesystem.directorySize", () => {
+  it("counts a file that vanishes between the listing and its stat as 0 bytes, and fails on any other error", async () => {
+    const filesystem = new NodeFilesystem();
+    const root = `${temporaryDirectory}/set`;
+    await filesystem.mkdirp(root);
+    await filesystem.writeFileAtomic(`${root}/device.plist`, "abcd");
+    await filesystem.writeFileAtomic(`${root}/device.plist.sb-1`, "xy");
+    const real = vi.mocked(lstat).getMockImplementation() as typeof lstat;
+    const failWith = (code: string) =>
+      vi.mocked(lstat).mockImplementation((async (path: string, ...rest: never[]) => {
+        if (path.endsWith(".sb-1")) throw Object.assign(new Error(code), { code });
+        return await real(path, ...rest);
+      }) as typeof lstat);
+
+    failWith("ENOENT");
+    await expect(filesystem.directorySize(root)).resolves.toBe(4);
+
+    failWith("EACCES");
+    await expect(filesystem.directorySize(root)).rejects.toMatchObject({ code: "EACCES" });
+  });
+});
+
+describe("MemoryFilesystem", () => {
+  it("resolves symlinked path components, not just the last one", async () => {
+    const filesystem = new MemoryFilesystem();
+    await filesystem.mkdirp("/private/devices/ios");
+    filesystem.defineSymlink("/devices", "/private/devices");
+
+    await expect(filesystem.realpath("/devices/ios")).resolves.toBe("/private/devices/ios");
+  });
+
+  it("reports the ownership and permissions a test defines for a path", async () => {
+    const filesystem = new MemoryFilesystem();
+    await filesystem.mkdirp("/devices/ios");
+    filesystem.defineAttributes("/devices/ios", { uid: 4242, mode: 0o755 });
+
+    await expect(filesystem.lstat("/devices/ios")).resolves.toEqual({
+      kind: "directory",
+      mode: 0o755,
+      uid: 4242,
+    });
+  });
+
+  it("refuses to size a directory when a path under it was declared broken", async () => {
+    const filesystem = new MemoryFilesystem();
+    await filesystem.mkdirp("/image/data");
+    await filesystem.writeFileAtomic("/image/data/userdata.img", "0123456789");
+    filesystem.defineFailure("/image/data/userdata.img", "EACCES");
+
+    await expect(filesystem.directorySize("/image")).rejects.toMatchObject({ code: "EACCES" });
+  });
+
+  it("fails at a path a test declared broken, with the errno it declared", async () => {
+    // why: The only way to reach the branches that turn a filesystem failure into a typed
+    // rejection: an EACCES on a device root cannot be produced by writing to the double.
+    const filesystem = new MemoryFilesystem();
+    await filesystem.mkdirp("/devices/ios");
+    filesystem.defineFailure("/devices/ios", "EACCES");
+
+    await expect(filesystem.lstat("/devices/ios")).rejects.toMatchObject({ code: "EACCES" });
+    await expect(filesystem.readdir("/devices/ios")).rejects.toMatchObject({ code: "EACCES" });
+    await expect(filesystem.mkdirp("/devices/ios")).rejects.toMatchObject({ code: "EACCES" });
+  });
+
+  it("gives a new directory owner-only permissions unless a mode says otherwise", async () => {
+    const filesystem = new MemoryFilesystem();
+    await filesystem.mkdirp("/devices");
+
+    await filesystem.mkdir("/devices/ios");
+
+    await expect(filesystem.lstat("/devices/ios")).resolves.toMatchObject({ mode: 0o700 });
+  });
+});
+
+describe("Filesystem.copyTree", () => {
+  const cpResult = (code: number, stderr = "") => ({ code, stderr, stdout: "" });
+  const runnerFor = (args: readonly string[], result = cpResult(0)) =>
+    new ScriptedProcessRunner([{ match: { args, command: "cp" }, result }]);
+
+  it("copies a folder to a path that does not exist with file modification times kept, through cp on macOS and Linux and in Node elsewhere, and rejects with cp's own message", async () => {
+    const darwin = runnerFor(["-c", "-p", "-R", "/from", "/to"]);
+    await new NodeFilesystem({ platform: "darwin", processRunner: darwin }).copyTree(
+      "/from",
+      "/to",
+      {
+        timeoutMs: 600_000,
+      },
+    );
+    expect(darwin.calls).toHaveLength(1);
+
+    const linux = runnerFor(["-a", "--reflink=auto", "/from", "/to"]);
+    await new NodeFilesystem({ platform: "linux", processRunner: linux }).copyTree("/from", "/to", {
+      timeoutMs: 600_000,
+    });
+    expect(linux.calls).toHaveLength(1);
+
+    const failing = runnerFor(
+      ["-c", "-p", "-R", "/from", "/to"],
+      cpResult(1, "cp: /from: No such file or directory\n"),
+    );
+    await expect(
+      new NodeFilesystem({ platform: "darwin", processRunner: failing }).copyTree("/from", "/to", {
+        timeoutMs: 600_000,
+      }),
+    ).rejects.toThrow("cp: /from: No such file or directory");
+
+    const modifiedAt = new Date("2026-01-02T03:04:05Z");
+    const source = `${temporaryDirectory}/copy-tree/source`;
+    const real = new NodeFilesystem();
+    await real.mkdirp(source);
+    await writeFile(`${source}/disk.img`, "image");
+    await utimes(`${source}/disk.img`, modifiedAt, modifiedAt);
+    for (const platform of new Set(["win32", process.platform] as const)) {
+      const target = `${temporaryDirectory}/copy-tree/${platform}`;
+      await new NodeFilesystem({ platform }).copyTree(source, target, { timeoutMs: 600_000 });
+      await expect(real.readFile(`${target}/disk.img`)).resolves.toBe("image");
+      expect((await stat(`${target}/disk.img`)).mtimeMs).toBe(modifiedAt.getTime());
+    }
+
+    const memory = new MemoryFilesystem();
+    await memory.mkdirp("/from/nested");
+    await memory.writeFileAtomic("/from/nested/disk.img", "image");
+    memory.defineAttributes("/from/nested/disk.img", { modifiedAtMs: 1_234 });
+    await memory.copyTree("/from", "/to", { timeoutMs: 600_000 });
+    await expect(memory.stat("/to/nested/disk.img")).resolves.toMatchObject({
+      modifiedAtMs: 1_234,
+    });
+    await expect(memory.readFile("/to/nested/disk.img")).resolves.toBe("image");
+  });
+
+  it("kills cp at timeoutMs and rejects with how long it waited", async () => {
+    vi.useFakeTimers();
+    try {
+      const runner = new ScriptedProcessRunner([
+        { hangs: true, match: { args: ["-c", "-p", "-R", "/from", "/to"], command: "cp" } },
+      ]);
+      const copying = new NodeFilesystem({ platform: "darwin", processRunner: runner }).copyTree(
+        "/from",
+        "/to",
+        { timeoutMs: 600_000 },
+      );
+      const rejected = expect(copying).rejects.toThrow("timed out after 600000ms");
+      const kill = vi.spyOn(runner.handles[0] as { kill(): void }, "kill");
+
+      await vi.advanceTimersByTimeAsync(599_999);
+      expect(kill).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(kill).toHaveBeenCalledTimes(1);
+
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

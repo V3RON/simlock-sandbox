@@ -1,0 +1,285 @@
+/**
+ * why: nothing controls a device's picture but the panel that shows it, because this surface has no
+ * command of its own to send — the request *is* the on command and aborting it *is* the off one. So
+ * the pane's lifecycle is the capture's lifecycle: leaving the tab, closing the drawer, navigating
+ * away and signing out are four ways of doing the same single thing, and a capture cannot outlive the
+ * pane that asked for it. That is also why nothing here polls or holds a stream open across a
+ * navigation; the one retry is a started stream the server ended with no reason (see `capture`).
+ */
+import { type RefObject, useEffect, useRef, useState } from "react";
+
+import { ApiError } from "../data/api";
+import { readStream, type StreamMeta, type StreamStats } from "../data/stream";
+import {
+  deviceScreen,
+  plainSentence,
+  type Readout,
+  type ScreenPhase,
+  screenView,
+  type StreamOffer,
+  streamsDevice,
+} from "../model/screen";
+import type { AcquireCapture } from "../model/screens";
+import { useApi } from "./services";
+
+export type { Readout, StreamOffer } from "../model/screen";
+
+export type { AcquireCapture } from "../model/screens";
+
+const EMPTY: StreamStats = {
+  dropped: 0,
+  error: undefined,
+  fed: 0,
+  framesPerSecond: 0,
+  kilobitsPerSecond: 0,
+  painted: 0,
+};
+
+// why: a worker answers a stream's headers only once its capture wrote its first frame, and it may
+// take about 185 s on a physical Android phone (the shared adb server's version check up to 45 s
+// the first time and 5 s before each later step, the screen read 20 s, the wake 20 s, the second
+// read 20 s, the push 40 s, the server 15 s and a last check of up to 5 s past it); an emulator's
+// worst case is 75 s (its push 30 s, its server 15 s, the first frame 30 s). A console that gave up
+// sooner would show its own timeout instead of the worker's reason.
+export const STREAM_HEAD_TIMEOUT_MS = 200_000;
+
+export interface Screen {
+  readonly canvas: RefObject<HTMLCanvasElement | null>;
+  readonly width: number;
+  readonly height: number;
+  readonly live: boolean;
+  readonly waiting: string | undefined;
+  readonly readout: Readout;
+  readonly note: string | undefined;
+  // why: the daemon's 409 message, kept apart from `note` because the panel words it with the device's
+  // state and the row may be about to say the same.
+  readonly conflict: string | undefined;
+}
+
+export type DeviceScreenView =
+  | { readonly kind: "picture"; readonly screen: Screen }
+  | { readonly kind: "sentence"; readonly text: string };
+
+// why: the tab shows the picture only for a device the daemon streams, and says in words why it
+// shows none for any other, so the decision sits here and the panel only draws.
+export function useDeviceScreen(
+  workerId: string,
+  deviceId: string,
+  state: string,
+  offer: StreamOffer,
+  acquire?: AcquireCapture,
+): DeviceScreenView {
+  const screen = useScreen(workerId, deviceId, streamsDevice(state, offer), acquire);
+  const shown = deviceScreen({ conflict: screen.conflict, offer, state, queued: screen.queued });
+  return shown.kind === "picture" ? { kind: "picture", screen } : shown;
+}
+
+function useScreen(
+  workerId: string,
+  deviceId: string,
+  enabled: boolean,
+  acquire?: AcquireCapture,
+): Screen & { readonly queued: boolean } {
+  const api = useApi();
+  const canvas = useRef<HTMLCanvasElement | null>(null);
+  const [owner, setOwner] = useState<
+    | {
+        readonly abort: AbortController;
+        readonly release: (() => void) | undefined;
+        started: boolean;
+      }
+    | undefined
+  >(undefined);
+  const [phase, setPhase] = useState<ScreenPhase>("idle");
+  const [queued, setQueued] = useState(acquire !== undefined);
+  const [meta, setMeta] = useState<StreamMeta | undefined>(undefined);
+  const [stats, setStats] = useState<StreamStats>(EMPTY);
+  const [note, setNote] = useState<string | undefined>(undefined);
+  const [conflict, setConflict] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (!enabled) {
+      setQueued(false);
+      setOwner(undefined);
+      return undefined;
+    }
+    const abort = new AbortController();
+    let admitted: NonNullable<typeof owner> | undefined;
+    setOwner(undefined);
+    setNote(undefined);
+    setConflict(undefined);
+    setMeta(undefined);
+    setStats(EMPTY);
+    setQueued(acquire !== undefined);
+    const admit = (release: (() => void) | undefined) => {
+      if (abort.signal.aborted) {
+        release?.();
+        return;
+      }
+      admitted = { abort, release, started: false };
+      setQueued(false);
+      setPhase("starting");
+      setOwner(admitted);
+    };
+    if (acquire === undefined) admit(undefined);
+    else
+      void acquire(abort.signal).then((release) => {
+        if (release !== undefined) admit(release);
+      });
+    return () => {
+      abort.abort();
+      if (admitted !== undefined && !admitted.started) admitted.release?.();
+      setPhase("stopped");
+    };
+  }, [enabled, api, workerId, deviceId, acquire]);
+
+  // why: admission first mounts the canvas; its effect then starts the capture, so even a first
+  // frame supplied immediately has somewhere to paint. A slot outlives abort until cleanup settles.
+  useEffect(() => {
+    if (owner === undefined || owner.abort.signal.aborted) return undefined;
+    owner.started = true;
+    const signal = owner.abort.signal;
+    void capture(api, workerId, deviceId, signal, {
+      canvas,
+      conflict: (message) => {
+        setConflict(message);
+        setPhase("stopped");
+      },
+      ended: (reason) => {
+        setNote(reason);
+        setPhase("stopped");
+      },
+      live: () => setPhase("live"),
+      setMeta,
+      setStats,
+    }).finally(() => owner.release?.());
+    return () => owner.abort.abort();
+  }, [owner, api, workerId, deviceId]);
+
+  return { canvas, conflict, queued, ...screenView({ meta, note, phase, stats }) };
+}
+
+/**
+ * why: the daemon names its reason in its own words and those words reach the reader, because they
+ * say what its operator has to fix; the status only decides what to add or replace. A 415 is the one
+ * refusal whose words are not kept: every such message a driver writes names the kind of device it
+ * cannot stream, and which kinds can be streamed is the drivers' knowledge and not this side's, so
+ * the console says only that this device cannot be streamed and names no kind.
+ */
+export function refusalOf(error: unknown): string {
+  if (!(error instanceof ApiError)) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  // why: an unknown route and an unknown device are the same answer, because a daemon with
+  // `capabilities.stream.enabled` off does not mount the route at all and answers like any path it has not heard of.
+  if (error.status === 404) {
+    return `${plainSentence(error.message)} A stream is only offered where capabilities.stream.enabled is on.`.trim();
+  }
+  if (error.status === 415) {
+    return "This device cannot be streamed.";
+  }
+  return plainSentence(error.message);
+}
+
+export interface CaptureSinks {
+  readonly canvas: RefObject<HTMLCanvasElement | null>;
+  readonly conflict: (message: string) => void;
+  readonly live: () => void;
+  readonly ended: (reason: string) => void;
+  readonly setMeta: (meta: StreamMeta) => void;
+  readonly setStats: (stats: StreamStats) => void;
+}
+
+// why: a stream that ended because this pane asked it to says nothing — the operator pressed Stop,
+// and telling them the stream they stopped has stopped is noise.
+export async function capture(
+  api: ReturnType<typeof useApi>,
+  workerId: string,
+  deviceId: string,
+  signal: AbortSignal,
+  sinks: CaptureSinks,
+): Promise<void> {
+  // why: a stream the server ends with no reason, after it had started a picture, is one its deadline
+  // ended (a proxy-signed identity's expiry) or a capture that lost its device; asking again gets the
+  // proxy's fresh identity, or the daemon's own refusal, which is shown. A stream that never started a
+  // picture, one that failed (a silent capture, a dropped connection) and a lease that ended (it says
+  // why in a last frame) are not retried, so a device that is gone is asked for once, not forever.
+  while (await captureOnce(api, workerId, deviceId, signal, sinks)) {
+    await new Promise((resolve) => setTimeout(resolve, RECONNECT_MS));
+    if (signal.aborted) return;
+  }
+}
+
+const RECONNECT_MS = 1_000;
+
+async function captureOnce(
+  api: ReturnType<typeof useApi>,
+  workerId: string,
+  deviceId: string,
+  signal: AbortSignal,
+  sinks: CaptureSinks,
+): Promise<boolean> {
+  let reconnect = false;
+  let started = false;
+  try {
+    const { body } = await api.stream(
+      `/v1/stream/workers/${encodeURIComponent(workerId)}/devices/${encodeURIComponent(deviceId)}`,
+      signal,
+      STREAM_HEAD_TIMEOUT_MS,
+    );
+    if (signal.aborted) {
+      await body.cancel().catch(() => undefined);
+      return false;
+    }
+    sinks.live();
+    await readStream(
+      body,
+      {
+        onEnd: (reason) => {
+          if (signal.aborted) return;
+          if (reason === undefined && started) reconnect = true;
+          else sinks.ended(reason ?? "The stream ended.");
+        },
+        onFrame: (frame) => {
+          if (!signal.aborted)
+            paint(sinks.canvas.current, frame.displayWidth, frame.displayHeight, frame);
+          frame.close();
+        },
+        onImage: (image) => {
+          if (!signal.aborted) paint(sinks.canvas.current, image.width, image.height, image);
+          image.close();
+        },
+        onMeta: (meta) => {
+          if (signal.aborted) return;
+          started = true;
+          sinks.setMeta(meta);
+        },
+        onStats: (stats) => {
+          if (!signal.aborted) sinks.setStats(stats);
+        },
+      },
+      signal,
+    );
+  } catch (error) {
+    if (signal.aborted) return false;
+    if (error instanceof ApiError && error.status === 409) sinks.conflict(error.message);
+    else sinks.ended(refusalOf(error));
+  }
+  return reconnect;
+}
+
+function paint(
+  target: HTMLCanvasElement | null,
+  width: number,
+  height: number,
+  source: CanvasImageSource,
+): void {
+  // why: the canvas goes away with the stream, and a frame the decoder was still holding arrives after
+  // that; drawing into nothing is what a stream ending looks like from here.
+  if (target === null) return;
+  if (target.width !== width || target.height !== height) {
+    target.width = width;
+    target.height = height;
+  }
+  target.getContext("2d")?.drawImage(source, 0, 0);
+}

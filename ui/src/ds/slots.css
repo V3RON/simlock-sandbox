@@ -1,0 +1,104 @@
+.slots {
+  display: flex;
+  min-width: 0;
+}
+
+.slots-meter {
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.slots-meter .load-bar {
+  flex: 1 1 4rem;
+}
+
+.slots-meter > :last-child {
+  white-space: nowrap;
+}
+
+.slots-sm {
+  gap: 3px;
+}
+
+.slots-sm .slot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+}
+
+.slots-md {
+  flex-wrap: nowrap;
+  gap: var(--space-1);
+}
+
+.slots-md .slot {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
+.slots-lg {
+  display: grid;
+  grid-template-columns: repeat(8, 16px);
+  gap: var(--space-1);
+}
+
+.slots-lg .slot {
+  width: 16px;
+  height: 16px;
+}
+
+.slot {
+  display: inline-block;
+  box-sizing: border-box;
+}
+
+.slot-leased {
+  background: var(--slot-leased);
+}
+
+.slot-ready {
+  background: var(--status-ok);
+}
+
+.slot-busy {
+  background: var(--status-idle);
+}
+
+.slot-broken {
+  background: var(--status-error);
+}
+
+.slot-absent {
+  background: var(--status-warn);
+}
+
+.slot-drained {
+  background: repeating-linear-gradient(135deg, var(--status-ok) 0 3px, var(--surface-2) 3px 6px);
+}
+
+.slot-shutdown {
+  background: var(--border-strong);
+}
+
+.slot-offline {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--border-strong) 0 3px,
+    var(--surface-2) 3px 6px
+  );
+}
+
+.slot-free {
+  border: 1px dashed var(--border-strong);
+}
+
+.slots-fraction {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.slots-meter .slots-fraction {
+  color: inherit;
+}

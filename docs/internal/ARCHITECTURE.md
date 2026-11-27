@@ -1,0 +1,127 @@
+# Architecture
+
+The map. Each module's manual (`src/<module>/AGENTS.md`) says what a change there must not break;
+each flow doc under [flows/](flows/) follows one path across modules; the
+[ADRs](adr/) say why.
+
+## Topology
+
+A **worker** is one daemon owning the simulators and emulators (and enrolled
+phones) on one machine. A **gateway** owns no device; workers dial out to it
+and it fronts them as one fleet. `mode` in the config picks which a daemon is.
+
+```
+agent ─spawns─> simlock CLI ──┐
+MCP client ─> stdio MCP ──────┼─ simlock/client ── unix socket ──┐
+                              │                                  ▼
+remote agent ── bearer token ─> HTTP frontend ── in process ──> Dispatcher ── handlers
+console (browser) ────────────┘                                  │
+                                                  worker: leasing + core ── drivers ── simctl / adb / devicectl
+                                                  gateway: fleet coordinator ── worker views
+                                                                  ▲
+worker daemon ── uplink (WebSocket to /v1/uplink, worker dials) ──┘
+```
+
+- One contract, one `Dispatcher` per daemon, every transport. HTTP calls the
+  dispatcher in process, never through the socket.
+- A gateway is a second set of handlers for the same contract. Every frontend
+  works against either mode unchanged.
+- State lives on the worker (`state.db`, its registry tables written only by core's
+  `Registry`; the warm pool's learned kinds in its own tables). A gateway keeps only its tokens, its instance id and its drained-worker set on
+  disk (`state.db`); everything else is rebuilt from the workers that reconnect.
+
+## Modules
+
+| Module | Does | Manual |
+|---|---|---|
+| contract | Every operation, schema, role, error code, protocol range | [contract](../../src/contract/AGENTS.md) |
+| modules | Optional-module contract and the host that loads each turned-on module | [modules](../../src/modules/AGENTS.md) |
+| module-registry | The list of optional modules, read by the composition root and the CLI | [module-registry](../../src/module-registry/AGENTS.md) |
+| driver-registry | Each driver's config section, read by the composition root and the CLI | [driver-registry](../../src/driver-registry/AGENTS.md) |
+| daemon | Composition root, socket server, `Dispatcher`, sessions, uplink dialler | [daemon](../../src/daemon/AGENTS.md) |
+| leasing | Every lease rule: admit, queue, plan, grant, renew, end | [leasing](../../src/leasing/AGENTS.md) |
+| core | Registry, device lifecycle, reclaim, quarantine, cleanup, components, baselines, doctor | [core](../../src/core/AGENTS.md) |
+| core/warm-pool | What stays booted, and warm targets | [warm-pool](../../src/core/warm-pool/AGENTS.md) |
+| core/seed-settle | When a quick seed is settled in the background | [seed-settle](../../src/core/seed-settle/AGENTS.md) |
+| core/capacity | Limits, RAM budget, reservations | [capacity](../../src/core/capacity/AGENTS.md) |
+| core/usage | Usage figures from the history rows, read on a thread | [usage](../../src/core/usage/AGENTS.md) |
+| drivers | The `Driver` port's two implementations | [drivers](../../src/drivers/AGENTS.md) · [android](../../src/drivers/android/AGENTS.md) · [android screen](../../src/drivers/android/screen/AGENTS.md) · [android input](../../src/drivers/android/input/AGENTS.md) · [ios](../../src/drivers/ios/AGENTS.md) · [ios input](../../src/drivers/ios/input/AGENTS.md) |
+| gateway | Fleet queue, routing, forwarding to workers, relay | [gateway](../../src/gateway/AGENTS.md) · [routing](../../src/gateway/routing/AGENTS.md) |
+| alerts | Gateway only: chosen fleet events POSTed to webhook destinations | [alerts](../../src/alerts/AGENTS.md) |
+| link | Byte channels over the uplink | [link](../../src/link/AGENTS.md) |
+| agent-device | Optional edge: the two agent-device daemons (simulators, phones) beside a worker, its HTTP front | [agent-device](../../src/agent-device/AGENTS.md) |
+| stream | Optional edge: a running device's live screen over HTTP, relayed by a gateway | [stream](../../src/stream/AGENTS.md) |
+| input | Optional edge: a lease holder's taps and keys over a WebSocket, relayed by a gateway | [input](../../src/input/AGENTS.md) |
+| fseventsd | Optional module: doctor warns when a macOS worker's `fseventsd` uses over 2 GB | [fseventsd](../../src/fseventsd/AGENTS.md) |
+| tunnel | Optional edge: a lease holder's reverse tunnels (device to caller) and forward tunnels (caller to device) on its Android device or iOS simulator over a WebSocket, on a lone worker or through a gateway | [tunnel](../../src/tunnel/AGENTS.md) |
+| lease-files | Core worker feature: a lease's files uploaded over HTTP to a folder under the data directory, served back with ranges, and removed when the lease ends | [lease-files](../../src/lease-files/AGENTS.md) |
+| auth | Credential → identity: tokens, admin secret, `hello`, uplink join token, HTTP strategies | [auth](../../src/auth/AGENTS.md) |
+| http | HTTP frontend: routes, SSE | [http](../../src/http/AGENTS.md) |
+| cli | Operator command surface | [cli](../../src/cli/AGENTS.md) |
+| mcp | stdio MCP server for one agent session | [mcp](../../src/mcp/AGENTS.md) |
+| simlock-client, client, admin | The typed programmatic client (`simlock/client`, `simlock/admin`) | [simlock-client](../../src/simlock-client/AGENTS.md) · [client](../../src/client/AGENTS.md) · [admin](../../src/admin/AGENTS.md) |
+| updater | The detached process that installs a Simlock version with npm, restarts the daemon and rolls back | [updater](../../src/updater/AGENTS.md) |
+| lease-policy | Client-side renew timer | [lease-policy](../../src/lease-policy/AGENTS.md) |
+| bus | Post-commit business events and their in-memory ring | [bus](../../src/bus/AGENTS.md) |
+| state | `state.db`: opens it, refuses an old file, damage and a newer version, migrates each owner's tables | [state](../../src/state/AGENTS.md) |
+| history | The durable event history: `history.db`, prune, set-aside, projections (usage: request, minute and device fact rows) | [history](../../src/history/AGENTS.md) |
+| ports | Every external API behind an interface, with a fake; `ws` loads lazily, in the CLI only for `simlock tunnel` | [ports](../../src/ports/AGENTS.md) |
+| host-load | CPU, memory and disk load samples | [host-load](../../src/host-load/AGENTS.md) |
+| instructions | The static rules text for agents: `simlock instructions`, the MCP server instructions and resource; `simlock setup`, which installs the router skill | [instructions](../../src/instructions/AGENTS.md) |
+| agent-identity | Default requester id for CLI and MCP | [agent-identity](../../src/agent-identity/AGENTS.md) |
+| shared | Small pure helpers two or more components use; imports nothing | [shared](../../src/shared/AGENTS.md) |
+| daemon-protocol | Socket framing and the protocol version | [daemon-protocol](../../src/daemon-protocol/AGENTS.md) |
+| test-support | Shared test helpers | [test-support](../../src/test-support/AGENTS.md) |
+| `ui/` | Web console, served by the daemon: data, model, state, design system and screens in layers | [ui](../../ui/AGENTS.md) · [console.mdx](../../website/src/content/docs/docs/reference/console.mdx) |
+| `packages/e2e` | The `@simlock/e2e` package: the device provider the `e2e` test runner leases simulators and emulators through. A second npm package of this workspace, released with `simlock` under one version | [ADR 0077](adr/0077-the-repository-is-a-workspace-and-its-packages-release-together-under-one-version.md) · [README](../../packages/e2e/README.md) |
+
+## Dependencies
+
+Arrows point from the optional to the required (architecture rule 15).
+`pnpm lint` (`.dependency-cruiser.mjs`, ADR 0027) enforces each line:
+
+| Rule | Means |
+|---|---|
+| `past-index` | Outside a component, import only its index file (tests may also import its testing file) |
+| `core-not-leasing` | Core declares a port; the composition root connects leasing to it |
+| `core-not-drivers` | Core and leasing reach a platform only through the `Driver` interface |
+| `no-fs-or-process` | Everything under `src/` but `ports/` uses ports, never `fs` or `child_process` |
+| `definition-is-light` | A module's or a driver's definition file imports its own module only for types or by dynamic import |
+| `auth-imports-little` | `src/auth` imports only ports and contract |
+| `modules-imports-little`, `modules-imports-bus-types-only` | `src/modules` imports only ports, contract, core and shared, and the bus for types |
+| `not-modules` | Core, leasing, drivers, gateway and contract import nothing from modules or module-registry |
+| `not-agent-device` | Core, leasing and drivers import nothing from agent-device |
+| `host-load-imports-ports-only`, `not-host-load` | host-load stands alone, apart from shared |
+| `alerts-imports-bus-ports-core-only`, `not-alerts` | alerts imports the bus, ports and core only; only `src/daemon/main.ts` imports it |
+| `not-stream`, `stream-not-edges` | Nothing required imports stream; stream imports no frontend, gateway or driver |
+| `not-input`, `input-not-edges` | Nothing required imports input; input imports no frontend, gateway or driver |
+| `gateway-not-edges`, `gateway-only-dispatch` | Gateway imports no driver or frontend, and from daemon only `src/daemon/dispatch.ts` |
+| `only-main-knows-gateway` | In daemon, only `src/daemon/main.ts` imports the gateway |
+| `link-is-portable`, `link-imports-port-types-only` | The link uses no Node module or package, and only the types of ports |
+| `contract-imports-nothing` | The contract imports nothing outside itself |
+| `shared-imports-nothing` | `src/shared` imports nothing: no component, package or Node module |
+| `packages-not-from-root-code`, `packages-not-in-root-code` | Nothing under `packages/` imports `src/`, `ui/` or `e2e/`, and none of those imports `packages/`, except an `e2e/` test file driving a package (ADR 0077 §3) |
+
+A directory under `src/` with an index file is a component. Two components
+never import each other, directly or through a third.
+
+## Flows
+
+| Flow | Doc |
+|---|---|
+| A lease, from request to reclaim | [leasing](../../src/leasing/AGENTS.md) |
+| A lease through a gateway | [gateway](../../src/gateway/AGENTS.md) |
+| Which device a request gets | [device-selection](flows/device-selection.md) |
+| Startup and stop | [startup](flows/startup.md) |
+| `device.exec`, local and through a gateway | [device-exec](flows/device-exec.md) |
+| agent-device through simlock | [agent-device](../../src/agent-device/AGENTS.md) |
+| A screen stream, local and through a gateway | [stream](../../src/stream/AGENTS.md) |
+| A lease's input socket, local and through a gateway | [input](../../src/input/AGENTS.md) |
+
+## Rules that cut across modules
+
+- One place enforces a rule (architecture rule 10).
+- Events go out after the commit that made them true ([events.md](agent-rules/events.md)).
+- Simlock destroys only what its registry owns, and never touches a leased
+  device ([safety.md](agent-rules/safety.md)).
+- Every external API sits behind a port with an in-memory fake (architecture rule 9).

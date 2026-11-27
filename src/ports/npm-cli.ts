@@ -1,0 +1,110 @@
+import { dirname, join } from "node:path";
+
+import type { Filesystem } from "./filesystem.js";
+import type { ProcessRunner } from "./process-runner.js";
+
+export type NpmOutcome =
+  | { readonly ok: true; readonly output: string }
+  | { readonly ok: false; readonly message: string };
+
+export interface NpmCli {
+  view(spec: string, signal?: AbortSignal): Promise<NpmOutcome>;
+  install(spec: string): Promise<NpmOutcome>;
+  globalRoot(): Promise<NpmOutcome>;
+}
+
+export interface NpmCall {
+  readonly method: "view" | "install" | "globalRoot";
+  readonly spec: string | undefined;
+}
+
+export class FakeNpmCli implements NpmCli {
+  readonly calls: NpmCall[] = [];
+  readonly #script: Record<NpmCall["method"], NpmOutcome[]>;
+
+  constructor(script: Partial<Record<NpmCall["method"], readonly NpmOutcome[]>> = {}) {
+    this.#script = {
+      view: [...(script.view ?? [])],
+      install: [...(script.install ?? [{ ok: true, output: "" }])],
+      globalRoot: [...(script.globalRoot ?? [])],
+    };
+  }
+
+  async view(spec: string, _signal?: AbortSignal): Promise<NpmOutcome> {
+    return this.#answer("view", spec);
+  }
+
+  async install(spec: string): Promise<NpmOutcome> {
+    return this.#answer("install", spec);
+  }
+
+  async globalRoot(): Promise<NpmOutcome> {
+    return this.#answer("globalRoot", undefined);
+  }
+
+  #answer(method: NpmCall["method"], spec: string | undefined): NpmOutcome {
+    this.calls.push({ method, spec });
+    const queue = this.#script[method];
+    const outcome = queue.length > 1 ? queue.shift() : queue[0];
+    if (outcome === undefined) {
+      throw new Error(`FakeNpmCli has no answer for ${method}`);
+    }
+    return outcome;
+  }
+}
+
+export interface NodeNpmCliOptions {
+  readonly runner: ProcessRunner;
+  readonly filesystem: Filesystem;
+  readonly dataDirectory: string;
+  readonly execPath?: string;
+}
+
+const SHORT_LIMIT_MS = 30_000;
+const INSTALL_LIMIT_MS = 10 * 60_000;
+const MESSAGE_CHARACTERS = 2000;
+
+export class NodeNpmCli implements NpmCli {
+  constructor(private readonly options: NodeNpmCliOptions) {}
+
+  async view(spec: string, signal?: AbortSignal): Promise<NpmOutcome> {
+    return this.#run(["view", spec, "version"], SHORT_LIMIT_MS, "30 seconds", signal);
+  }
+
+  async install(spec: string): Promise<NpmOutcome> {
+    return this.#run(["i", "-g", spec], INSTALL_LIMIT_MS, "10 minutes");
+  }
+
+  async globalRoot(): Promise<NpmOutcome> {
+    return this.#run(["root", "-g"], SHORT_LIMIT_MS, "30 seconds");
+  }
+
+  // why: the Windows installer has no `npm` symlink, only a shell wrapper Node cannot parse.
+  async #script(node: string): Promise<string> {
+    const bundled = join(dirname(node), "node_modules", "npm", "bin", "npm-cli.js");
+    if (await this.options.filesystem.exists(bundled)) return bundled;
+    return this.options.filesystem.realpath(join(dirname(node), "npm"));
+  }
+
+  async #run(
+    args: readonly string[],
+    timeoutMs: number,
+    limit: string,
+    signal?: AbortSignal,
+  ): Promise<NpmOutcome> {
+    const node = this.options.execPath ?? process.execPath;
+    const script = await this.#script(node);
+    const result = await this.options.runner.run(node, [script, ...args], {
+      cwd: this.options.dataDirectory,
+      timeoutMs,
+      ...(signal === undefined ? {} : { signal }),
+    });
+    if (result.code === null) {
+      return { ok: false, message: `npm did not finish within ${limit}` };
+    }
+    if (result.code !== 0) {
+      return { ok: false, message: result.stderr.trim().slice(-MESSAGE_CHARACTERS) };
+    }
+    return { ok: true, output: result.stdout.trim() };
+  }
+}

@@ -1,0 +1,318 @@
+import { describe, expect, it } from "vitest";
+
+import { waitFor, withDaemon } from "./helpers/index.js";
+import type { CliBackgroundHandle } from "./helpers/cli.js";
+import type { ScriptedObservedDevice } from "./fake-driver/types.js";
+
+interface DeviceRow {
+  readonly id: string;
+  readonly driverDeviceId: string;
+  readonly state: string;
+  readonly foreignProvenanceDetectedAt?: number;
+}
+
+interface Finding {
+  readonly kind: string;
+  readonly deviceId?: string;
+  readonly device?: { readonly deviceId: string };
+  readonly detail?: string;
+}
+
+async function deviceRows(env: Awaited<ReturnType<typeof withDaemon>>): Promise<DeviceRow[]> {
+  const result = await env.cli(["list", "--devices"]);
+  if (result.code !== 0) throw new Error(`simlock list --devices failed: ${result.stderr}`);
+  return result.json as DeviceRow[];
+}
+
+function leaseHeld(
+  env: Awaited<ReturnType<typeof withDaemon>>,
+  agentId: string,
+): CliBackgroundHandle {
+  return env.cliBackground([
+    "lease",
+    "--platform",
+    "ios",
+    "--device",
+    "iPhone 16",
+    "--os",
+    "18.4",
+    "--agent-id",
+    agentId,
+  ]);
+}
+
+interface Grant {
+  readonly lease: { readonly id: string };
+  readonly device: { readonly driverDeviceId: string };
+}
+
+async function grantOf(held: CliBackgroundHandle): Promise<Grant> {
+  return JSON.parse(await held.firstStdoutLine()) as Grant;
+}
+
+describe("doctor and drift", () => {
+  it("reports registry vs. reality drift, applies only registry-safe fixes, and skips leased devices", async () => {
+    const env = await withDaemon({
+      configOverrides: {
+        limits: { maxRunning: 5, ios: { maxDevices: 5, maxRunning: 5 } },
+        warmPool: {
+          targets: [{ count: 4, model: "iPhone 16", osVersion: "18.4", platform: "ios" }],
+        },
+      },
+      driverScript: { ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] } },
+    });
+
+    // why: a released device is deleted, so A, C, D and E are the four idle devices the warm pool keeps ready; B is leased from the fifth slot throughout as the "must skip a leased device" case.
+    await waitFor(
+      async () => (await deviceRows(env)).filter((row) => row.state === "ready").length === 4,
+      { label: "the warm pool keeps four devices ready" },
+    );
+    const heldB = leaseHeld(env, "doctor-b");
+    const deviceB = await grantOf(heldB);
+    let idle: DeviceRow[] = [];
+    await waitFor(
+      async () => {
+        idle = (await deviceRows(env)).filter((row) => row.state === "ready");
+        return idle.length === 4;
+      },
+      { label: "the pool refills to four ready devices beside the leased one" },
+    );
+    const [deviceA, deviceC, deviceD, deviceE] = idle.map((row) => ({
+      device: { driverDeviceId: row.driverDeviceId },
+    })) as [
+      Pick<Grant, "device">,
+      Pick<Grant, "device">,
+      Pick<Grant, "device">,
+      Pick<Grant, "device">,
+    ];
+    const distinctUdids = new Set(
+      [deviceA, deviceB, deviceC, deviceD, deviceE].map((d) => d.device.driverDeviceId),
+    );
+    expect(distinctUdids.size, "expected 5 distinct devices, one leased and four idle").toBe(5);
+
+    const rows = await deviceRows(env);
+    const registryIdOf = (udid: string): string => {
+      const row = rows.find((candidate) => candidate.driverDeviceId === udid);
+      if (row === undefined) throw new Error(`No registry row for driverDeviceId ${udid}`);
+      return row.id;
+    };
+
+    const stagedDevices: ScriptedObservedDevice[] = [
+      { deviceId: deviceA.device.driverDeviceId, runState: "stopped" },
+      { deviceId: deviceB.device.driverDeviceId, runState: "stopped" },
+      // why: deviceC.device.driverDeviceId deliberately omitted.
+      {
+        deviceId: deviceD.device.driverDeviceId,
+        runState: "running",
+        mark: { durable: "tok-d", erasableReadable: true },
+      },
+      {
+        deviceId: deviceE.device.driverDeviceId,
+        runState: "running",
+        mark: { durable: "tok-e", erasable: "stale", erasableReadable: false },
+      },
+      { deviceId: "fake-ios-99-unregistered", runState: "running" },
+    ];
+    await env.driverScript.merge({
+      ios: {
+        managedReality: {
+          devices: stagedDevices,
+          processes: [{ deviceId: "fake-ios-100-orphan" }],
+        },
+      },
+    });
+
+    const dryRun = await env.cli(["doctor"]);
+    expect(dryRun.code).toBe(0);
+    const findings = (dryRun.json as { findings: Finding[] }).findings;
+
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        kind: "foreign-state-change",
+        deviceId: registryIdOf(deviceA.device.driverDeviceId),
+        expected: "running",
+        observed: "stopped",
+      }),
+    );
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        kind: "foreign-state-change",
+        deviceId: registryIdOf(deviceB.device.driverDeviceId),
+        expected: "running",
+        observed: "stopped",
+      }),
+    );
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        kind: "registry-device-missing",
+        deviceId: registryIdOf(deviceC.device.driverDeviceId),
+      }),
+    );
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        kind: "foreign-provenance-change",
+        deviceId: registryIdOf(deviceD.device.driverDeviceId),
+        detail: "erased",
+      }),
+    );
+    expect(
+      findings.some((finding) => finding.deviceId === registryIdOf(deviceE.device.driverDeviceId)),
+      "deviceE has an unreadable erasable mark and must produce no finding at all",
+    ).toBe(false);
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        kind: "orphan-device",
+        device: expect.objectContaining({ deviceId: "fake-ios-99-unregistered" }),
+      }),
+    );
+    expect(findings).toContainEqual(
+      expect.objectContaining({
+        kind: "orphan-process",
+        device: expect.objectContaining({ deviceId: "fake-ios-100-orphan" }),
+      }),
+    );
+
+    await env.driverLog.clear();
+    const fixed = await env.cli(["doctor", "--fix"]);
+    expect(fixed.code).toBe(0);
+
+    // why: registry-only destruction (safety.md #1/#3): --fix must never call a destructive
+    // or state-changing driver verb. Every correction above is pure registry bookkeeping. The calls that are not --fix's are the warm pool's: booting back the device --fix just
+    // marked shut down, and creating and booting one device to refill the leased kind that lost
+    // device C from the registry.
+    const calls = await env.driverLog.calls();
+    const destructiveOps = new Set(["destroy", "shutdown", "reclaim"]);
+    expect(
+      calls.filter((call) => destructiveOps.has(call.operation)),
+      `--fix must be registry-only; saw: ${JSON.stringify(calls.map((call) => call.operation))}`,
+    ).toEqual([]);
+    for (const call of calls.filter((entry) => entry.operation === "makeReady")) {
+      const booted = JSON.stringify(call.arguments);
+      expect(
+        booted.includes(deviceA.device.driverDeviceId) ||
+          ![...distinctUdids].some((udid) => booted.includes(udid)),
+        "the warm pool boots only the corrected device or a device it created",
+      ).toBe(true);
+    }
+
+    const rowsAfterFix = await deviceRows(env);
+    const rowA = rowsAfterFix.find((row) => row.id === registryIdOf(deviceA.device.driverDeviceId));
+    // why: `shutdown` is what --fix commits; the warm pool may already have booted the device back.
+    expect(["shutdown", "ready"], "deviceA must not be left in any other state").toContain(
+      rowA?.state,
+    );
+    const shutdownEvents = (await env.events()).filter(
+      (entry) =>
+        entry.event === "device.shutdown" &&
+        JSON.stringify(entry.payload).includes(registryIdOf(deviceA.device.driverDeviceId)),
+    );
+    expect(
+      shutdownEvents.map((entry) => entry.payload),
+      "deviceA's foreign-state-change should have been corrected by doctor",
+    ).toEqual([{ deviceId: registryIdOf(deviceA.device.driverDeviceId), initiator: "doctor" }]);
+    const rowB = rowsAfterFix.find((row) => row.id === registryIdOf(deviceB.device.driverDeviceId));
+    expect(rowB?.state, "leased deviceB must be left alone by --fix").toBe("leased");
+    const rowC = rowsAfterFix.find((row) => row.id === registryIdOf(deviceC.device.driverDeviceId));
+    expect(rowC?.state, "vanished deviceC should be marked deleted, not recreated").toBe("deleted");
+    const rowD = rowsAfterFix.find((row) => row.id === registryIdOf(deviceD.device.driverDeviceId));
+    expect(
+      rowD?.foreignProvenanceDetectedAt,
+      "provenance drift is report-only -- re-marking would destroy the evidence",
+    ).toBeGreaterThan(0);
+
+    heldB.kill("SIGKILL");
+    await heldB.waitForExit(15_000).catch(() => undefined);
+  });
+
+  it("reports a scripted missing prerequisite in the JSON report and on stderr, and stops once it is installed", async () => {
+    const env = await withDaemon();
+    const emulator = {
+      prerequisite: "android-emulator",
+      message: "The Android emulator package is not installed.",
+      remedy: "Run `sdkmanager --install emulator`.",
+    };
+    await env.driverScript.set({ android: { missingPrerequisites: [emulator] } });
+
+    const missing = await env.cli(["doctor"]);
+    expect(missing.code).toBe(0);
+    expect((missing.json as { findings: unknown[] }).findings).toEqual([
+      { kind: "prerequisite-missing", platform: "android", ...emulator },
+    ]);
+    expect(missing.stderr).toContain(
+      "Missing [android] android-emulator: The Android emulator package is not installed. " +
+        "Run `sdkmanager --install emulator`.",
+    );
+
+    await env.driverScript.set({ android: {} });
+    const installed = await env.cli(["doctor"]);
+    expect((installed.json as { findings: unknown[] }).findings).toEqual([]);
+    expect(installed.stderr).not.toContain("Missing [");
+  });
+
+  it("purges orphans only when asked and confirmed and the root re-proves first, while --fix only reports them", async () => {
+    const env = await withDaemon();
+    const orphanScript = {
+      knownModels: ["iPhone 16"],
+      availableOsVersions: ["18.4"],
+      managedReality: {
+        devices: [{ deviceId: "fake-ios-orphan", runState: "running" as const }],
+        processes: [{ deviceId: "fake-ios-orphan" }],
+      },
+    };
+    await env.driverScript.set({ ios: orphanScript });
+    const operations = async () => (await env.driverLog.calls()).map((call) => call.operation);
+    const kinds = (result: { json?: unknown }) =>
+      (result.json as { findings: Finding[] }).findings.map((f) => f.kind);
+
+    const reported = await env.cli(["doctor"]);
+    expect(reported.code).toBe(0);
+    expect(kinds(reported)).toEqual(["orphan-device", "orphan-process"]);
+
+    // why: ADR 0001 decision 6: `purgeOrphans` is not part of `fix`, so an operator already running
+    // `doctor --fix` unattended does not gain a device-destroying behaviour by upgrading. Its
+    // own step, asserted on its own: folding the purge into `fix` would still pass the purge
+    // steps below. `--yes` too, since the confirmation is not what keeps `--fix` safe.
+    await env.driverLog.clear();
+    const fixed = await env.cli(["doctor", "--fix", "--yes"]);
+    expect(fixed.code).toBe(0);
+    expect(kinds(fixed)).toEqual(["orphan-device", "orphan-process"]);
+    expect(await operations(), "--fix must never destroy a device").not.toContain("destroy");
+    // why: The purge is the only path that re-proves the root, because it is the only one that
+    // was ever going to destroy anything.
+    expect(await operations()).not.toContain("revalidateRoot");
+
+    // why: No TTY behind the e2e CLI, so `confirm` answers no: the refusal is the documented
+    // `USAGE`/exit 2 contract `release --all` already has (safety rule 5).
+    await env.driverLog.clear();
+    const declined = await env.cli(["doctor", "--purge-orphans"]);
+    expect(declined.code).toBe(2);
+    expect(declined.error?.code).toBe("USAGE");
+    expect(await operations()).not.toContain("destroy");
+
+    // why: A root that stopped proving ownership is exactly the case where `listManaged` may be
+    // describing the user's own devices: the orphans stay reported, and stay on disk.
+    await env.driverScript.set({
+      ios: {
+        ...orphanScript,
+        failures: { revalidateRoot: { type: "generic", message: "root is a symlink now" } },
+      },
+    });
+    await env.driverLog.clear();
+    const refused = await env.cli(["doctor", "--purge-orphans", "--yes"]);
+    expect(refused.code).toBe(0);
+    expect(kinds(refused)).toEqual(["orphan-device", "orphan-process"]);
+    expect(await operations()).not.toContain("destroy");
+
+    await env.driverScript.set({ ios: orphanScript });
+    await env.driverLog.clear();
+    const purged = await env.cli(["doctor", "--purge-orphans", "--yes"]);
+    expect(purged.code).toBe(0);
+    // why: Both findings go: destroying the device covers the process it was running.
+    expect((purged.json as { findings: Finding[] }).findings).toEqual([]);
+    expect(
+      (await operations()).filter((operation) => operation !== "listManaged"),
+      "the root is re-proven before anything is destroyed",
+    ).toEqual(["revalidateRoot", "destroy"]);
+    await env.expectEvents(["device.orphan-purged"]);
+  });
+});

@@ -1,0 +1,176 @@
+// why: every import here is type-only -- a value import through this file would pull a whole
+// component into the router's own load and break the lazy command tree.
+import type { SimlockAdminClient } from "../admin/index.js";
+import type { EventEnvelope } from "../bus/index.js";
+import type { PassthroughCommand } from "../client/index.js";
+import type { RunTool } from "../instructions/index.js";
+import type {
+  Clock,
+  DaemonFlag,
+  DaemonHome,
+  DaemonLauncher,
+  Filesystem,
+  HttpJsonClient,
+  HttpStreamClient,
+  IpcConnector,
+  ParentWatch,
+  ProcessRunner,
+  ServiceDefinition,
+  ServiceManager,
+  SystemStats,
+  TcpListenerFactory,
+  TcpStreamConnector,
+  WebSocketClientConnector,
+} from "../ports/index.js";
+
+export interface Signals {
+  on(signal: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+  off(signal: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+}
+
+export interface Output {
+  write(value: string): unknown;
+}
+
+/** why: the CLI's own shape for "start the stdio MCP server and run until it closes";
+ * `src/mcp/main.ts` has a runner of the same job under the same name and a different shape, so
+ * this one is named for what the CLI holds rather than shared, which would couple the two. */
+export type McpStdioLauncher = (options: {
+  readonly daemonFlag: DaemonFlag;
+  readonly remote?: {
+    readonly url: string;
+    readonly token: string;
+    readonly allowInsecureHttp: boolean;
+  };
+}) => Promise<void>;
+
+export interface ServiceSetup {
+  readonly manager: ServiceManager | undefined;
+  readonly platform: NodeJS.Platform;
+  readonly home: string;
+  /** why: read only where the linger hint needs it; the lookup throws for a uid with no passwd entry. */
+  readonly user: () => string;
+  readonly root: string;
+  readonly nodePath: string;
+  readonly mainPath: string;
+}
+
+export interface CliServiceAccess {
+  readonly manager: ServiceManager | undefined;
+  readonly platform: NodeJS.Platform;
+  /** why: read only where the linger hint needs it; the lookup throws for a uid with no passwd entry. */
+  readonly user: () => string;
+  readonly definition: () => Promise<ServiceDefinition>;
+  /** why: install checks the config the daemon will load before it registers a service that would restart a daemon refusing it. */
+  readonly checkConfig: () => Promise<void>;
+}
+
+/** why: set by the router when a command runs against a farm (`--url` or `SIMLOCK_URL`); `token` is `--token` else `SIMLOCK_TOKEN`, and may be missing. */
+export interface RemoteFarm {
+  readonly url: string;
+  readonly token: string | undefined;
+  /** why: `--allow-insecure-http`, and the variable's raw value; the farm URL check judges them, so a command that checks none never refuses a stale one. */
+  readonly allowInsecureHttpFlag: boolean;
+  readonly allowInsecureHttpVariable: string | undefined;
+}
+
+export interface CliEnvironment {
+  readonly remote?: RemoteFarm | undefined;
+  /** why: the raw `SIMLOCK_ALLOW_INSECURE_HTTP`, unjudged: only a farm URL check reads it, so a leftover value never breaks a command that checks none. */
+  readonly allowInsecureHttpFromEnv?: string | undefined;
+  readonly clock: Clock;
+  readonly configPath: string;
+  readonly daemonHome: DaemonHome;
+  readonly requesterId: string;
+  /** why: with no `SIMLOCK_AGENT_ID` and no agent session the requester is this process, which no later command of a shell can name. */
+  readonly requesterIsProcess?: boolean;
+  readonly homeDirectory: string;
+  readonly workingDirectory: string;
+  readonly codexHome?: string | undefined;
+  /** why: `setup` lists iOS in its machine summary only on a macOS host, where the daemon has an iOS driver. */
+  readonly hostPlatform?: NodeJS.Platform | undefined;
+  readonly runTool: RunTool;
+  readonly filesystem: Filesystem;
+  /** why: `untilStarted` makes a launch return only once the daemon has left `starting`, so a start that fails after its first answer is reported as the daemon's own error. */
+  readonly connectAdmin: (
+    resolveCredential: () => Promise<string | undefined>,
+    options?: { readonly untilStarted?: boolean },
+  ) => Promise<SimlockAdminClient>;
+  readonly connectExistingAdmin: (
+    resolveCredential: () => Promise<string | undefined>,
+  ) => Promise<SimlockAdminClient>;
+  /** why: a daemon stopping refuses connections while it still holds its socket; the endpoint going away is the proof it is gone. */
+  readonly daemonEndpointPresent: () => Promise<boolean>;
+  readonly adminTokenFromEnv?: string;
+  /** why: `SIMLOCK_BASELINE` names the baseline a lease asks for when `--baseline` is absent. */
+  readonly baselineFromEnv?: string;
+  /** why: `SIMLOCK_RUN` names the run id a lease carries when `--run` is absent; empty is unset, and the command checks it. */
+  readonly runFromEnv?: string;
+  /** why: on GitHub Actions the run id falls back to `<GITHUB_RUN_ID>-<GITHUB_RUN_ATTEMPT, else 1>`; the command drops a value that fails the run id rule. */
+  readonly githubRunFromEnv?: string;
+  readonly readAdminTokenFile: () => Promise<string | undefined>;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly readConfigFile: () => Promise<Record<string, unknown>>;
+  readonly writeConfigFile: (contents: Record<string, unknown>) => Promise<void>;
+  readonly validateConfig: (merged: Record<string, unknown>) => Promise<void>;
+  readonly service?: CliServiceAccess;
+  readonly readLogFile?: () => Promise<string>;
+  readonly followLogFile?: () => Promise<void>;
+  readonly readEventHistory: (sinceTs: number) => Promise<readonly EventEnvelope[]>;
+  readonly loadMcpStdio?: () => Promise<McpStdioLauncher>;
+  readonly runMcpStdio?: McpStdioLauncher;
+  readonly signals: Signals;
+  readonly parentPid?: number;
+  readonly parentWatch?: ParentWatch;
+  readonly stderr: Output;
+  readonly stdout: Output;
+  /** why: `simlock files get` prints a binary file as it is, which a string sink would re-encode. */
+  readonly stdoutBytes: (bytes: Uint8Array) => unknown;
+  readonly confirm?: ((question: string) => Promise<boolean>) | undefined;
+  readonly runPassthrough?: (command: PassthroughCommand) => Promise<number>;
+  /** why: `simlock tunnel` reaches a worker or gateway over HTTP and WebSocket, not the daemon's socket; each port loads its adapter on first use. */
+  readonly webSocket: WebSocketClientConnector;
+  readonly httpJson: HttpJsonClient;
+  /** why: `simlock files` moves a file of any size over HTTP, which the capped GET of `httpJson` cannot. */
+  readonly httpStream: HttpStreamClient;
+  readonly tcpStreams: TcpStreamConnector;
+  /** why: a `forward` tunnel listens on the caller's loopback port; the adapter loads on first use. */
+  readonly tcpListeners: TcpListenerFactory;
+  /** why: `simlock tunnel emulator adb` runs the caller's own adb; absent, adb is not found. */
+  readonly processRunner?: ProcessRunner | undefined;
+  /** why: the commands that may be the caller's adb, in the order they are tried: `adb` on the PATH, then each Android SDK folder's `platform-tools`. */
+  readonly adbCandidates?: readonly string[] | undefined;
+  /** why: `SIMLOCK_URL` and `SIMLOCK_TOKEN` name the farm every command reaches, and the credential it sends, when no `--url` or `--token` does. */
+  readonly tunnelUrl?: string;
+  readonly tunnelToken?: string;
+  readonly readStdin?: () => Promise<string>;
+}
+
+export interface CliEnvironmentPorts {
+  readonly filesystem: Filesystem;
+  readonly clock: Clock;
+  readonly systemStats: SystemStats;
+  readonly ipc: IpcConnector;
+  readonly launcher: DaemonLauncher;
+  readonly daemonHome: DaemonHome;
+  readonly homeDirectory: string;
+  readonly workingDirectory: string;
+  readonly codexHome?: string | undefined;
+  readonly hostPlatform?: NodeJS.Platform | undefined;
+  readonly runTool: RunTool;
+  readonly service?: ServiceSetup;
+  readonly parentWatch?: ParentWatch;
+  readonly signals?: Signals;
+  readonly stderr?: Output;
+  readonly stdout?: Output;
+  readonly confirm?: ((question: string) => Promise<boolean>) | undefined;
+  readonly runPassthrough?: (command: PassthroughCommand) => Promise<number>;
+  readonly readStdin?: () => Promise<string>;
+  readonly parentPid?: number;
+  readonly webSocket?: WebSocketClientConnector;
+  readonly httpJson?: HttpJsonClient;
+  readonly httpStream?: HttpStreamClient;
+  readonly tcpStreams?: TcpStreamConnector;
+  readonly tcpListeners?: TcpListenerFactory;
+  readonly processRunner?: ProcessRunner;
+}

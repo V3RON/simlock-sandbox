@@ -1,0 +1,178 @@
+import type { Filesystem } from "../../ports/index.js";
+
+/**
+ * why: Where each Android SDK tool lives. Driver discovery and the `doctor` prerequisite check both
+ * ask this file, so the two can never disagree about whether a tool is there (architecture
+ * rule 10).
+ */
+export interface AndroidSdkPaths {
+  readonly adb: string;
+  readonly avdmanager: string;
+  readonly emulator: string;
+  readonly root: string;
+  readonly sdkmanager: string;
+}
+
+/**
+ * why: The SDK's command-line tools are `.bat` scripts on Windows and its binaries `.exe`; a path
+ * without the extension is not a file there, so a complete SDK would read as missing every tool.
+ */
+export function withWindowsExtension(
+  path: string,
+  platform: NodeJS.Platform,
+  extension: ".bat" | ".exe",
+): string {
+  return platform === "win32" ? `${path}${extension}` : path;
+}
+
+/** why: Android Studio installs the SDK under `%LOCALAPPDATA%` on Windows, so a machine with no `ANDROID_HOME` still finds it there. */
+function defaultSdkRoot(
+  env: Readonly<Record<string, string | undefined>>,
+  homeDirectory: string,
+  platform: NodeJS.Platform,
+): string {
+  if (platform !== "win32") return `${homeDirectory}/Library/Android/sdk`;
+  const localAppData = env.LOCALAPPDATA;
+  return localAppData === undefined || localAppData === ""
+    ? `${homeDirectory}/AppData/Local/Android/Sdk`
+    : `${localAppData}/Android/Sdk`;
+}
+
+function sdkSearchRoots(
+  env: Readonly<Record<string, string | undefined>>,
+  homeDirectory: string,
+  platform: NodeJS.Platform,
+): string[] {
+  return [
+    env.ANDROID_HOME,
+    env.ANDROID_SDK_ROOT,
+    defaultSdkRoot(env, homeDirectory, platform),
+  ].filter((root): root is string => root !== undefined && root !== "");
+}
+
+/**
+ * why: Which SDK root is the SDK. `complete`: the first searched root holding every tool, the one
+ * driver discovery runs. Otherwise `incomplete`: the first searched root that is a directory, the
+ * one a prerequisite check reports on. Otherwise `absent`. Both discovery and the check ask this,
+ * so a running driver's SDK is never the one reported as missing tools.
+ */
+export type SdkLocation =
+  | { readonly kind: "complete"; readonly paths: AndroidSdkPaths }
+  | { readonly kind: "incomplete"; readonly root: string; readonly searched: readonly string[] }
+  | { readonly kind: "absent"; readonly searched: readonly string[] };
+
+export async function locateSdk(
+  env: Readonly<Record<string, string | undefined>>,
+  homeDirectory: string,
+  filesystem: Filesystem,
+  platform: NodeJS.Platform = process.platform,
+): Promise<SdkLocation> {
+  const searched = sdkSearchRoots(env, homeDirectory, platform);
+  const directories: string[] = [];
+  for (const root of searched) {
+    if (await isDirectory(filesystem, root)) directories.push(root);
+  }
+  for (const root of directories) {
+    const paths = await sdkPathsAt(root, filesystem, platform);
+    if (paths !== undefined) return { kind: "complete", paths };
+  }
+  const first = directories[0];
+  return first === undefined
+    ? { kind: "absent", searched }
+    : { kind: "incomplete", root: first, searched };
+}
+
+async function isDirectory(filesystem: Filesystem, path: string): Promise<boolean> {
+  try {
+    return (await filesystem.stat(path)).kind === "directory";
+  } catch {
+    return false;
+  }
+}
+
+export function emulatorPath(root: string, platform: NodeJS.Platform = process.platform): string {
+  return withWindowsExtension(`${root}/emulator/emulator`, platform, ".exe");
+}
+
+export function adbPath(root: string, platform: NodeJS.Platform = process.platform): string {
+  return withWindowsExtension(`${root}/platform-tools/adb`, platform, ".exe");
+}
+
+async function sdkPathsAt(
+  root: string,
+  filesystem: Filesystem,
+  platform: NodeJS.Platform,
+): Promise<AndroidSdkPaths | undefined> {
+  const tools = await sdkToolBin(root, filesystem, platform);
+  const emulator = emulatorPath(root, platform);
+  const adb = adbPath(root, platform);
+  if (
+    tools === undefined ||
+    !(await filesystem.exists(emulator)) ||
+    !(await filesystem.exists(adb))
+  ) {
+    return undefined;
+  }
+  return { adb, emulator, root, ...tools };
+}
+
+/**
+ * why: The newest `cmdline-tools/<version>/bin` holding both `avdmanager` and `sdkmanager`, or the
+ * obsolete `tools/bin` when none does.
+ */
+export async function sdkToolBin(
+  root: string,
+  filesystem: Filesystem,
+  platform: NodeJS.Platform = process.platform,
+): Promise<Pick<AndroidSdkPaths, "avdmanager" | "sdkmanager"> | undefined> {
+  const bins = [...(await commandLineToolBins(root, filesystem)), `${root}/tools/bin`];
+  for (const bin of bins) {
+    const avdmanager = withWindowsExtension(`${bin}/avdmanager`, platform, ".bat");
+    const sdkmanager = withWindowsExtension(`${bin}/sdkmanager`, platform, ".bat");
+    if ((await filesystem.exists(avdmanager)) && (await filesystem.exists(sdkmanager))) {
+      return { avdmanager, sdkmanager };
+    }
+  }
+  return undefined;
+}
+
+async function commandLineToolBins(root: string, filesystem: Filesystem): Promise<string[]> {
+  const toolsRoot = `${root}/cmdline-tools`;
+  if (!(await filesystem.exists(toolsRoot))) {
+    return [];
+  }
+
+  const directories = await filesystem.readdir(toolsRoot);
+  return directories
+    .sort(compareCommandLineToolVersions)
+    .reverse()
+    .map((directory) => `${toolsRoot}/${directory}/bin`);
+}
+
+function compareCommandLineToolVersions(left: string, right: string): number {
+  if (left === "latest") {
+    return 1;
+  }
+  if (right === "latest") {
+    return -1;
+  }
+
+  const leftSegments = left.split(".").map(Number);
+  const rightSegments = right.split(".").map(Number);
+  if (leftSegments.every(Number.isFinite) && rightSegments.every(Number.isFinite)) {
+    const length = Math.max(leftSegments.length, rightSegments.length);
+    for (let index = 0; index < length; index += 1) {
+      const difference = (leftSegments[index] ?? 0) - (rightSegments[index] ?? 0);
+      if (difference !== 0) {
+        return difference;
+      }
+    }
+  }
+
+  return left.localeCompare(right);
+}
+
+/** why: `emulator -help` prints each option on its own line, so a flag counts as listed only at the start of a line, never inside another option's description. */
+export function emulatorHelpLists(usage: string, flag: string): boolean {
+  return new RegExp(`^\\s*${flag}(?:\\s|$)`, "m").test(usage);
+}

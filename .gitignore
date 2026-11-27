@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.turbo/
+*.log
+.DS_Store
+.fallow/
+.claude/settings.local.json
+.claude/worktrees/
+.stryker-tmp/
+test-results/
+playwright-report/
+.agent-device
+.slow-lane.env

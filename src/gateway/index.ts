@@ -1,0 +1,33 @@
+/**
+ * why: `src/gateway` -- the second implementation of the daemon contract (ADR 0005 §32), for a
+ * daemon that owns no devices and fronts the workers connected to it.
+ *
+ * Boundaries (§33, enforced by `pnpm lint`): nothing here imports `src/drivers`, and
+ * from `src/core`'s index only the names `.oxlintrc.json` lists -- no registry, no capacity, no lifecycle. The only
+ * daemon-side import is `daemon/dispatch.js`, the transport-facing dispatch contract, which is
+ * itself core-free.
+ *
+ * The barrel is what the daemon entrypoint assembles a gateway out of, not a mirror of every
+ * module here: `WorkerRegistry`, `WorkerLink` and the aggregation functions are wired together
+ * *by* `GatewayService` and `GatewayDispatcher`, so nothing outside builds one directly, and
+ * their own tests import their modules.
+ */
+export { drainedWorkersOwner, StateDrainStore } from "./drain-store.js";
+export { endedLeaseIdsOwner, MemoryEndedLeaseIds, StateEndedLeaseIds } from "./ended-lease-ids.js";
+// fallow-ignore-next-line unused-type -- public port shape for anyone supplying their own store.
+export type { DrainStore } from "./drain-store.js";
+export { GatewayDispatcher } from "./dispatcher.js";
+export { GatewayService, type GatewayServiceOptions } from "./service.js";
+export type { WorkerDirectory } from "./fleet-ports.js";
+// fallow-ignore-next-line unused-type -- public port shape: what a WorkerDirectory resolves a worker id to, for anyone supplying their own directory.
+export type { WorkerDispatchTarget } from "./fleet-ports.js";
+export { FleetLeaseCoordinator } from "./fleet-coordinator.js";
+export { FleetLeaseIndex } from "./lease-index.js";
+export type { FleetLeaseEntry } from "./lease-index.js";
+export { createRoutingPolicy } from "./routing.js";
+// fallow-ignore-next-line unused-type -- public shape for a caller implementing its own routing policy; no current one exists outside routing.ts.
+export type { RoutingPolicy, RoutingPolicyName } from "./routing.js";
+export { GatewayOwnerRoutedFacts } from "./owner-routed-facts.js";
+export { GatewayRelay } from "./relay.js";
+export type { TwoWayRelay } from "./relay.js";
+export type { GatewayWorkerClient } from "./worker-client.js";

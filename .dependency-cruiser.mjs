@@ -1,0 +1,365 @@
+// why: a component is any directory under src/ with an index.ts, found when the config loads, so a new one is guarded from its first commit (ADR 0027).
+import { readdirSync } from "node:fs";
+
+function findComponents(dir) {
+  const entries = readdirSync(dir, { withFileTypes: true });
+  const here = entries.some((entry) => entry.isFile() && entry.name === "index.ts") ? [dir] : [];
+  return here.concat(
+    entries
+      .filter((entry) => entry.isDirectory())
+      .flatMap((entry) => findComponents(`${dir}/${entry.name}`)),
+  );
+}
+
+const escape = (path) => path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const testFile = "(\\.test\\.tsx?|/test-[^/]+\\.tsx?)$";
+const linkTestFile = "(\\.test\\.tsx?|/test-[^/]+\\.tsx?|/testing\\.ts)$";
+// why: the console layers below the screens are plain TypeScript, so a test drives them without a browser.
+const uiLibrary = "(^|node_modules/)(react|react-dom|recharts|@base-ui/react|@tanstack/[^/]+)(/|$)";
+const fsOrProcess = "^(node:)?(fs|fs/promises|child_process)$";
+
+// why: e2e imports the compiled package from dist/, which mirrors src/, so each component's rule covers its compiled copy too.
+const components = findComponents("src")
+  .filter((dir) => dir !== "src")
+  .flatMap((dir) => [dir, `dist${dir.slice("src".length)}`]);
+
+// why: the console imports the contract's `isNewerVersion` as a value; the index also exports the
+// zod schemas, which would put zod's `eval` in the bundle and break its Content-Security-Policy.
+// Maintainer-authorized 2026-10-22 (#825 Decisions, "Console import of the newer rule"): this one file only.
+// `inbox.ts` is the same case (ADR 0044 §3, #915): the rules the daemon and the console share, with no runtime import.
+const entryFiles = (component) =>
+  component === "src/contract"
+    ? "index|testing|definition|version-order|inbox"
+    : "index|testing|definition";
+
+const pastIndex = components.map((component) => ({
+  name: "past-index",
+  comment: `${component} is entered through its index`,
+  severity: "error",
+  from: { pathNot: `^${escape(component)}/` },
+  to: {
+    path: `^${escape(component)}/`,
+    pathNot: `^${escape(component)}/(${entryFiles(component)})\\.(ts|js)$`,
+  },
+}));
+
+const direction = (name, comment, from, to) => ({
+  name,
+  comment,
+  severity: "error",
+  from: { path: from, pathNot: testFile },
+  to,
+});
+
+export default {
+  forbidden: [
+    ...pastIndex,
+    {
+      name: "past-index-unbuilt",
+      comment:
+        "the compiled package is entered through a component's index.js, whether or not dist/ is built",
+      severity: "error",
+      from: {},
+      to: {
+        couldNotResolve: true,
+        path: "(^|/)dist/",
+        pathNot: "(^|/)dist/[^/]+/index\\.js$",
+      },
+    },
+    {
+      name: "testing-only-in-tests",
+      comment:
+        "only a *.test.ts file, a test-*.ts helper or a testing.ts entry imports a testing.ts or test-*.ts file",
+      severity: "error",
+      from: { pathNot: linkTestFile },
+      to: { path: "(^|/)(testing|test-[^/]+)\\.tsx?$" },
+    },
+    {
+      name: "link-is-portable",
+      comment:
+        "the link uses no Node module and no package, so it runs in a browser or React Native and can move to its own package",
+      severity: "error",
+      from: { path: "^src/link/", pathNot: linkTestFile },
+      to: {
+        dependencyTypes: [
+          "core",
+          "npm",
+          "npm-dev",
+          "npm-optional",
+          "npm-peer",
+          "npm-bundled",
+          "npm-no-pkg",
+          "npm-unknown",
+        ],
+      },
+    },
+    {
+      name: "link-imports-port-types-only",
+      comment:
+        "the link imports only the types of src/ports/, because a value from the ports barrel pulls in every Node adapter",
+      severity: "error",
+      from: { path: "^src/link/", pathNot: linkTestFile },
+      to: { path: "^src/ports/", dependencyTypesNot: ["type-only"] },
+    },
+    {
+      name: "packages-not-from-root-code",
+      comment:
+        "a package under packages/ never imports src/, ui/ or e2e/: it reaches simlock the way a user does, over its published addresses (ADR 0077 §3)",
+      severity: "error",
+      from: { path: "^packages/" },
+      to: { path: "^(src|ui|e2e)/" },
+    },
+    {
+      name: "packages-not-in-root-code",
+      comment:
+        "src/, ui/ and e2e/ never import packages/; an e2e test file may, to drive a package against a real daemon (ADR 0077 §3)",
+      severity: "error",
+      from: { path: "^(src|ui|e2e)/", pathNot: "^e2e/.*\\.test\\.tsx?$" },
+      to: { path: "^packages/" },
+    },
+    direction(
+      "core-not-leasing",
+      "core never imports leasing: where it needs something from leasing it declares a port, and the composition root connects it",
+      "^src/core/",
+      { path: "^src/leasing/" },
+    ),
+    direction(
+      "core-not-drivers",
+      "platform behaviour reaches the core and leasing only through the Driver interface",
+      "^src/(core|leasing)/",
+      { path: "^src/drivers/" },
+    ),
+    {
+      name: "no-fs-or-process",
+      comment:
+        "application code reaches the filesystem and processes only through injected ports; src/ports/ holds the adapters, src/test-support/ is test-only",
+      severity: "error",
+      from: { path: "^src/", pathNot: `^src/(ports|test-support)/|${testFile}` },
+      to: { dependencyTypes: ["core"], path: fsOrProcess },
+    },
+    direction(
+      "not-agent-device",
+      "the core, leasing and the drivers import nothing from the agent-device edge",
+      "^src/(core|leasing|drivers)/",
+      { path: "^src/agent-device/" },
+    ),
+    direction(
+      "not-stream",
+      "core, leasing, the drivers, the gateway and the contract import nothing from the stream module",
+      "^src/(core|leasing|drivers|gateway|contract)/",
+      { path: "^src/stream/" },
+    ),
+    direction(
+      "stream-not-edges",
+      "the stream module is a module the host loads: it imports no frontend, gateway, driver or leasing",
+      "^src/stream/",
+      { path: "^src/(http|gateway|drivers|daemon|cli|mcp|leasing)/" },
+    ),
+    direction(
+      "not-input",
+      "core, leasing, the drivers, the gateway and the contract import nothing from the input module",
+      "^src/(core|leasing|drivers|gateway|contract)/",
+      { path: "^src/input/" },
+    ),
+    direction(
+      "input-not-edges",
+      "the input module is a module the host loads: it imports no frontend, gateway, driver or leasing",
+      "^src/input/",
+      { path: "^src/(http|gateway|drivers|daemon|cli|mcp|leasing)/" },
+    ),
+    direction(
+      "not-lease-files",
+      "core, leasing, the drivers, the gateway and the contract import nothing from lease-files: the daemon builds it and the HTTP frontend serves it",
+      "^src/(core|leasing|drivers|gateway|contract)/",
+      { path: "^src/lease-files/" },
+    ),
+    direction(
+      "lease-files-imports-little",
+      "lease-files reads and writes through the Filesystem port and knows leases only by the types it takes from leasing; it imports no frontend, gateway, driver or core",
+      "^src/lease-files/",
+      { path: "^src/(http|gateway|drivers|daemon|cli|mcp|core)/" },
+    ),
+    direction(
+      "host-load-imports-ports-only",
+      "host-load reads the machine through the HostLoadProbe port and imports no other component but shared",
+      "^src/host-load/",
+      { path: "^src/(core|leasing|gateway|drivers|contract|http|cli|mcp|daemon)/" },
+    ),
+    direction(
+      "updater-imports-little",
+      "the updater imports only ports, contract, admin and shared: it runs while its own files are being replaced, so it carries nothing else",
+      "^src/updater/",
+      { path: "^src/", pathNot: "^src/(ports|contract|admin|shared|updater)/" },
+    ),
+    direction(
+      "not-host-load",
+      "core, leasing, the drivers, the gateway and the contract import nothing from host-load",
+      "^src/(core|leasing|drivers|gateway|contract)/",
+      { path: "^src/host-load/" },
+    ),
+    direction(
+      "alerts-imports-bus-ports-core-only",
+      "alerts reads the bus, sends through the WebhookPoster port and takes config types from core, and imports no other component",
+      "^src/alerts/",
+      { path: "^src/", pathNot: "^src/(alerts|bus|ports|core)/" },
+    ),
+    direction(
+      "not-alerts",
+      "only the composition root, main.ts, imports the alerts module",
+      "^src/(?!alerts/|daemon/main\\.ts$)",
+      { path: "^src/alerts/" },
+    ),
+    direction(
+      "gateway-not-edges",
+      "the gateway imports no driver, HTTP, CLI or MCP module",
+      "^src/gateway/",
+      { path: "^src/(drivers|http|cli|mcp)/" },
+    ),
+    direction(
+      "gateway-only-dispatch",
+      "the gateway imports only the daemon's dispatch contract",
+      "^src/gateway/",
+      { path: "^src/daemon/", pathNot: "^src/daemon/dispatch\\.ts$" },
+    ),
+    direction(
+      "only-main-knows-gateway",
+      "only the composition root, main.ts, knows a gateway exists",
+      "^src/daemon/(?!main\\.ts$)",
+      { path: "^src/gateway/" },
+    ),
+    {
+      name: "definition-is-light",
+      comment:
+        "a module's or a driver's definition.ts imports its own module only for types or by dynamic import, so reading a registry loads no module or driver code",
+      severity: "error",
+      from: { path: "^src/((?:drivers/)?[^/]+)/definition\\.ts$" },
+      to: {
+        dependencyTypesNot: ["type-only", "dynamic-import"],
+        path: "^src/$1/",
+        pathNot: "^src/$1/definition\\.ts$",
+      },
+    },
+    {
+      name: "auth-imports-little",
+      comment: "src/auth imports only ports and contract",
+      severity: "error",
+      from: { path: "^src/auth/", pathNot: linkTestFile },
+      to: { path: "^src/", pathNot: "^src/(auth|ports|contract)/" },
+    },
+    {
+      name: "modules-imports-little",
+      comment:
+        "src/modules imports only ports, contract, core and shared, plus the bus for its types",
+      severity: "error",
+      from: { path: "^src/modules/", pathNot: linkTestFile },
+      to: { path: "^src/", pathNot: "^src/(modules|ports|contract|core|bus|shared)/" },
+    },
+    {
+      name: "modules-imports-bus-types-only",
+      comment: "src/modules imports the bus for its types only",
+      severity: "error",
+      from: { path: "^src/modules/", pathNot: linkTestFile },
+      to: { path: "^src/bus/", dependencyTypesNot: ["type-only"] },
+    },
+    {
+      name: "main-loads-modules-lazily",
+      comment:
+        "the composition root (main.ts and its parts: worker-composition.ts, driver-discovery.ts, composition-support.ts, entry-support.ts) imports nothing from src/agent-device, of any type: a module reaches a daemon only through the module host",
+      severity: "error",
+      from: {
+        path: "^src/daemon/(main|worker-composition|driver-discovery|composition-support|entry-support)\\.ts$",
+      },
+      to: { path: "^src/agent-device/" },
+    },
+    direction(
+      "not-modules",
+      "core, leasing, the drivers, the gateway and the contract import nothing from the optional-module host or its registry",
+      "^src/(core|leasing|drivers|gateway|contract)/",
+      { path: "^src/(modules|module-registry)/" },
+    ),
+    direction(
+      "ui-ds-stands-alone",
+      "the console's design system imports nothing else of the console",
+      "^ui/src/ds/",
+      { path: "^ui/src/(app|screens|state|data|model)/" },
+    ),
+    direction(
+      "ui-model-is-pure",
+      "the console's business rules import no other layer and no UI library",
+      "^ui/src/model/",
+      { path: `^ui/src/(app|screens|state|data|ds)/|${uiLibrary}` },
+    ),
+    direction(
+      "ui-data-is-below-the-ui",
+      "the console's network and storage layer imports no state, screen, design system or UI library",
+      "^ui/src/data/",
+      { path: `^ui/src/(app|screens|state|ds)/|${uiLibrary}` },
+    ),
+    direction(
+      "ui-state-feeds-screens",
+      "the console's state layer imports no screen, and from the design system only the types it fills",
+      "^ui/src/state/",
+      { path: "^ui/src/(app|screens)/" },
+    ),
+    direction(
+      "ui-state-ds-types-only",
+      "the console's state layer imports no screen, and from the design system only the types it fills",
+      "^ui/src/state/",
+      { path: "^ui/src/ds/", dependencyTypesNot: ["type-only"] },
+    ),
+    direction(
+      "ui-screens-present-only",
+      "a console screen reaches data only through the state layer: no network, storage or business rule of its own",
+      "^ui/src/screens/",
+      { path: "^ui/src/(app|data|model)/" },
+    ),
+    direction(
+      "ui-base-ui-in-ds-only",
+      "only the console's design system imports Base UI; everything else uses its wrapped parts",
+      "^ui/src/(?!ds/)",
+      { path: "(^|node_modules/)@base-ui/react(/|$)" },
+    ),
+    direction(
+      "cli-router-imports-no-component-values",
+      "the CLI's router answers --help and a usage error before any component loads: these files reach another component only for types, by dynamic import, or statically for agent-identity and shared alone, so the fast paths load no component code",
+      "^src/cli/(main|index|tree|errors|types|usage-error|environment|stdio|log-file|args|connect)\\.ts$",
+      {
+        // why: every component but agent-identity and shared, the two that import nothing and so
+        // are the cheap static imports, plus the command modules: a static edge to one of those from the
+        // router is the same eager load this rule exists to keep out
+        path: "^src/((?!agent-identity/|cli/|shared/)[a-z0-9-]+/)|^src/cli/commands/",
+        dependencyTypesNot: ["type-only", "dynamic-import"],
+      },
+    ),
+    direction(
+      "contract-imports-nothing",
+      "the contract imports nothing outside src/contract/",
+      "^src/contract/",
+      { path: "^(src|dist|e2e|ui)/", pathNot: "^src/contract/" },
+    ),
+    direction(
+      "contract-imports-nothing-unresolved",
+      "the contract imports nothing outside src/contract/",
+      "^src/contract/",
+      { couldNotResolve: true, path: "^[./]" },
+    ),
+    direction(
+      "shared-imports-nothing",
+      "shared imports nothing: no component, no package and no Node module, so any component may depend on it",
+      "^src/shared/",
+      { path: "^[^.]", pathNot: "^src/shared/" },
+    ),
+    direction(
+      "shared-imports-nothing-unresolved",
+      "shared imports nothing: no component, no package and no Node module, so any component may depend on it",
+      "^src/shared/",
+      { couldNotResolve: true, path: "^[./]" },
+    ),
+  ],
+  options: {
+    doNotFollow: { path: ["node_modules", "^dist/"] },
+    tsPreCompilationDeps: true,
+    tsConfig: { fileName: "tsconfig.json" },
+    enhancedResolveOptions: { extensions: [".ts", ".tsx", ".js", ".mjs"] },
+  },
+};

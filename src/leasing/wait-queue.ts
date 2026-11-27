@@ -1,0 +1,529 @@
+import type { Clock, IdGenerator, TimerHandle } from "../ports/index.js";
+import {
+  type DeviceRequest,
+  type LeaseGrant,
+  type LeaseProgress,
+  type MaxPerRequester,
+  type Platform,
+} from "../core/index.js";
+import { type WaitingReason } from "./acquisition-planner.js";
+
+export interface LeaseRequestOptions {
+  readonly requesterId: string;
+  /** why: ADR 0003 §4: the session principal the resulting lease is owned by -- distinct from
+   * `requesterId`, which is attribution and defaults to the principal but may be set to
+   * something else per request. Required: every caller of `LeaseCommands.request` (the daemon
+   * dispatcher) always knows its own session's principal. */
+  readonly ownerId: string;
+  readonly timeoutMs?: number;
+  readonly noWait?: boolean;
+  readonly allowDownload?: boolean;
+  readonly requires?: readonly string[];
+  readonly onProgress?: (progress: LeaseProgress) => void;
+  /** why: ADR 0004 §4: this lease's initial TTL, accepted on every request. Omitted means
+   * `lease.defaultTtlMs`; the cap against `lease.maxTtlMs` is applied at the daemon boundary
+   * before a request ever reaches here, so this type trusts what it is given. */
+  readonly ttlMs?: number;
+  /**
+   * why: The caller's key for repeating this request (see `LeaseRequestBook`). Paired with
+   * `requesterId`; both are the caller's own claims, so a replay is authorized on `ownerId`.
+   */
+  readonly idempotencyKey?: string;
+  /**
+   * why: ADR 0020: the lease ID the requester chose. The granted lease has exactly this ID; a live
+   * lease or waiting request holds it, and one whose lease ended is refused for
+   * `lease.endedIdRetentionMs` (ADR 0074 §4).
+   * An option of the request, not part of the device it names.
+   */
+  readonly leaseId?: string;
+  readonly runId?: string;
+  readonly label?: string;
+  /**
+   * why: ADR 0021: the gateway's request id. A request that has one is a probe: its refusals and
+   * failures are `lease.declined`, and it is never queued. Set only for the gateway's uplink.
+   */
+  readonly fleetRequestId?: string;
+  readonly onAdmitted?: (requestId: string, replayed: boolean) => void;
+}
+
+export class QueueTimeoutError extends Error {
+  constructor(readonly requestId: string) {
+    super(`Timed out waiting for a device: ${requestId}`);
+    this.name = "QueueTimeoutError";
+  }
+}
+
+export class RequestCancelledError extends Error {
+  constructor(readonly requestId: string) {
+    super(`Lease request cancelled: ${requestId}`);
+    this.name = "RequestCancelledError";
+  }
+}
+
+export interface RequesterLimitContext {
+  readonly limit: number;
+  readonly held: number;
+  readonly waiting: boolean;
+  readonly platform?: Platform;
+}
+
+export class RequesterAlreadyLeasedError extends Error {
+  constructor(
+    readonly requesterId: string,
+    readonly existingLeaseId?: string,
+    context?: RequesterLimitContext,
+  ) {
+    super(requesterRefusalMessage(requesterId, existingLeaseId, context));
+    this.name = "RequesterAlreadyLeasedError";
+  }
+}
+
+function requesterRefusalMessage(
+  requesterId: string,
+  existingLeaseId: string | undefined,
+  context: RequesterLimitContext | undefined,
+): string {
+  if (context?.platform !== undefined) {
+    return platformRefusalMessage(requesterId, existingLeaseId, context, context.platform);
+  }
+  if (context !== undefined && context.limit > 1) {
+    if (context.waiting) {
+      return `Requester ${requesterId} already has a waiting request; wait for it to be granted or cancel it before requesting another device`;
+    }
+    return `Requester ${requesterId} already holds ${String(context.held)} leases and lease.maxPerRequester is ${String(context.limit)}; release one (\`simlock release ${String(existingLeaseId)}\`) before requesting another device`;
+  }
+  return existingLeaseId === undefined
+    ? `Requester already has a lease or pending request: ${requesterId}`
+    : `Requester ${requesterId} already holds lease ${existingLeaseId}; release it (\`simlock release ${existingLeaseId}\`) before requesting another device`;
+}
+
+export interface HeldLease {
+  readonly id: string;
+  readonly grantedAt: number;
+  readonly platform?: Platform;
+}
+
+export interface RequesterLimitInput {
+  readonly requesterId: string;
+  readonly platform: Platform;
+  readonly maxPerRequester: MaxPerRequester | undefined;
+  readonly held: readonly HeldLease[];
+  readonly waiting: readonly Platform[];
+  readonly probe: boolean;
+}
+
+/**
+ * why: worker and gateway admit a request by this one rule (architecture rule 10). It returns the
+ * refusal for the caller to emit and throw, or `undefined` to admit.
+ */
+export function requesterLimitDecision(
+  input: RequesterLimitInput,
+): RequesterAlreadyLeasedError | undefined {
+  const configured = input.maxPerRequester ?? 1;
+  if (typeof configured === "number") {
+    const waiting = input.waiting.length > 0;
+    const atLimit = !input.probe && input.held.length + input.waiting.length >= configured;
+    if (!input.waiting.includes(input.platform) && !atLimit) return undefined;
+    return new RequesterAlreadyLeasedError(input.requesterId, earliestGranted(input.held)?.id, {
+      held: input.held.length,
+      limit: configured,
+      waiting,
+    });
+  }
+  const limit = configured[input.platform] ?? 1;
+  const held = input.held.filter(
+    (lease) => lease.platform === undefined || lease.platform === input.platform,
+  );
+  const atLimit = !input.probe && held.length >= limit;
+  const waiting = input.waiting.includes(input.platform);
+  if (!waiting && !atLimit) return undefined;
+  return new RequesterAlreadyLeasedError(input.requesterId, earliestGranted(held)?.id, {
+    held: held.length,
+    limit,
+    platform: input.platform,
+    waiting: waiting && !atLimit,
+  });
+}
+
+function earliestGranted(leases: readonly HeldLease[]): HeldLease | undefined {
+  let earliest: HeldLease | undefined;
+  for (const lease of leases) {
+    if (earliest === undefined || lease.grantedAt < earliest.grantedAt) earliest = lease;
+  }
+  return earliest;
+}
+
+function platformRefusalMessage(
+  requesterId: string,
+  existingLeaseId: string | undefined,
+  context: RequesterLimitContext,
+  platform: Platform,
+): string {
+  const label = platform === "ios" ? "iOS" : "Android";
+  if (context.waiting) {
+    return `Requester ${requesterId} already has a waiting ${label} request; wait for it to be granted or cancel it before requesting another ${label} device`;
+  }
+  const release = `release it (\`simlock release ${String(existingLeaseId)}\`)`;
+  if (context.limit === 1) {
+    return `Requester ${requesterId} already holds ${label} lease ${String(existingLeaseId)}; ${release} before requesting another ${label} device`;
+  }
+  return `Requester ${requesterId} already holds ${String(context.held)} ${label} leases and lease.maxPerRequester.${platform} is ${String(context.limit)}; release one (\`simlock release ${String(existingLeaseId)}\`) before requesting another ${label} device`;
+}
+
+export class LeaseIdTakenError extends Error {
+  constructor(readonly leaseId: string) {
+    super(`lease ID ${leaseId} is already in use`);
+    this.name = "LeaseIdTakenError";
+  }
+}
+
+export class ForeignWaiterError extends Error {
+  constructor() {
+    super("Waiter does not belong to this queue");
+    this.name = "ForeignWaiterError";
+  }
+}
+
+export type WaiterState = "new" | "queued" | "processing" | "granted" | "rejected";
+
+export interface QueuePlace {
+  readonly id: string;
+  readonly queuePosition?: number;
+  readonly reason?: WaitingReason;
+}
+
+export interface Waiter {
+  readonly id: string;
+  readonly request: DeviceRequest;
+  readonly options: LeaseRequestOptions;
+  readonly promise: Promise<LeaseGrant>;
+  readonly state: WaiterState;
+}
+
+interface MutableWaiter extends Waiter {
+  readonly onProgress: ((progress: LeaseProgress) => void) | undefined;
+  rejectPromise: (error: Error) => void;
+  resolvePromise: (grant: LeaseGrant) => void;
+  reason: WaitingReason | undefined;
+  state: WaiterState;
+  timer: TimerHandle | undefined;
+  /**
+   * why: Fixed on the first arm and never moved, so a re-queue cannot restart the budget.
+   */
+  deadlineAt: number | undefined;
+}
+
+export type QueueLine = "virtual" | "physical";
+
+export interface WaitQueueOptions {
+  readonly clock: Clock;
+  readonly idGenerator: IdGenerator;
+  readonly onTimeout?: (waiter: Waiter) => void;
+  readonly onDepthChange?: ((depth: number, line: QueueLine) => void) | undefined;
+  /**
+   * why: ADR 0074 §2: a gateway serves a higher priority first, equal priorities in arrival order.
+   * Unset (a worker's queue), every waiter has priority 0 and the line stays in arrival order.
+   */
+  readonly priorityOf?: ((waiter: Waiter) => number) | undefined;
+}
+
+export function lineOf(request: DeviceRequest): QueueLine {
+  return request.physical === true ? "physical" : "virtual";
+}
+
+export class WaitQueue {
+  readonly #ownedWaiters = new WeakSet<MutableWaiter>();
+  readonly #waiters: MutableWaiter[] = [];
+  readonly #pendingWaiters = new Set<MutableWaiter>();
+
+  constructor(private readonly options: WaitQueueOptions) {}
+
+  get depth(): number {
+    return this.#line("virtual").length;
+  }
+
+  get physicalDepth(): number {
+    return this.#line("physical").length;
+  }
+
+  get head(): Waiter | undefined {
+    return this.#line("virtual")[0];
+  }
+
+  list(): readonly Waiter[] {
+    return [...this.#waiters];
+  }
+
+  /** why: the waiter's place in its line, 1 for the next served; 0 when it is not queued. */
+  positionOf(waiter: Waiter): number {
+    return this.#line(lineOf(waiter.request)).indexOf(waiter as MutableWaiter) + 1;
+  }
+
+  places(): readonly QueuePlace[] {
+    return [...this.#pendingWaiters].map((waiter) =>
+      waiter.state === "queued"
+        ? {
+            id: waiter.id,
+            queuePosition: this.positionOf(waiter),
+            ...(waiter.reason === undefined ? {} : { reason: waiter.reason }),
+          }
+        : { id: waiter.id },
+    );
+  }
+
+  pending(): readonly Waiter[] {
+    return [...this.#pendingWaiters];
+  }
+
+  hasPendingRequester(requesterId: string): boolean {
+    return this.pendingPlatforms(requesterId).length > 0;
+  }
+
+  pendingPlatforms(requesterId: string): readonly Platform[] {
+    return [...this.#pendingWaiters]
+      .filter((waiter) => waiter.options.requesterId === requesterId)
+      .map((waiter) => waiter.request.platform);
+  }
+
+  findPendingWaiter(requesterId: string, platform?: Platform): Waiter | undefined {
+    for (const waiter of this.#pendingWaiters) {
+      if (
+        waiter.options.requesterId === requesterId &&
+        (platform === undefined || waiter.request.platform === platform)
+      ) {
+        return waiter;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * why: `id` is the stored request's id when the caller stored one first (`LeaseRequestBook`), so
+   * the waiter and its record share one name; omitted, the queue mints its own.
+   *
+   * The pending-request limit is the owner's rule, not the queue's: the owner asks
+   * `pendingPlatforms` inside its admission decision (`requesterLimitDecision`), before it stores
+   * the request and calls this, and answers a refusal with its own (`emitLeaseRefusal`). Checking
+   * again here would be a second copy of that rule, firing only after the request was already stored.
+   */
+  create(request: DeviceRequest, requestOptions: LeaseRequestOptions, id?: string): Waiter {
+    let resolvePromise!: (grant: LeaseGrant) => void;
+    let rejectPromise!: (error: Error) => void;
+    const promise = new Promise<LeaseGrant>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    const waiter: MutableWaiter = {
+      deadlineAt: undefined,
+      id: id ?? `req_${this.options.idGenerator.generate()}`,
+      onProgress: requestOptions.onProgress,
+      options: requestOptions,
+      promise,
+      rejectPromise,
+      reason: undefined,
+      request,
+      resolvePromise,
+      state: "new",
+      timer: undefined,
+    };
+    this.#ownedWaiters.add(waiter);
+    this.#pendingWaiters.add(waiter);
+    return waiter;
+  }
+
+  enqueue(waiter: Waiter, reason?: WaitingReason): boolean {
+    const mutable = this.#mutable(waiter);
+    if (isTerminal(mutable.state)) return false;
+
+    if (this.#expireIfPastDeadline(mutable)) return false;
+    mutable.reason = reason;
+
+    if (!this.#waiters.includes(mutable)) {
+      this.#insert(mutable);
+      const line = lineOf(mutable.request);
+      this.options.onDepthChange?.(this.#line(line).length, line);
+      this.notifyProgress(mutable, { queuePosition: this.positionOf(mutable), stage: "queued" });
+    }
+    mutable.state = "queued";
+    this.#armTimeout(mutable);
+    return true;
+  }
+
+  markProcessing(waiter: Waiter): boolean {
+    const mutable = this.#mutable(waiter);
+    if (isTerminal(mutable.state)) return false;
+    // why: A retry does not reset the deadline, so a waiter past it is not handed to the next worker.
+    if (this.#expireIfPastDeadline(mutable)) return false;
+    mutable.state = "processing";
+    return true;
+  }
+
+  #expireIfPastDeadline(mutable: MutableWaiter): boolean {
+    if (mutable.deadlineAt === undefined || this.options.clock.now() < mutable.deadlineAt) {
+      return false;
+    }
+    if (this.reject(mutable, new QueueTimeoutError(mutable.id))) {
+      try {
+        this.options.onTimeout?.(mutable);
+      } catch {
+        // why: Queue wake-up is an observer of this committed timeout fact.
+      }
+    }
+    return true;
+  }
+
+  markNew(waiter: Waiter): boolean {
+    const mutable = this.#mutable(waiter);
+    if (isTerminal(mutable.state)) return false;
+    mutable.state = this.#waiters.includes(mutable) ? "queued" : "new";
+    return true;
+  }
+
+  isQueued(waiter: Waiter): boolean {
+    return this.#waiters.includes(this.#mutable(waiter));
+  }
+
+  /**
+   * why: P3 (round 2 review): a terminal waiter never gets a push. Before this guard, `enqueue`
+   * rejecting synchronously (the deadline-check branch above) left a caller free to keep calling
+   * `notifyProgress` on the same waiter regardless -- `LeaseAcquisitionCoordinator#defer`
+   * unconditionally pushes a `reclaiming` progress right after its own `#enqueue` call, so a
+   * request that had just settled `QUEUE_TIMEOUT` could still receive a push after its error,
+   * with nothing here or at that call site distinguishing "still waiting" from "already told".
+   */
+  notifyProgress(waiter: Waiter, progress: LeaseProgress): void {
+    const mutable = this.#mutable(waiter);
+    if (isTerminal(mutable.state)) return;
+    try {
+      mutable.onProgress?.(progress);
+    } catch {
+      // why: Client feedback must not affect lease acquisition.
+    }
+  }
+
+  resolve(waiter: Waiter, grant: LeaseGrant): boolean {
+    const mutable = this.#mutable(waiter);
+    if (isTerminal(mutable.state)) return false;
+    this.#remove(mutable);
+    mutable.state = "granted";
+    mutable.resolvePromise(grant);
+    return true;
+  }
+
+  reject(waiter: Waiter, error: Error): boolean {
+    const mutable = this.#mutable(waiter);
+    if (isTerminal(mutable.state)) return false;
+    this.#remove(mutable);
+    mutable.state = "rejected";
+    mutable.rejectPromise(error);
+    return true;
+  }
+
+  cancelAll(error: Error | ((waiter: Waiter) => Error)): readonly Waiter[] {
+    const cancelled: Waiter[] = [];
+    for (const waiter of this.#pendingWaiters) {
+      const cancellation = typeof error === "function" ? error(waiter) : error;
+      if (this.reject(waiter, cancellation)) cancelled.push(waiter);
+    }
+    return cancelled;
+  }
+
+  /**
+   * why: Arms (or re-arms, after a cycle back through `queued`) this waiter's timeout. `deadlineAt` is
+   * computed once, the first time a waiter with a `timeoutMs` is ever armed, and never moved
+   * afterward -- every later call here (a re-enqueue `enqueue` already let through because the
+   * deadline had not yet passed) times the remaining budget against that same fixed deadline
+   * instead of starting a fresh `timeoutMs` window, which is what let the total wait exceed
+   * `timeoutMs` by a multiple across repeated `processing` <-> `queued` cycles before this fix.
+   *
+   * If the timer fires while `waiter.state !== "queued"` (mid-attempt), it does *not* reject --
+   * the request is actively being handled, and this class does not know whether that attempt is
+   * about to succeed. `enqueue`'s own deadline check is what catches this case at the next
+   * re-queue, since `waiter.timer` is already cleared by the time this branch returns.
+   *
+   * H5 (round 3 review): the `waiter.timer !== undefined` guard above means `remainingMs` is
+   * only ever actually computed with a genuinely partial value in theory, essentially never in
+   * practice under a real `Clock` -- every real call into this method lands in one of exactly two
+   * cases. A fresh arm (`waiter.timer` was never set) always computes the *full* `timeoutMs`,
+   * since `deadlineAt` is being fixed in the same line. Every later call finds one of two things:
+   * the original timer is still counting down (`waiter.timer !== undefined`), so the guard above
+   * returns immediately and the still-live timer -- already targeting the correct fixed
+   * `deadlineAt` -- is left untouched, no second `setTimer` call, no recompute, no re-arm; or that
+   * timer already fired at (or acceptably near) `deadlineAt` (clearing itself, above), in which
+   * case `enqueue`'s own upfront `clock.now() >= deadlineAt` check rejects the waiter before this
+   * method is even called again. That "acceptably near" is not exact under a real `Clock`: Node's
+   * own timers can fire a little early (sub-millisecond to a few ms, platform- and load-
+   * dependent), so a re-`enqueue` landing in that narrow window between the timer's early fire and
+   * the deadline it was targeting can reach here with `waiter.timer === undefined`, `deadlineAt`
+   * already set, and `clock.now()` still (fractionally) short of it -- the one shape this
+   * arithmetic then computes a genuinely partial `remainingMs` for, rather than the full budget or
+   * an already-expired one. Harmless (the re-armed timer still targets the same fixed
+   * `deadlineAt`, just via a few-millisecond-shorter final `setTimer` call instead of one that
+   * would have fired at the identical moment anyway), but real, not merely theoretical --
+   * `FakeClock` (every test here) never fires early, so no test under it can ever land in this
+   * window, which is why the difference is a doc claim to get right rather than a behavior to
+   * cover with one.
+   *
+   * `markNew` arms nothing, and that is safe only because its callers hand the waiter straight
+   * back to a decision: every branch of that decision that keeps the waiter alive passes
+   * `#expireIfPastDeadline` (through `markProcessing`) or `enqueue`'s own upfront check first. A
+   * caller that returned without re-deciding would leave a waiter `queued` with a fixed deadline
+   * and no timer, and would have to arm here.
+   */
+  #armTimeout(waiter: MutableWaiter): void {
+    if (waiter.timer !== undefined || waiter.options.timeoutMs === undefined) return;
+    waiter.deadlineAt ??= this.options.clock.now() + waiter.options.timeoutMs;
+    const remainingMs = Math.max(0, waiter.deadlineAt - this.options.clock.now());
+    waiter.timer = this.options.clock.setTimer(remainingMs, () => {
+      waiter.timer = undefined;
+      if (waiter.state !== "queued") return;
+      if (this.reject(waiter, new QueueTimeoutError(waiter.id))) {
+        try {
+          this.options.onTimeout?.(waiter);
+        } catch {
+          // why: Queue wake-up is an observer of this committed timeout fact.
+        }
+      }
+    });
+  }
+
+  #remove(waiter: MutableWaiter): void {
+    const index = this.#waiters.indexOf(waiter);
+    if (index !== -1) {
+      this.#waiters.splice(index, 1);
+      const line = lineOf(waiter.request);
+      this.options.onDepthChange?.(this.#line(line).length, line);
+    }
+    this.#pendingWaiters.delete(waiter);
+    if (waiter.timer !== undefined) {
+      this.options.clock.cancel(waiter.timer);
+      waiter.timer = undefined;
+    }
+  }
+
+  /** why: after the last waiter of at least this priority, so equal priorities keep arrival order. */
+  #insert(waiter: MutableWaiter): void {
+    const { priorityOf } = this.options;
+    if (priorityOf === undefined) {
+      this.#waiters.push(waiter);
+      return;
+    }
+    const priority = priorityOf(waiter);
+    const behind = this.#waiters.findIndex((queued) => priorityOf(queued) < priority);
+    this.#waiters.splice(behind === -1 ? this.#waiters.length : behind, 0, waiter);
+  }
+
+  #line(line: QueueLine): MutableWaiter[] {
+    return this.#waiters.filter((waiter) => lineOf(waiter.request) === line);
+  }
+
+  #mutable(waiter: Waiter): MutableWaiter {
+    const mutable = waiter as MutableWaiter;
+    if (!this.#ownedWaiters.has(mutable)) throw new ForeignWaiterError();
+    return mutable;
+  }
+}
+
+function isTerminal(state: WaiterState): boolean {
+  return state === "granted" || state === "rejected";
+}

@@ -1,0 +1,1000 @@
+import {
+  DEFAULT_DEVICES_DELETED_RETENTION_MS,
+  DEFAULT_LEASE_ENDED_ID_RETENTION_MS,
+  DEFAULT_LEASE_MAX_REQUEST_RECORDS,
+  DEFAULT_LEASE_REQUEST_RETENTION_MS,
+} from "./config.js";
+import {
+  type AbsentReason,
+  type DeviceRecord,
+  type QuarantineCause,
+  type DeviceState,
+  type DeviceTransitionUpdate,
+  IllegalTransition,
+  isSettled,
+  type LeaseGrant,
+  type LeaseRecord,
+  type LeaseRequestFailure,
+  type LeaseRequestRecord,
+  type PhysicalDevice,
+  type Platform,
+  transition,
+  type VirtualDevice,
+} from "./domain.js";
+import {
+  type LeaseRequestOutcome,
+  type LeaseRequestStore,
+  type NewLeaseRequest,
+  newLeaseRequestId,
+  newLeaseRequestRecord,
+  retainedLeaseRequests,
+  withNewLeaseRequest,
+  withSettledLeaseRequest,
+} from "./lease-request-store.js";
+import {
+  deleteComponentRows,
+  deleteLease,
+  deleteDevice,
+  deleteLeaseRequest,
+  loadRegistryRows,
+  pruneEndedLeaseIds,
+  readEndedLeaseId,
+  writeComponent,
+  writeDevice,
+  writeEndedLeaseId,
+  writeLease,
+  writeLeaseRequest,
+} from "./registry-rows.js";
+import { presentFields } from "./present-fields.js";
+import { RegistryEventError, UnknownDeviceError, UnknownLeaseError } from "./registry-errors.js";
+import type {
+  ComponentRecord,
+  CreateLeaseInput,
+  PhysicalEnrollmentInput,
+  RegisterDeviceInput,
+  RegistryDeviceEvent,
+  RegistryOptions,
+  RegistrySnapshot,
+  ReleasedLease,
+} from "./registry-types.js";
+import {
+  assertTransitionEvent,
+  changes,
+  cloneComponent,
+  cloneDevice,
+  cloneLease,
+  cloneLeaseRequest,
+  componentKey,
+  isExpired,
+  isVirtual,
+  withoutCauseUnlessQuarantined,
+} from "./registry-records.js";
+
+export type {
+  ComponentRecord,
+  CreateLeaseInput,
+  PhysicalEnrollmentInput,
+  RegisterDeviceInput,
+  RegistryDeviceEvent,
+  RegistryOptions,
+  RegistrySnapshot,
+  ReleasedLease,
+} from "./registry-types.js";
+export { RegistryEventError, UnknownDeviceError, UnknownLeaseError } from "./registry-errors.js";
+
+/**
+ * Devices, leases, lease requests (stored before they are queued, see `LeaseRequestBook`) and
+ * the components Simlock installed (`ComponentRecord`). All four are written through one
+ * `#commit`, so no two of them are ever on disk in separate files.
+ */
+export class Registry implements LeaseRequestStore<LeaseGrant> {
+  #devices: DeviceRecord[] = [];
+  #leases: LeaseRecord[] = [];
+  #leaseRequests: readonly LeaseRequestRecord[] = [];
+  #components: readonly ComponentRecord[] = [];
+  readonly #commitListeners: (() => void)[] = [];
+
+  private constructor(private readonly options: Required<RegistryOptions>) {}
+
+  static async load(options: RegistryOptions): Promise<Registry> {
+    const registry = new Registry({
+      ...options,
+      deletedRetentionMs: options.deletedRetentionMs ?? DEFAULT_DEVICES_DELETED_RETENTION_MS,
+      endedIdRetentionMs: options.endedIdRetentionMs ?? DEFAULT_LEASE_ENDED_ID_RETENTION_MS,
+      leaseIdentity: options.leaseIdentity ?? { android: "reusable", ios: "reusable" },
+      leaseRequestLimits: options.leaseRequestLimits ?? {
+        maxRecords: DEFAULT_LEASE_MAX_REQUEST_RECORDS,
+        retentionMs: DEFAULT_LEASE_REQUEST_RETENTION_MS,
+      },
+    });
+    const loaded = loadRegistryRows(options.state.database, options.deviceData);
+    registry.#devices = loaded.devices;
+    registry.#leases = loaded.leases;
+    registry.#leaseRequests = loaded.leaseRequests;
+    registry.#components = loaded.components;
+    // why: a record deleted before the upgrade has no `deletedAt`; this commit stamps it and drops what has expired.
+    if (registry.#devices.some((device) => device.state === "deleted")) {
+      registry.#commit(registry.#devices, registry.#leases);
+    }
+    return registry;
+  }
+
+  get snapshot(): RegistrySnapshot {
+    // why: only a commit drops an expired record from state.db, so an idle worker would list it past devices.deletedRetentionMs.
+    const now = this.options.clock.now();
+    const kept = this.#devices.filter(
+      (device) => !isExpired(device, now, this.options.deletedRetentionMs),
+    );
+    const devices = [
+      ...kept.filter((device) => !device.physical),
+      ...kept.filter((device) => device.physical),
+    ].map(cloneDevice);
+    return {
+      devices,
+      virtualDevices: devices.filter(isVirtual),
+      leases: this.#leases.map((lease) => ({ ...lease })),
+      components: this.#components.map(cloneComponent),
+    };
+  }
+
+  /**
+   * Stores the record of a component Simlock installed, replacing one with the same platform
+   * and version (ADR 0010 §5). `ComponentInstaller` calls it before it emits
+   * `component.installed`, so the event never describes an install the registry does not hold.
+   */
+  async recordComponent(record: ComponentRecord): Promise<void> {
+    const components = [
+      ...this.#components.filter(
+        (existing) => existing.platform !== record.platform || existing.version !== record.version,
+      ),
+      cloneComponent(record),
+    ];
+    this.#commit(this.#devices, this.#leases, this.#leaseRequests, components);
+  }
+
+  /**
+   * Deletes the record of the component of this platform and version (ADR 0010 §8).
+   * `ComponentInstaller` calls it once the driver removed the component, before it emits
+   * `component.removed`. Deleting a record that is not there commits nothing.
+   */
+  // fallow-ignore-next-line unused-class-member -- called by ComponentInstaller through its Pick<Registry> port and by the registry tests.
+  async deleteComponent(platform: Platform, version: string): Promise<void> {
+    const components = this.#components.filter(
+      (existing) => existing.platform !== platform || existing.version !== version,
+    );
+    if (components.length === this.#components.length) return;
+    this.#commit(this.#devices, this.#leases, this.#leaseRequests, components);
+  }
+
+  async registerDevice({
+    driverData,
+    driverDeviceId,
+    provisionDuration,
+    spec,
+  }: RegisterDeviceInput): Promise<VirtualDevice> {
+    const record: VirtualDevice = {
+      createdAt: this.options.clock.now(),
+      driverData,
+      driverDeviceId,
+      id: `dev_${this.options.idGenerator.generate()}`,
+      leaseIdentity: this.options.leaseIdentity[spec.platform],
+      mode: "full",
+      physical: false,
+      spec: { ...spec },
+      state: "provisioning",
+    };
+    const devices = [...this.#devices, record];
+
+    this.#commit(devices, this.#leases);
+    this.options.eventBus.emit(
+      "device.provisioned",
+      {
+        deviceId: record.id,
+        driver: spec.platform,
+        duration: provisionDuration,
+        spec: record.spec,
+      },
+      "registry",
+    );
+
+    return cloneDevice(record);
+  }
+
+  async transitionDevice(
+    deviceId: string,
+    to: DeviceState,
+    event?: RegistryDeviceEvent,
+    update?: DeviceTransitionUpdate,
+  ): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (to === "deleted" && this.#leases.some((lease) => lease.deviceId === deviceId)) {
+      throw new RegistryEventError(`Cannot delete device with an active lease: ${deviceId}`);
+    }
+
+    assertTransitionEvent(device, to, event);
+
+    const updated = this.#transitioned(device, to, update);
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+
+    if (event !== undefined) {
+      this.#emitDeviceEvent(event, updated);
+    }
+
+    return this.#committed(deviceId);
+  }
+
+  /**
+   * why: a ready device shut down and prepared again for a lease (ADR 0066 §2) keeps its state, so this is no transition and emits no event (`ready → ready` is no edge); it records only what the new boot produced.
+   */
+  // fallow-ignore-next-line unused-class-member -- called through `ManagedDeviceRegistry`, which `Registry` implements.
+  async recordRebootedDevice(
+    deviceId: string,
+    update: Required<Pick<DeviceTransitionUpdate, "address" | "driverData" | "mode">>,
+  ): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.physical || device.state !== "ready") {
+      throw new RegistryEventError(`Only a ready virtual device can be rebooted: ${deviceId}`);
+    }
+    const updated = { ...device, ...update };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return this.#committed(deviceId);
+  }
+
+  async completeReclaimWithoutPurge(deviceId: string): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.state !== "reclaiming") {
+      throw new RegistryEventError(`Device is not reclaiming: ${deviceId}`);
+    }
+    const updated = this.#transitioned(device, "shutdown");
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  /**
+   * Commits quarantine entry from any of its legal sources (see domain.ts): a
+   * release-time purge failure, or a fresh device's failed lease-end shutdown, leaves
+   * `reclaiming`; a fresh device's failed delete leaves `shutdown`; and a
+   * stalled-transition timeout leaves `provisioning`. The caller -- QuarantineCoordinator,
+   * reached from ReclaimCoordinator for the lease-end paths -- emits `device.quarantined`
+   * (and, for a lease-end failure, `device.purge-failed`) after this commits.
+   */
+  async enterQuarantine(
+    deviceId: string,
+    nextRetryAt: number,
+    cause: QuarantineCause,
+  ): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (
+      device.state !== "reclaiming" &&
+      device.state !== "provisioning" &&
+      device.state !== "shutdown"
+    ) {
+      throw new RegistryEventError(
+        `Device is not reclaiming, provisioning, or shutdown: ${deviceId}`,
+      );
+    }
+    const updated: DeviceRecord = {
+      ...this.#transitioned(device, "quarantined"),
+      quarantineAttempts: 0,
+      quarantineNextRetryAt: nextRetryAt,
+      quarantinedAt: this.options.clock.now(),
+      quarantineCause: cause,
+    };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  /** Records a failed purge retry without leaving `quarantined`; the caller re-arms backoff. */
+  async recordQuarantineRetryFailure(
+    deviceId: string,
+    attempts: number,
+    nextRetryAt: number,
+  ): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.state !== "quarantined") {
+      throw new RegistryEventError(`Device is not quarantined: ${deviceId}`);
+    }
+    const updated: DeviceRecord = {
+      ...device,
+      quarantineAttempts: attempts,
+      quarantineNextRetryAt: nextRetryAt,
+    };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  #transitioned(
+    device: DeviceRecord,
+    to: DeviceState,
+    update?: DeviceTransitionUpdate,
+  ): DeviceRecord {
+    const now = this.options.clock.now();
+    if (to === "ready") return transition(device, to, { ...update, readyAt: now });
+    if (to === "shutdown") return transition(device, to, { ...update, shutdownAt: now });
+    if (to === "reclaiming" && device.physical) {
+      return transition(device, to, { ...update, reclaimingSince: now });
+    }
+    return transition(device, to, update);
+  }
+
+  async recoverFromQuarantine(deviceId: string, to: "ready" | "shutdown"): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.state !== "quarantined") {
+      throw new RegistryEventError(`Device is not quarantined: ${deviceId}`);
+    }
+    const {
+      quarantineAttempts: _quarantineAttempts,
+      quarantineNextRetryAt: _quarantineNextRetryAt,
+      quarantinedAt: _quarantinedAt,
+      ...updated
+    } = this.#transitioned(device, to);
+    const devices = [...this.#devices];
+    devices[index] = updated as DeviceRecord;
+    this.#commit(devices, this.#leases);
+    return this.#committed(deviceId);
+  }
+
+  /**
+   * Records that a quarantined device exhausted its retries *and* could not be destroyed, so
+   * nothing is armed for it any more. Clears the retry deadline rather than leaving a stale one
+   * behind: readers (`status`) would otherwise report a retry that is never coming, and a
+   * restarting daemon re-arms from this field -- undefined makes it retry once promptly instead
+   * of at a timestamp that has long since passed.
+   */
+  async strandQuarantine(deviceId: string, attempts: number): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.state !== "quarantined") {
+      throw new RegistryEventError(`Device is not quarantined: ${deviceId}`);
+    }
+    const { quarantineNextRetryAt: _quarantineNextRetryAt, ...rest } = device;
+    const updated: DeviceRecord = { ...rest, quarantineAttempts: attempts };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  async deleteQuarantined(deviceId: string, initiator: string): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.state !== "quarantined") {
+      throw new RegistryEventError(`Device is not quarantined: ${deviceId}`);
+    }
+    const updated = this.#transitioned(device, "deleted");
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    this.options.eventBus.emit(
+      "device.deleted",
+      { deviceId, initiator, physical: device.physical },
+      "registry",
+    );
+    return this.#committed(deviceId);
+  }
+
+  async markForeignStateDetected(deviceId: string, at: number): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    // why: Doctor re-reports persistent drift on every reaper tick; keep the first-detected
+    // timestamp and skip the commit so a flagged device stops rewriting its row.
+    if (device.foreignStateDetectedAt !== undefined) {
+      return cloneDevice(device);
+    }
+    const updated = { ...device, foreignStateDetectedAt: at };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  async markForeignProvenanceDetected(deviceId: string, at: number): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.foreignProvenanceDetectedAt !== undefined) {
+      return cloneDevice(device);
+    }
+    const updated = { ...device, foreignProvenanceDetectedAt: at };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  /** Clears the foreign-state flag once `doctor --fix` has reconciled the device. */
+  async clearForeignStateDetected(deviceId: string): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.foreignStateDetectedAt === undefined) {
+      return cloneDevice(device);
+    }
+    const { foreignStateDetectedAt: _foreignStateDetectedAt, ...rest } = device;
+    const updated = rest as DeviceRecord;
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  /** Marks a recovery boot attempt; keeps the first-seen start time across retries. */
+  async markRecoveryAttempt(deviceId: string, at: number): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    const updated = {
+      ...device,
+      recoveringSince: device.recoveringSince ?? at,
+      recoveryAttempts: (device.recoveryAttempts ?? 0) + 1,
+    };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  /** Clears recovery markers once recovery has finished, one way or another. */
+  async clearRecovery(deviceId: string): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (device.recoveringSince === undefined && device.recoveryAttempts === undefined) {
+      return cloneDevice(device);
+    }
+    const {
+      recoveringSince: _recoveringSince,
+      recoveryAttempts: _recoveryAttempts,
+      ...rest
+    } = device;
+    const updated = rest as DeviceRecord;
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  async markDeviceMissing(deviceId: string, initiator: string): Promise<DeviceRecord> {
+    const { device } = this.#requireDeviceRecord(deviceId);
+    if (this.#leases.some((lease) => lease.deviceId === deviceId)) {
+      throw new RegistryEventError(`Cannot mark leased device missing: ${deviceId}`);
+    }
+    if (device.state === "deleted") {
+      return cloneDevice(device);
+    }
+    this.#commitMissing(device, this.#leases);
+    this.options.eventBus.emit(
+      "device.deleted",
+      { deviceId, initiator, physical: device.physical },
+      "registry",
+    );
+    return this.#committed(deviceId);
+  }
+
+  /**
+   * why: removes a lease and marks its device missing in one write, for a device a daemon start found
+   * gone from a platform it could read. There is nothing left to delete, so no `reclaiming` state
+   * stands between: the lease and the device leave `leased` together. The device record is
+   * written exactly as `markDeviceMissing` writes it.
+   *
+   * `announceLeaseEnd` runs once the write has committed and before `device.deleted` is emitted,
+   * so the lease's own fact precedes the device's. The registry never names a lease event itself.
+   */
+  async endLeaseAndMarkDeviceMissing(
+    leaseId: string,
+    initiator: string,
+    announceLeaseEnd: (ended: ReleasedLease) => void,
+  ): Promise<ReleasedLease> {
+    const lease = this.#leases.find((candidate) => candidate.id === leaseId);
+    if (lease === undefined) {
+      throw new UnknownLeaseError(leaseId);
+    }
+    const { device } = this.#requireDeviceRecord(lease.deviceId);
+    const deleted = this.#commitMissing(
+      device,
+      this.#leases.filter((candidate) => candidate.id !== leaseId),
+    );
+    const ended = { device: cloneDevice(deleted), lease: cloneLease(lease) };
+    announceLeaseEnd(ended);
+    this.options.eventBus.emit(
+      "device.deleted",
+      { deviceId: device.id, initiator, physical: device.physical },
+      "registry",
+    );
+    return ended;
+  }
+
+  /** why: `announceLeaseEnd` runs after the commit and before `device.absence-detected`, so the lease's fact comes first. */
+  async endLeaseAndMarkDeviceAbsent(
+    leaseId: string,
+    absentReason: AbsentReason,
+    announceLeaseEnd: (ended: ReleasedLease) => void,
+  ): Promise<ReleasedLease> {
+    const lease = this.#leases.find((candidate) => candidate.id === leaseId);
+    if (lease === undefined) {
+      throw new UnknownLeaseError(leaseId);
+    }
+    const { device, index } = this.#requireDeviceRecord(lease.deviceId);
+    const absent = {
+      ...this.#transitioned(device, "absent", { absentReason }),
+      lastLeaseEndedAt: this.options.clock.now(),
+    };
+    const devices = [...this.#devices];
+    devices[index] = absent;
+    this.#commit(
+      devices,
+      this.#leases.filter((candidate) => candidate.id !== leaseId),
+    );
+    const ended = { device: cloneDevice(absent), lease: cloneLease(lease) };
+    announceLeaseEnd(ended);
+    this.options.eventBus.emit(
+      "device.absence-detected",
+      { absentReason, deviceId: device.id, previousState: "leased" },
+      "registry",
+    );
+    return ended;
+  }
+
+  async rewriteAbsentReason(deviceId: string, absentReason: AbsentReason): Promise<DeviceRecord> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (!device.physical || device.state !== "absent") {
+      throw new RegistryEventError(`Device is not absent: ${deviceId}`);
+    }
+    const updated: PhysicalDevice = { ...device, absentReason };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    return cloneDevice(updated);
+  }
+
+  /**
+   * The one place a device is written as missing. Recovery markers go with it: a deleted device
+   * has no recovery to track, and a stale count would only mislead a reader of the record.
+   */
+  #commitMissing(device: DeviceRecord, leases: LeaseRecord[]): DeviceRecord {
+    // A physical record is never written as missing: that would unenrol it (ADR 0022 §4).
+    if (device.physical) {
+      throw new RegistryEventError(`Cannot mark a physical device missing: ${device.id}`);
+    }
+    const {
+      recoveringSince: _recoveringSince,
+      recoveryAttempts: _recoveryAttempts,
+      deferredReclaimLeaseId: _deferred,
+      ...rest
+    } = device;
+    const deleted = { ...rest, state: "deleted" as const } as DeviceRecord;
+    const devices = this.#devices.map((candidate) =>
+      candidate.id === device.id ? deleted : candidate,
+    );
+    this.#commit(devices, leases);
+    return this.#committed(device.id);
+  }
+
+  async enrollPhysical(input: PhysicalEnrollmentInput): Promise<PhysicalDevice> {
+    const now = this.options.clock.now();
+    const record: PhysicalDevice = {
+      createdAt: now,
+      driverData: {},
+      driverDeviceId: input.driverDeviceId,
+      enrolledApps: [...input.apps],
+      ...(input.hardwareSerial === undefined ? {} : { hardwareSerial: input.hardwareSerial }),
+      id: `dev_${this.options.idGenerator.generate()}`,
+      physical: true,
+      readyAt: now,
+      spec: {
+        class: input.class,
+        model: input.model,
+        osVersion: input.osVersion,
+        physical: true,
+        platform: input.platform,
+      },
+      state: "ready",
+    };
+    this.#commit([...this.#devices, record], this.#leases);
+    this.#emitEnrolled(record, false, input.initiator ?? "operator");
+    return cloneDevice(record) as PhysicalDevice;
+  }
+
+  async reenrollPhysical(
+    deviceId: string,
+    input: PhysicalEnrollmentInput,
+  ): Promise<PhysicalDevice> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (!device.physical) throw new RegistryEventError(`Cannot re-enrol device: ${deviceId}`);
+    const {
+      quarantineAttempts: _quarantineAttempts,
+      quarantineNextRetryAt: _quarantineNextRetryAt,
+      quarantinedAt: _quarantinedAt,
+      deferredReclaimLeaseId: _deferred,
+      ...kept
+    } = device;
+    let settled: PhysicalDevice = kept;
+    if (device.state !== "ready") {
+      try {
+        settled = transition(kept, "ready");
+      } catch (error) {
+        if (error instanceof IllegalTransition) {
+          throw new RegistryEventError(`Cannot re-enrol device: ${deviceId}`);
+        }
+        throw error;
+      }
+    }
+    const { hardwareSerial: _previousSerial, ...unserialed } = settled;
+    const updated: PhysicalDevice = {
+      ...unserialed,
+      enrolledApps: [...input.apps],
+      ...(input.hardwareSerial === undefined ? {} : { hardwareSerial: input.hardwareSerial }),
+      readyAt: this.options.clock.now(),
+      spec: {
+        class: input.class,
+        model: input.model,
+        osVersion: input.osVersion,
+        physical: true,
+        platform: device.spec.platform,
+      },
+    };
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    this.#emitEnrolled(updated, true, "operator");
+    return this.#committed(deviceId) as PhysicalDevice;
+  }
+
+  async unenrollPhysical(deviceId: string): Promise<PhysicalDevice> {
+    const { device, index } = this.#requireDeviceRecord(deviceId);
+    if (!device.physical) throw new RegistryEventError(`Cannot unenrol device: ${deviceId}`);
+    const {
+      quarantineAttempts: _quarantineAttempts,
+      quarantineNextRetryAt: _quarantineNextRetryAt,
+      quarantinedAt: _quarantinedAt,
+      ...kept
+    } = device;
+    let updated: PhysicalDevice;
+    try {
+      updated = transition(kept, "deleted");
+    } catch (error) {
+      if (error instanceof IllegalTransition) {
+        throw new RegistryEventError(`Cannot unenrol device: ${deviceId}`);
+      }
+      throw error;
+    }
+    const devices = [...this.#devices];
+    devices[index] = updated;
+    this.#commit(devices, this.#leases);
+    this.options.eventBus.emit(
+      "device.deleted",
+      { deviceId, initiator: "operator", physical: true },
+      "registry",
+    );
+    return this.#committed(deviceId) as PhysicalDevice;
+  }
+
+  #emitEnrolled(device: PhysicalDevice, reenrolled: boolean, initiator: "operator" | "auto"): void {
+    this.options.eventBus.emit(
+      "device.enrolled",
+      {
+        appCount: device.enrolledApps.length,
+        class: device.spec.class,
+        deviceId: device.id,
+        driverDeviceId: device.driverDeviceId,
+        initiator,
+        model: device.spec.model,
+        osVersion: device.spec.osVersion,
+        platform: device.spec.platform,
+        reenrolled,
+      },
+      "registry",
+    );
+  }
+
+  async createLease({
+    deviceId,
+    ownerId,
+    requesterId,
+    ttlMs,
+    ttlDeadline,
+    leaseId,
+    runId,
+    label,
+    except,
+    request,
+  }: CreateLeaseInput): Promise<LeaseRecord> {
+    const index = this.#devices.findIndex((device) => device.id === deviceId);
+    if (index === -1) {
+      throw new UnknownDeviceError(deviceId);
+    }
+
+    const device = this.#devices[index];
+    if (device === undefined) {
+      throw new UnknownDeviceError(deviceId);
+    }
+    if (this.#leases.some((lease) => lease.deviceId === deviceId)) {
+      throw new RegistryEventError(`Device already has an active lease: ${deviceId}`);
+    }
+
+    const leased = this.#transitioned(device, "leased");
+    const leasedDevice = except === undefined || leased.physical ? leased : { ...leased, except };
+    const grantedAt = this.options.clock.now();
+    const lease: LeaseRecord = {
+      deviceId,
+      grantedAt,
+      id: leaseId ?? `lse_${this.options.idGenerator.generate()}`,
+      idChosenByRequester: leaseId !== undefined,
+      // ADR 0004: set at grant, then again on every renew -- a lease that has never been
+      // renewed reports the moment it was granted rather than nothing at all.
+      lastRenewedAt: grantedAt,
+      ownerId,
+      requesterId,
+      ...presentFields({ runId, label }),
+      ttlMs,
+      ttlDeadline,
+    };
+    const devices = [...this.#devices];
+    devices[index] = leasedDevice;
+    // The request's result goes in the same write as the lease: a crash leaves both or neither.
+    // A request that is gone or already settled is left alone, as the book's own settle does.
+    const leaseRequests =
+      request === undefined
+        ? this.#leaseRequests
+        : withSettledLeaseRequest(
+            this.#leaseRequests,
+            request.id,
+            {
+              grant: {
+                device: leasedDevice,
+                environment: request.environment,
+                lease,
+                timing: request.timing,
+              },
+              state: "granted",
+            },
+            grantedAt,
+          ).records;
+    this.#commit(devices, [...this.#leases, lease], leaseRequests);
+
+    return cloneLease(lease);
+  }
+
+  async beginRelease(
+    leaseId: string,
+    options: { readonly deferReclaim?: boolean } = {},
+  ): Promise<ReleasedLease> {
+    const leaseIndex = this.#leases.findIndex((lease) => lease.id === leaseId);
+    const lease = this.#leases[leaseIndex];
+    if (leaseIndex === -1 || lease === undefined) {
+      throw new UnknownLeaseError(leaseId);
+    }
+    const deviceIndex = this.#devices.findIndex((device) => device.id === lease.deviceId);
+    const device = this.#devices[deviceIndex];
+    if (deviceIndex === -1 || device === undefined) {
+      throw new UnknownDeviceError(lease.deviceId);
+    }
+
+    const {
+      recoveringSince: _recoveringSince,
+      recoveryAttempts: _recoveryAttempts,
+      ...withoutRecoveryMarkers
+    } = device;
+    const reclaiming = {
+      ...this.#transitioned(withoutRecoveryMarkers as DeviceRecord, "reclaiming"),
+      lastLeaseEndedAt: this.options.clock.now(),
+      // why: the reclaim is not started now; a later start that can read the platform runs it.
+      ...(options.deferReclaim === true ? { deferredReclaimLeaseId: leaseId } : {}),
+    };
+    const devices = [...this.#devices];
+    devices[deviceIndex] = reclaiming;
+    const leases = this.#leases.filter((candidate) => candidate.id !== leaseId);
+    this.#commit(devices, leases);
+
+    return { device: cloneDevice(reclaiming), lease: cloneLease(lease) };
+  }
+
+  /**
+   * Commits a renewal: the new deadline, the width it was applied at (which becomes what the
+   * *next* body-less renew re-applies), and `lastRenewedAt`. All three are persisted together,
+   * so a daemon restart mid-lease restores the renewed deadline rather than the grant-time one.
+   */
+  async renewLease(leaseId: string, ttlDeadline: number, ttlMs: number): Promise<LeaseRecord> {
+    const index = this.#leases.findIndex((lease) => lease.id === leaseId);
+    const lease = this.#leases[index];
+    if (index === -1 || lease === undefined) {
+      throw new UnknownLeaseError(leaseId);
+    }
+
+    const renewed = { ...lease, lastRenewedAt: this.options.clock.now(), ttlDeadline, ttlMs };
+    const leases = [...this.#leases];
+    leases[index] = renewed;
+    this.#commit(this.#devices, leases);
+    return cloneLease(renewed);
+  }
+
+  leaseRequests(): readonly LeaseRequestRecord[] {
+    return retainedLeaseRequests(
+      this.#leaseRequests,
+      this.options.clock.now(),
+      this.options.leaseRequestLimits.retentionMs,
+    ).map((record) => this.#withCurrentDevice(record));
+  }
+
+  /** why: a granted request stores the lease, environment and timing as first answered, but names its device only by id (ADR 0036 §4). */
+  #withCurrentDevice(record: LeaseRequestRecord): LeaseRequestRecord {
+    const copy = cloneLeaseRequest(record);
+    if (copy.grant === undefined) return copy;
+    const { grant } = copy;
+    const device = this.#devices.find((candidate) => candidate.id === grant.device.id);
+    return device === undefined
+      ? copy
+      : { ...copy, grant: { ...grant, device: cloneDevice(device) } };
+  }
+
+  async createLeaseRequest(input: NewLeaseRequest): Promise<LeaseRequestRecord> {
+    const now = this.options.clock.now();
+    const record = newLeaseRequestRecord<LeaseGrant>(
+      input.id ?? newLeaseRequestId(this.options.idGenerator),
+      input,
+      now,
+    );
+    const leaseRequests = withNewLeaseRequest(
+      this.#leaseRequests,
+      record,
+      now,
+      this.options.leaseRequestLimits,
+    );
+    this.#commit(this.#devices, this.#leases, leaseRequests);
+    return cloneLeaseRequest(record);
+  }
+
+  async settleLeaseRequest(
+    id: string,
+    outcome: LeaseRequestOutcome<LeaseGrant>,
+  ): Promise<LeaseRequestRecord | undefined> {
+    const { records, settled } = withSettledLeaseRequest(
+      this.#leaseRequests,
+      id,
+      outcome,
+      this.options.clock.now(),
+    );
+    if (settled === undefined) return undefined;
+    this.#commit(this.#devices, this.#leases, records);
+    return this.#withCurrentDevice(settled);
+  }
+
+  /**
+   * Settles every request still open as `failed`, in one write. Startup calls it before admission
+   * opens: nothing in a new process drives a wait the old one started, so an open record from
+   * before the restart would otherwise stay open with nothing to settle it.
+   */
+  async failOpenLeaseRequests(
+    failure: LeaseRequestFailure,
+  ): Promise<readonly LeaseRequestRecord[]> {
+    let records = this.#leaseRequests;
+    const settled: LeaseRequestRecord[] = [];
+    const now = this.options.clock.now();
+    for (const open of this.#leaseRequests.filter((record) => !isSettled(record))) {
+      const result = withSettledLeaseRequest(records, open.id, { failure, state: "failed" }, now);
+      records = result.records;
+      if (result.settled !== undefined) settled.push(result.settled);
+    }
+    if (settled.length > 0) this.#commit(this.#devices, this.#leases, records);
+    return settled.map((record) => this.#withCurrentDevice(record));
+  }
+
+  /** why: the exits return the committed record, which has dropped any cause. */
+  #committed(deviceId: string): DeviceRecord {
+    return cloneDevice(this.#requireDeviceRecord(deviceId).device);
+  }
+
+  #requireDeviceRecord(deviceId: string): {
+    readonly device: DeviceRecord;
+    readonly index: number;
+  } {
+    const index = this.#devices.findIndex((device) => device.id === deviceId);
+    const device = this.#devices[index];
+    if (index === -1 || device === undefined) {
+      throw new UnknownDeviceError(deviceId);
+    }
+    return { device, index };
+  }
+
+  #commit(
+    devices: DeviceRecord[],
+    leases: LeaseRecord[],
+    leaseRequests: readonly LeaseRequestRecord[] = this.#leaseRequests,
+    components: readonly ComponentRecord[] = this.#components,
+  ): void {
+    const now = this.options.clock.now();
+    const { deletedRetentionMs, deviceData, state } = this.options;
+    const stamped = devices
+      .map(withoutCauseUnlessQuarantined)
+      .map((device) =>
+        device.state === "deleted" && device.deletedAt === undefined
+          ? ({ ...device, deletedAt: now } as DeviceRecord)
+          : device,
+      );
+    const committed = stamped.filter((device) => !isExpired(device, now, deletedRetentionMs));
+    // why: a granted request names its device, so a request the purged device outlives goes with it; it has expired by then (`deletedRetentionMs` is at least `lease.requestRetentionMs`).
+    const requests =
+      committed.length < stamped.length
+        ? retainedLeaseRequests(leaseRequests, now, this.options.leaseRequestLimits.retentionMs)
+        : leaseRequests;
+    state.transaction(() => {
+      const { database } = state;
+      const device = changes(this.#devices, committed, (record) => record.id);
+      const lease = changes(this.#leases, leases, (record) => record.id);
+      const request = changes(this.#leaseRequests, requests, (record) => record.id);
+      const component = changes(this.#components, components, componentKey);
+      for (const id of request.removed) deleteLeaseRequest(database, id);
+      for (const id of device.removed) deleteDevice(database, id);
+      for (const record of device.changed) writeDevice(database, record, deviceData);
+      for (const id of lease.removed) deleteLease(database, id);
+      this.#recordEndedLeaseIds(lease.removed, now);
+      for (const record of lease.changed) writeLease(database, record);
+      for (const record of request.changed) writeLeaseRequest(database, record);
+      for (const key of component.removed) {
+        const [platform, version] = key.split("\0") as [Platform, string];
+        deleteComponentRows(database, platform, version);
+      }
+      for (const record of component.changed) writeComponent(database, record);
+    });
+    this.#devices = committed;
+    this.#leases = leases;
+    this.#leaseRequests = requests;
+    this.#components = components;
+    this.#commitListeners.forEach((listener) => listener());
+  }
+
+  /** why: ADR 0074 §4: runs inside the commit's transaction, so a lease and its ended row are written together. */
+  #recordEndedLeaseIds(removedIds: readonly string[], now: number): void {
+    const { database } = this.options.state;
+    for (const id of removedIds) {
+      if (this.#leases.find((record) => record.id === id)?.idChosenByRequester === true) {
+        writeEndedLeaseId(database, id, now);
+      }
+    }
+    pruneEndedLeaseIds(database, now - this.options.endedIdRetentionMs);
+  }
+
+  /** why: ADR 0074 §4: when the chosen lease id ended, while it is still inside `lease.endedIdRetentionMs`. */
+  // fallow-ignore-next-line unused-class-member -- reached through the acquisition coordinator's registry port.
+  endedLeaseId(leaseId: string): number | undefined {
+    const endedAt = readEndedLeaseId(this.options.state.database, leaseId);
+    if (endedAt === undefined) return undefined;
+    return this.options.clock.now() - endedAt > this.options.endedIdRetentionMs
+      ? undefined
+      : endedAt;
+  }
+
+  /** Calls `listener` after every commit, once the new state is what `snapshot` reads. */
+  onCommit(listener: () => void): void {
+    this.#commitListeners.push(listener);
+  }
+
+  #emitDeviceEvent(event: RegistryDeviceEvent, device: DeviceRecord): void {
+    switch (event.event) {
+      case "device.ready":
+        this.options.eventBus.emit(
+          event.event,
+          { ...event.payload, platform: device.spec.platform },
+          "registry",
+        );
+        return;
+      case "device.reclaimed":
+        this.options.eventBus.emit(event.event, event.payload, "registry");
+        return;
+      case "device.shutdown":
+        this.options.eventBus.emit(event.event, event.payload, "registry");
+        return;
+      case "device.absence-detected":
+        this.options.eventBus.emit(event.event, event.payload, "registry");
+        return;
+      case "device.returned":
+        this.options.eventBus.emit(event.event, event.payload, "registry");
+        return;
+      case "device.deleted":
+        this.options.eventBus.emit(
+          event.event,
+          { ...event.payload, physical: device.physical },
+          "registry",
+        );
+    }
+  }
+}

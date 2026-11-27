@@ -1,0 +1,67 @@
+export type Section = "/fleet" | "/leases" | "/queue" | "/inbox" | "/activity";
+
+export function itemPath(section: Section, id: string): `/${string}` {
+  return `${section}/${encodeURIComponent(id)}`;
+}
+
+// why: an Inbox key may hold a `.` (a gateway lease id does), and the daemon serves the console's page
+// only for a path whose last segment has none, so such an address ends in `/`.
+export function inboxPath(key: string): `/${string}` {
+  const path = itemPath("/inbox", key);
+  return key.includes(".") ? `${path}/` : path;
+}
+
+// why: ids are opaque and may hold a slash (an Inbox item's key does), so the whole rest of the
+// path is one id; a malformed escape is kept as typed rather than thrown.
+export function itemIdFrom(section: Section, path: string): string | undefined {
+  if (!path.startsWith(`${section}/`)) return undefined;
+  const rest = path.slice(section.length + 1).replace(/\/$/, "");
+  if (rest === "") return undefined;
+  try {
+    return decodeURIComponent(rest);
+  } catch {
+    return rest;
+  }
+}
+
+export interface FleetAddress {
+  readonly workerId?: string;
+  readonly deviceId?: string;
+  readonly streaming?: true;
+}
+
+// why: the streaming page's address carries a marker between the ids and ends in `/`, so an id with a
+// dot is still served; `devices` in the worker's own second position is only ever a device id, so
+// only `<worker>/devices/<device>` names a stream.
+const STREAM = "devices";
+
+export function streamPath(workerId: string, deviceId: string): `/${string}` {
+  return `/fleet/${encodeURIComponent(workerId)}/${STREAM}/${encodeURIComponent(deviceId)}/`;
+}
+
+function decoded(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+// why: a worker's page is `/fleet/<workerId>`, its device drawer `/fleet/<workerId>/<deviceId>` and
+// the device's streaming page `/fleet/<workerId>/devices/<deviceId>/`, each id encoded on its own, so
+// a slash inside an id cannot be taken for the separator; a malformed escape is kept as typed.
+export function fleetAddress(path: string): FleetAddress {
+  if (!path.startsWith("/fleet/")) return {};
+  const segments = path.slice("/fleet/".length).replace(/\/$/, "").split("/");
+  const [worker, second, third] = segments;
+  if (worker === undefined || worker === "") return {};
+  if (segments.length === 3 && second === STREAM && third !== undefined && third !== "")
+    return { deviceId: decoded(third), streaming: true, workerId: decoded(worker) };
+  return second === undefined || second === ""
+    ? { workerId: decoded(worker) }
+    : { deviceId: decoded(second), workerId: decoded(worker) };
+}
+
+export function devicePath(workerId: string, deviceId: string): `/${string}` {
+  return `/fleet/${encodeURIComponent(workerId)}/${encodeURIComponent(deviceId)}`;
+}

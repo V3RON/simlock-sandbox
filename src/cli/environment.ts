@@ -1,0 +1,599 @@
+// why: nothing heavy is imported statically here -- `loadConfig`, the module registry, the
+// event-history reader and the admin client load inside the closures that use them, so building
+// an environment costs what it always cost while loading this file costs almost nothing.
+import { join } from "node:path";
+
+import { resolveRequesterId } from "../agent-identity/index.js";
+import type { SimlockAdminClient } from "../admin/index.js";
+import type { ConfigOverrides, DriverConfigEntry, ModuleConfigEntry } from "../core/index.js";
+import type {
+  Clock,
+  DaemonExit,
+  DaemonLauncher,
+  Filesystem,
+  HttpStreamClient,
+  IpcConnector,
+  LaunchedDaemon,
+  ParentWatch,
+  ParentWatchHandle,
+} from "../ports/index.js";
+import { UsageError } from "./usage-error.js";
+import { readLogFile } from "./log-file.js";
+import { readPipedStdin } from "./stdio.js";
+import type { CliEnvironment, CliEnvironmentPorts, Output } from "./types.js";
+import { errorMessage } from "../shared/index.js";
+
+const EXIT_GRACE_MS = 2_000;
+// why: a daemon whose start failed is already stopping when it answers, so its stopping refusal is the failed start.
+const STARTING_FAILURE_CODES: ReadonlySet<string> = new Set([
+  "DAEMON_CONNECTION_LOST",
+  "DAEMON_STOPPING",
+]);
+// why: the daemon bounds its own startup read at STARTUP_READ_LIMIT_MS, so the CLI waits past it before it calls a daemon that is still starting stuck.
+const STARTING_WAIT_EXTRA_MS = 30_000;
+
+// why: the adapter loads on the first transfer, so a command that moves no file never loads node:http for it.
+function httpStreamOf(supplied: HttpStreamClient | undefined): HttpStreamClient {
+  return (
+    supplied ?? {
+      request: async (request) => {
+        const { NodeHttpStreamClient } = await import("../ports/index.js");
+        return new NodeHttpStreamClient().request(request);
+      },
+    }
+  );
+}
+
+// why: a real stdout takes the bytes as they are; a stdout a test or a host supplied is a text sink, so the bytes go to it as text.
+function stdoutBytesOf(stdout: Output | undefined): (bytes: Uint8Array) => unknown {
+  return stdout === undefined
+    ? (bytes) => process.stdout.write(bytes)
+    : (bytes) => stdout.write(Buffer.from(bytes).toString("utf8"));
+}
+
+class AutoLaunchAdminConnector {
+  private startupDeadline: number | undefined;
+
+  constructor(
+    private readonly connectClient: (
+      resolveCredential: () => Promise<string | undefined>,
+    ) => Promise<SimlockAdminClient>,
+    private readonly clock: Clock,
+    private readonly launcher: DaemonLauncher,
+    private readonly checkConfig: () => Promise<void>,
+  ) {}
+
+  async connect(
+    resolveCredential: () => Promise<string | undefined>,
+    options: { readonly untilStarted?: boolean } | undefined = undefined,
+  ): Promise<SimlockAdminClient> {
+    try {
+      return await this.finishConnection(this.connectClient(resolveCredential));
+    } catch (error: unknown) {
+      if (!(await isUnavailable(error))) throw error;
+    }
+    await this.checkConfig();
+    const launched = await this.launcher.launch();
+    let exit: DaemonExit | undefined;
+    void launched.exited.then((value) => {
+      exit = value;
+    });
+    // why: the constant lives behind the ports barrel, which loads on the first connection that needs it.
+    const { DAEMON_STARTUP_TIMEOUT_MS } = await import("../ports/index.js");
+    const deadline = this.clock.now() + DAEMON_STARTUP_TIMEOUT_MS;
+    this.startupDeadline = deadline;
+    let lastError: unknown;
+    while (this.clock.now() < deadline) {
+      try {
+        const client = await this.finishConnection(this.connectClient(resolveCredential));
+        return options?.untilStarted === true ? await this.untilStarted(client, launched) : client;
+      } catch (error: unknown) {
+        await this.failStoppingStart(error, options, launched);
+        if (!(await isUnavailable(error))) throw error;
+        lastError = error;
+        if (exit !== undefined)
+          return await this.connectAfterExit(launched, exit, resolveCredential);
+        await new Promise<void>((resolve) => this.clock.setTimer(50, resolve));
+      }
+    }
+    const output = await launched.readOutput().catch(() => "");
+    const { SimlockError } = await import("../contract/index.js");
+    const { startTimeoutMessage } = await import("../ports/index.js");
+    throw new SimlockError(
+      "DAEMON_STARTUP_FAILED",
+      "transport",
+      startTimeoutMessage(errorMessage(lastError), output),
+      {},
+    );
+  }
+
+  /** why: the first `status.get` answer arrives while the daemon is still converging, and a start that fails later (an HTTP port it cannot bind) must not be reported as running. */
+  private async untilStarted(
+    client: SimlockAdminClient,
+    launched: LaunchedDaemon,
+  ): Promise<SimlockAdminClient> {
+    const { isSimlockError, SimlockError } = await import("../contract/index.js");
+    const { STARTUP_READ_LIMIT_MS } = await import("../core/index.js");
+    const giveUpAt = this.clock.now() + STARTUP_READ_LIMIT_MS + STARTING_WAIT_EXTRA_MS;
+    for (;;) {
+      let health: string | undefined;
+      try {
+        health = (await client.getStatus()).daemon.health;
+      } catch (error: unknown) {
+        if (!isSimlockError(error) || !STARTING_FAILURE_CODES.has(error.code)) throw error;
+      }
+      if (health === "running") return client;
+      if (health === "starting") {
+        if (this.clock.now() >= giveUpAt) {
+          await client.close().catch(() => undefined);
+          throw new SimlockError(
+            "DAEMON_STARTUP_FAILED",
+            "transport",
+            "The daemon is still starting; check simlock daemon status or daemon.log",
+            {},
+          );
+        }
+        await new Promise<void>((resolve) => this.clock.setTimer(50, resolve));
+        continue;
+      }
+      await client.close().catch(() => undefined);
+      throw await this.failedStart(launched);
+    }
+  }
+
+  /** why: a daemon whose start failed is already stopping when it answers the startup probe; that refusal is the failed start, reported as the daemon's own error. */
+  private async failStoppingStart(
+    error: unknown,
+    options: { readonly untilStarted?: boolean } | undefined,
+    launched: LaunchedDaemon,
+  ): Promise<void> {
+    if (options?.untilStarted === true && (await isStoppingRefusal(error)))
+      throw await this.failedStart(launched);
+  }
+
+  /** why: a daemon launched through a service manager has no child to exit, so the wait for its exit is short and the log is read either way. */
+  private async failedStart(launched: LaunchedDaemon): Promise<Error> {
+    const { SimlockError } = await import("../contract/index.js");
+    const exit = await Promise.race([
+      launched.exited,
+      new Promise<DaemonExit>((resolve) =>
+        this.clock.setTimer(EXIT_GRACE_MS, () => resolve({ code: null, signal: null })),
+      ),
+    ]);
+    const output = await launched.readOutput().catch(() => "");
+    const { startErrorFrom } = await import("../ports/index.js");
+    return new SimlockError("DAEMON_STARTUP_FAILED", "transport", startErrorFrom(exit, output), {});
+  }
+
+  private async connectAfterExit(
+    launched: LaunchedDaemon,
+    exit: DaemonExit,
+    resolveCredential: () => Promise<string | undefined>,
+  ): Promise<SimlockAdminClient> {
+    const output = await launched.readOutput().catch(() => "");
+    try {
+      return await this.finishConnection(this.connectClient(resolveCredential));
+    } catch (error: unknown) {
+      if (!(await isUnavailable(error))) throw error;
+    }
+    const { SimlockError } = await import("../contract/index.js");
+    const { startErrorFrom } = await import("../ports/index.js");
+    throw new SimlockError("DAEMON_STARTUP_FAILED", "transport", startErrorFrom(exit, output), {});
+  }
+
+  private async finishConnection(
+    connecting: Promise<SimlockAdminClient>,
+  ): Promise<SimlockAdminClient> {
+    const { isSimlockError, SimlockError } = await import("../contract/index.js");
+    let client: SimlockAdminClient | undefined;
+    let timer: ReturnType<Clock["setTimer"]> | undefined;
+    let timedOut = false;
+    try {
+      client = await connecting;
+      if (this.startupDeadline === undefined) return client;
+      const remainingMs = Math.max(0, this.startupDeadline - this.clock.now());
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = this.clock.setTimer(remainingMs, () => {
+          timedOut = true;
+          reject(
+            new SimlockError(
+              "DAEMON_STARTUP_FAILED",
+              "transport",
+              "Timed out starting simlock daemon: the startup status probe was not answered",
+              {},
+            ),
+          );
+        });
+      });
+      await Promise.race([client.getStatus(), timeout]);
+      this.startupDeadline = undefined;
+      return client;
+    } catch (error: unknown) {
+      // why: a daemon that went silent after `hello` never ends its side, so awaiting the close
+      // would hang the start this deadline bounds; other failures close against a live peer.
+      if (timedOut) void client?.close().catch(() => undefined);
+      else await client?.close();
+      if (
+        this.startupDeadline !== undefined &&
+        isSimlockError(error) &&
+        error.code === "DAEMON_CONNECTION_LOST"
+      ) {
+        throw new SimlockError(
+          "DAEMON_STARTUP_FAILED",
+          "transport",
+          "The daemon closed its connection while starting, before answering the startup status probe",
+          {},
+        );
+      }
+      throw error;
+    } finally {
+      if (timer !== undefined) this.clock.cancel(timer);
+    }
+  }
+}
+
+async function isStoppingRefusal(error: unknown): Promise<boolean> {
+  const { isSimlockError } = await import("../contract/index.js");
+  return isSimlockError(error) && error.code === "DAEMON_STOPPING";
+}
+
+/** why: the class lives behind the ports barrel, which this module must not load at CLI start;
+ * the name check picks the candidate and `instanceof` against the real class proves it. */
+async function isUnavailable(error: unknown): Promise<boolean> {
+  if (!(error instanceof Error) || error.name !== "IpcError") return false;
+  const { isEndpointAbsent } = await import("../ports/index.js");
+  return isEndpointAbsent(error);
+}
+
+// why: the same module and driver sections the daemon loads its config with, so the CLI accepts and refuses the same keys.
+async function configSections(): Promise<{
+  readonly driverSections: readonly DriverConfigEntry[];
+  readonly modules: readonly ModuleConfigEntry[];
+}> {
+  const [{ optionalModules }, { driverConfigEntries }] = await Promise.all([
+    import("../module-registry/index.js"),
+    import("../driver-registry/index.js"),
+  ]);
+  return {
+    driverSections: driverConfigEntries,
+    modules: optionalModules.map(({ config, enabledByDefault, name }) => ({
+      name,
+      ...config,
+      ...(enabledByDefault === undefined ? {} : { enabledByDefault }),
+    })),
+  };
+}
+
+async function readAdminTokenFile(
+  filesystem: Filesystem,
+  path: string,
+): Promise<string | undefined> {
+  try {
+    if (!(await filesystem.exists(path))) return undefined;
+    const contents = (await filesystem.readFile(path)).trim();
+    return contents === "" ? undefined : contents;
+  } catch {
+    return undefined;
+  }
+}
+
+function requireObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("Daemon returned an invalid response");
+  return value as Record<string, unknown>;
+}
+
+/** why: the default parent watcher is the ports' Node adapter, and the barrel behind it loads
+ * with every port the CLI never uses; this stands in until a command actually watches a parent,
+ * which only `lease` (through `termination.ts`) ever does. */
+function lazyNodeParentWatch(): ParentWatch {
+  let started: Promise<ParentWatch> | undefined;
+  return {
+    watch(pid: number, onExit: () => void): ParentWatchHandle {
+      let stopped = false;
+      let inner: ParentWatchHandle | undefined;
+      started ??= import("../ports/index.js").then(({ NodeParentWatch }) => new NodeParentWatch());
+      // why: a failed load means no parent watch, never a crash: the lease keeps renewing and
+      // ends only by signal or `simlock release` -- degraded, like a watch that misses its exit.
+      void started.then(
+        (watcher) => {
+          if (stopped) return;
+          inner = watcher.watch(pid, onExit);
+        },
+        () => undefined,
+      );
+      return {
+        stop: () => {
+          stopped = true;
+          inner?.stop();
+        },
+      };
+    },
+  };
+}
+
+// why: each adapter loads on first use, so a command that never touches a TCP port loads none of them.
+function tcpPorts(ports: CliEnvironmentPorts): Pick<CliEnvironment, "tcpListeners" | "tcpStreams"> {
+  return {
+    tcpListeners: ports.tcpListeners ?? {
+      listen: async (port) => {
+        const { NodeTcpListenerFactory } = await import("../ports/index.js");
+        return new NodeTcpListenerFactory().listen(port);
+      },
+    },
+    tcpStreams: ports.tcpStreams ?? {
+      connect: async (port, timeoutMs) => {
+        const { NodeTcpStreamConnector } = await import("../ports/index.js");
+        return new NodeTcpStreamConnector().connect(port, timeoutMs);
+      },
+    },
+  };
+}
+
+// why: the commands that may be the caller's adb, in the order they are tried: the one on the PATH, then the `platform-tools` of each SDK folder Simlock's own Android driver looks in.
+function adbCandidatesFor(
+  env: NodeJS.ProcessEnv,
+  home: string,
+  platform: NodeJS.Platform | undefined,
+): readonly string[] {
+  const windows = platform === "win32";
+  const adb = windows ? "adb.exe" : "adb";
+  const fallback = windows
+    ? join(env.LOCALAPPDATA ?? join(home, "AppData", "Local"), "Android", "Sdk")
+    : join(home, "Library", "Android", "sdk");
+  const roots = [env.ANDROID_HOME, env.ANDROID_SDK_ROOT, fallback].filter(
+    (root): root is string => root !== undefined && root !== "",
+  );
+  return [adb, ...roots.map((root) => join(root, "platform-tools", adb))];
+}
+
+function callerAdbPorts(
+  ports: CliEnvironmentPorts,
+  env: NodeJS.ProcessEnv,
+): Pick<CliEnvironment, "adbCandidates" | "processRunner"> {
+  return {
+    adbCandidates: adbCandidatesFor(env, ports.homeDirectory, ports.hostPlatform),
+    processRunner: ports.processRunner,
+  };
+}
+
+export function buildCliEnvironment(
+  ports: CliEnvironmentPorts,
+  env: NodeJS.ProcessEnv = process.env,
+): CliEnvironment {
+  const { clock, daemonHome, filesystem, ipc, launcher, systemStats } = ports;
+  const { dataDirectory } = daemonHome;
+  const configPath = join(dataDirectory, "config.json");
+  const logPath = join(dataDirectory, "daemon.log");
+  const adminTokenPath = join(dataDirectory, "admin.token");
+  const requesterId = resolveRequesterId(env, String(process.pid));
+  const checkConfig = async (): Promise<void> => {
+    // why: the daemon refuses to boot on a config `loadConfig` rejects and only its log says so;
+    // loading the same file before the launch puts the `ConfigError` on the CLI's stderr.
+    const { ConfigError, loadConfig } = await import("../core/index.js");
+    try {
+      await loadConfig({
+        configPath,
+        filesystem,
+        ...(await configSections()),
+        role: daemonHome.role,
+        systemStats,
+      });
+    } catch (error) {
+      // why: a rejected config value is a wrong request (exit 2), as `config set` reports it.
+      if (error instanceof ConfigError) throw new UsageError(error.message);
+      throw error;
+    }
+  };
+
+  const connect = async (
+    connector: IpcConnector,
+    resolveCredential: () => Promise<string | undefined>,
+  ): Promise<SimlockAdminClient> => {
+    const [{ connectSimlockAdmin }, { resolveDaemonSocketPath }] = await Promise.all([
+      import("../admin/index.js"),
+      import("../ports/index.js"),
+    ]);
+    // why: Resolved here rather than once during construction, because it can throw: a
+    // `SIMLOCK_HOME` whose socket path exceeds the platform limit is a `SocketPathTooLongError`.
+    // Every consumer of this path is behind a command already inside `runCli`'s own try, where
+    // that throw becomes the single structured error line the CLI reference promises instead of a
+    // raw stack trace, and `simlock --help` (which needs no socket at all) never resolves it.
+    const connection = await connector.connect(
+      resolveDaemonSocketPath(dataDirectory, ports.hostPlatform),
+    );
+    const credential = await resolveCredential();
+    return connectSimlockAdmin({
+      connection,
+      principal: requesterId,
+      ...(credential === undefined ? {} : { credential }),
+    });
+  };
+
+  const autoLaunch = new AutoLaunchAdminConnector(
+    (resolveCredential) => connect(ipc, resolveCredential),
+    clock,
+    launcher,
+    checkConfig,
+  );
+
+  const service = ports.service;
+  return {
+    clock,
+    configPath,
+    daemonHome,
+    ...(service === undefined
+      ? {}
+      : {
+          service: {
+            manager: service.manager,
+            platform: service.platform,
+            user: service.user,
+            checkConfig,
+            definition: async () => {
+              const { serviceDefinition } = await import("../ports/index.js");
+              return serviceDefinition({
+                ...(service.manager === undefined ? {} : { manager: service.manager.manager }),
+                role: daemonHome.role,
+                root: service.root,
+                dataDirectory,
+                home: service.home,
+                nodePath: service.nodePath,
+                mainPath: service.mainPath,
+                env,
+              });
+            },
+          },
+        }),
+    requesterId,
+    requesterIsProcess: resolveRequesterId(env, "") === "",
+    homeDirectory: ports.homeDirectory,
+    workingDirectory: ports.workingDirectory,
+    codexHome: ports.codexHome,
+    hostPlatform: ports.hostPlatform,
+    runTool: ports.runTool,
+    filesystem,
+    connectAdmin: (resolveCredential, options) => autoLaunch.connect(resolveCredential, options),
+    connectExistingAdmin: (resolveCredential) => connect(ipc, resolveCredential),
+    daemonEndpointPresent: async () => {
+      const { isEndpointAbsent, isPipeEndpoint, resolveDaemonSocketPath } =
+        await import("../ports/index.js");
+      const endpoint = resolveDaemonSocketPath(dataDirectory, ports.hostPlatform);
+      if (!isPipeEndpoint(endpoint)) return filesystem.exists(endpoint);
+      // why: `stat` on a live named pipe throws `EBUSY`, so a pipe is present exactly when something answers it.
+      try {
+        await (await ipc.connect(endpoint)).close();
+        return true;
+      } catch (error: unknown) {
+        return !isEndpointAbsent(error);
+      }
+    },
+    ...(env.SIMLOCK_ADMIN_TOKEN === undefined
+      ? {}
+      : { adminTokenFromEnv: env.SIMLOCK_ADMIN_TOKEN }),
+    readAdminTokenFile: () => readAdminTokenFile(filesystem, adminTokenPath),
+    sleep: (milliseconds) => new Promise<void>((resolve) => clock.setTimer(milliseconds, resolve)),
+    parentPid: ports.parentPid ?? process.ppid,
+    parentWatch: ports.parentWatch ?? lazyNodeParentWatch(),
+    readConfigFile: async () => {
+      if (!(await filesystem.exists(configPath))) return {};
+      return requireObject(JSON.parse(await filesystem.readFile(configPath)) as unknown);
+    },
+    runPassthrough:
+      ports.runPassthrough ??
+      ((command) =>
+        import("./passthrough.js").then(({ spawnPassthrough }) => spawnPassthrough(command))),
+    readStdin: ports.readStdin ?? readPipedStdin,
+    webSocket: ports.webSocket ?? {
+      connect: async (url, options) => {
+        const { NodeWebSocketClientConnector } = await import("../ports/index.js");
+        return new NodeWebSocketClientConnector().connect(url, options);
+      },
+    },
+    httpJson: ports.httpJson ?? {
+      get: async (url, token) => {
+        const { FetchHttpJsonClient } = await import("../ports/index.js");
+        return new FetchHttpJsonClient().get(url, token);
+      },
+    },
+    httpStream: httpStreamOf(ports.httpStream),
+    ...tcpPorts(ports),
+    ...callerAdbPorts(ports, env),
+    ...(env.SIMLOCK_BASELINE === undefined ? {} : { baselineFromEnv: env.SIMLOCK_BASELINE }),
+    ...runFieldsFromEnv(env),
+    ...farmFieldsFromEnv(env),
+    writeConfigFile: async (contents) => {
+      const { DATA_DIRECTORY_MODE } = await import("../ports/index.js");
+      await filesystem.mkdirp(dataDirectory, { mode: DATA_DIRECTORY_MODE });
+      // why: Owner-only on every write: the file can hold `gateway.token`, and the atomic rename
+      // replaces the old file, so a mode the user set by hand would not survive otherwise.
+      await filesystem.writeFileAtomic(configPath, `${JSON.stringify(contents, null, 2)}\n`, {
+        mode: 0o600,
+      });
+    },
+    validateConfig: async (merged) => {
+      const [{ loadConfig }, { MemoryFilesystem }] = await Promise.all([
+        import("../core/index.js"),
+        import("../ports/index.js"),
+      ]);
+      const unknownKeyWarnings: string[] = [];
+      await loadConfig({
+        configPath: "/config-set-validation.json",
+        filesystem: new MemoryFilesystem(),
+        ...(await configSections()),
+        overrides: merged as ConfigOverrides,
+        role: daemonHome.role,
+        systemStats,
+        warn: (message) => {
+          if (message.startsWith("Unknown config key:")) unknownKeyWarnings.push(message);
+        },
+      });
+      if (unknownKeyWarnings.length > 0) throw new Error(unknownKeyWarnings.join("; "));
+    },
+    readLogFile: async () => readLogFile(filesystem, logPath),
+    followLogFile: async () => {
+      const { followLog } = await import("./follow-log.js");
+      return followLog({
+        clock,
+        filesystem,
+        path: logPath,
+        signals: ports.signals ?? process,
+        write: (text: string) => (ports.stdout ?? process.stdout).write(text),
+      });
+    },
+    readEventHistory: async (sinceTs) => {
+      const { openHistoryReader } = await import("../history/index.js");
+      const { filterSqliteExperimentalWarning, NodeSqliteOpener } =
+        await import("../ports/index.js");
+      filterSqliteExperimentalWarning();
+      return openHistoryReader({
+        dataDirectory,
+        filesystem,
+        sqlite: new NodeSqliteOpener(),
+      }).read({ sinceTs });
+    },
+    signals: ports.signals ?? process,
+    stderr: ports.stderr ?? process.stderr,
+    stdout: ports.stdout ?? process.stdout,
+    stdoutBytes: stdoutBytesOf(ports.stdout),
+    confirm: ports.confirm ?? confirmTerminal,
+  };
+}
+
+async function confirmTerminal(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return false;
+  const { createInterface } = await import("node:readline/promises");
+  const prompt = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return (await prompt.question(question)).trim().toLowerCase() === "y";
+  } finally {
+    prompt.close();
+  }
+}
+
+function farmFieldsFromEnv(env: NodeJS.ProcessEnv): {
+  readonly tunnelUrl?: string;
+  readonly tunnelToken?: string;
+  readonly allowInsecureHttpFromEnv?: string;
+} {
+  return {
+    ...(env.SIMLOCK_URL === undefined ? {} : { tunnelUrl: env.SIMLOCK_URL }),
+    ...(env.SIMLOCK_TOKEN === undefined ? {} : { tunnelToken: env.SIMLOCK_TOKEN }),
+    ...(env.SIMLOCK_ALLOW_INSECURE_HTTP === undefined
+      ? {}
+      : { allowInsecureHttpFromEnv: env.SIMLOCK_ALLOW_INSECURE_HTTP }),
+  };
+}
+
+function runFieldsFromEnv(env: NodeJS.ProcessEnv): {
+  readonly runFromEnv?: string;
+  readonly githubRunFromEnv?: string;
+} {
+  const runId = env.GITHUB_RUN_ID;
+  // why: GitHub Actions sets the same run id and attempt for every job of a workflow run; an unset or empty attempt is the first.
+  const github =
+    env.GITHUB_ACTIONS === "true" && runId !== undefined && runId !== ""
+      ? { githubRunFromEnv: `${runId}-${env.GITHUB_RUN_ATTEMPT || "1"}` }
+      : {};
+  return { ...(env.SIMLOCK_RUN === undefined ? {} : { runFromEnv: env.SIMLOCK_RUN }), ...github };
+}

@@ -1,0 +1,229 @@
+#!/usr/bin/env node
+// `node .agents/scripts/comments.mjs [--all] <base> [<head>]`: every comment block a diff adds or
+// edits since it left <base> (from their merge base), each with the code line after it. `--all`
+// lists every comment block in the files the diff touches, unchanged ones too, for the weekly
+// comment routine. Without <head>, the diff runs to the working tree, untracked files included.
+// Code files only (JavaScript, TypeScript, shell); tool directives are left out. Prints nothing
+// when no comment is listed.
+// `comment-lint.mjs` imports `listComments({ base, head, all, files })` for the same blocks as
+// data: `{ path, start, end, state, trailing, lines: [{ n, text }], next: { n, text } | null }`,
+// and `trailingText(line, shell)` for the comment part of a code line. `test-lint.mjs` imports
+// `changedFiles({ base, head, files })`: each touched code file as `{ path, lines, added }`, its
+// text at <head> split into lines and the set of the line numbers (from 1) the diff adds; in a
+// merge, without <head>, only lines new against the merged-in parent as well.
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const SCRIPT = /\.(?:[cm]?[jt]s|[jt]sx)$/;
+const SHELL = /\.(?:sh|bash)$/;
+const DIRECTIVE =
+  /^(?:\/\/\/?|\/\*+|\{\/\*+|\*|#)\s*(?:@ts-|oxlint-|eslint-|fallow-ignore|Stryker (?:disable|restore)|prettier-ignore|biome-ignore|c8 |istanbul |shellcheck |<reference |#?(?:end)?region\b)/;
+const QUOTES = new Set(['"', "'", "`"]);
+
+const git = (...args) => execFileSync("git", args, { encoding: "utf8", maxBuffer: 1 << 28 });
+
+export function listComments({ base, head, all = false, files = null }) {
+  const blocks = [];
+  for (const { path, lines, added } of changedFiles({ base, head, files })) {
+    const kinds = SHELL.test(path) ? shellKinds(lines) : scriptKinds(lines);
+    blocks.push(...blocksIn(path, lines, kinds, added, all));
+  }
+  if (all) return blocks;
+  const removed = removedLines(base, head);
+  return blocks.filter((block) => !movedVerbatim(block, removed));
+}
+
+// why: a split moves code between files unchanged, so a block the diff adds whole while it
+// removes the same lines elsewhere is not new; one removed line excuses one added line.
+function movedVerbatim(block, removed) {
+  if (block.state !== "added") return false;
+  const wanted = new Map();
+  for (const { text } of block.lines.filter((l) => !DIRECTIVE.test(l.text.trim()))) {
+    wanted.set(text.trim(), (wanted.get(text.trim()) ?? 0) + 1);
+  }
+  if ([...wanted].some(([text, n]) => (removed.get(text) ?? 0) < n)) return false;
+  for (const [text, n] of wanted) removed.set(text, removed.get(text) - n);
+  return true;
+}
+
+function removedLines(base, head) {
+  const from = git("merge-base", base, head ?? "HEAD").trim();
+  const range = head === undefined ? [from] : [from, head];
+  const removed = new Map();
+  for (const line of git("diff", "-U0", "--no-color", ...range).split("\n")) {
+    if (!line.startsWith("-") || line.startsWith("--- ")) continue;
+    const text = line.slice(1).trim();
+    removed.set(text, (removed.get(text) ?? 0) + 1);
+  }
+  return removed;
+}
+
+export function changedFiles({ base, head, files = null }) {
+  // why: from where the branch left <base>, so a line <base> changed since is not blamed on it.
+  const from = git("merge-base", base, head ?? "HEAD").trim();
+  const range = head === undefined ? [from] : [from, head];
+  const wanted = files === null ? null : new Set(files);
+  return touchedFiles(range, head, wanted).map((path) => {
+    const lines = fileText(path, head).split("\n");
+    return { path, lines, added: addedLines(path, lines.length, range, head) };
+  });
+}
+
+export function trailingText(line, shell = false) {
+  const marker = shell ? "#" : "//";
+  const at = unquotedIndex(line, marker);
+  return at === -1 ? "" : line.slice(at + marker.length);
+}
+
+function touchedFiles(range, head, wanted) {
+  const paths = git("diff", "--name-only", "--diff-filter=d", ...range).split("\n");
+  if (head === undefined)
+    paths.push(...git("ls-files", "--others", "--exclude-standard").split("\n"));
+  return [...new Set(paths)]
+    .filter((f) => SCRIPT.test(f) || SHELL.test(f))
+    .filter((f) => wanted === null || wanted.has(f))
+    .sort();
+}
+
+function fileText(path, head) {
+  if (head !== undefined) return git("show", `${head}:${path}`);
+  return existsSync(path) ? readFileSync(path, "utf8") : "";
+}
+
+function blocksIn(path, lines, kinds, added, all) {
+  const blocks = [];
+  const shown = new Set();
+  for (let n = 1; n <= lines.length; n++) {
+    if (!kinds[n - 1].comment || shown.has(n) || !(all || added.has(n))) continue;
+    const trailing = kinds[n - 1].code;
+    const [start, end] = trailing ? [n, n] : extent(kinds, n);
+    for (let i = start; i <= end; i++) shown.add(i);
+    const block = blockAt(path, lines, added, start, end, trailing);
+    if (block !== null) blocks.push(block);
+  }
+  return blocks;
+}
+
+function blockAt(path, lines, added, start, end, trailing) {
+  const block = lines.slice(start - 1, end);
+  if (block.every((l) => DIRECTIVE.test(l.trim()) || l.trim() === "")) return null;
+  // why: a tool directive added beside a comment edits nothing that comment says.
+  const said = block.map((l, i) => i).filter((i) => !DIRECTIVE.test(block[i].trim()));
+  const changed = said.filter((i) => added.has(start + i)).length;
+  return {
+    path,
+    start,
+    end,
+    state: changed === said.length ? "added" : changed > 0 ? "edited" : "unchanged",
+    trailing,
+    lines: block.map((l, i) => ({ n: start + i, text: l })),
+    next: trailing ? null : nextCode(lines, end),
+  };
+}
+
+function extent(kinds, n) {
+  let [start, end] = [n, n];
+  while (start > 1 && kinds[start - 2].comment && !kinds[start - 2].code) start--;
+  while (end < kinds.length && kinds[end].comment && !kinds[end].code) end++;
+  return [start, end];
+}
+
+function nextCode(lines, end) {
+  const at = lines.findIndex((l, i) => i >= end && l.trim() !== "");
+  return at === -1 ? null : { n: at + 1, text: lines[at] };
+}
+
+function addedLines(path, count, range, head) {
+  const tracked = git("ls-files", "--", path).trim() !== "" || head !== undefined;
+  if (!tracked) return new Set(Array.from({ length: count }, (_, i) => i + 1));
+  const added = diffAdded(path, range);
+  // why: in a merge the other parent's lines come with it, so a line counts as the author's only
+  // when it is new against that parent too; the commit hook runs mid-merge, with no <head>.
+  const other = head === undefined ? mergeHead() : null;
+  if (other === null) return added;
+  const theirs = diffAdded(path, [other]);
+  return new Set([...added].filter((n) => theirs.has(n)));
+}
+
+function mergeHead() {
+  try {
+    return git("rev-parse", "-q", "--verify", "MERGE_HEAD").trim();
+  } catch {
+    return null;
+  }
+}
+
+function diffAdded(path, range) {
+  const added = new Set();
+  for (const line of git("diff", "-U0", "--no-color", ...range, "--", path).split("\n")) {
+    const hunk = /^@@ -\S+ \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (hunk === null) continue;
+    const start = Number(hunk[1]);
+    const size = hunk[2] === undefined ? 1 : Number(hunk[2]);
+    for (let i = start; i < start + size; i++) added.add(i);
+  }
+  return added;
+}
+
+function shellKinds(lines) {
+  return lines.map((line, i) => {
+    const t = line.trim();
+    const comment = t.startsWith("#") && !(i === 0 && t.startsWith("#!"));
+    return { comment, code: !comment };
+  });
+}
+
+function scriptKinds(lines) {
+  let inBlock = false;
+  return lines.map((line) => {
+    const t = line.trim();
+    if (inBlock) {
+      if (t.includes("*/")) inBlock = false;
+      return { comment: true, code: false };
+    }
+    if (t.startsWith("//")) return { comment: true, code: false };
+    const open = t.startsWith("/*") ? 2 : t.startsWith("{/*") ? 3 : -1;
+    if (open !== -1) {
+      if (!t.includes("*/", open)) inBlock = true;
+      return { comment: true, code: false };
+    }
+    return { comment: unquotedIndex(line, "//") !== -1, code: true };
+  });
+}
+
+function unquotedIndex(line, marker) {
+  let quote = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quote !== null) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (QUOTES.has(c)) {
+      quote = c;
+      continue;
+    }
+    // why: `\//` is the end of a regex literal, not a comment.
+    if (line.startsWith(marker, i) && line[i - 1] !== "\\") return i;
+  }
+  return -1;
+}
+
+if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
+  const args = process.argv.slice(2);
+  const all = args[0] === "--all";
+  const [base, head] = all ? args.slice(1) : args;
+  if (base === undefined) {
+    console.error("usage: comments.mjs [--all] <base> [<head>]");
+    process.exit(64);
+  }
+  const out = [];
+  for (const b of listComments({ base, head, all })) {
+    out.push(`${b.path}:${b.start === b.end ? b.start : `${b.start}-${b.end}`} (${b.state})`);
+    for (const l of b.lines) out.push(`  ${l.n} | ${l.text}`);
+    if (b.next !== null) out.push(`  ${b.next.n} > ${b.next.text}`);
+  }
+  if (out.length > 0) console.log(out.join("\n"));
+}

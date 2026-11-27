@@ -1,0 +1,893 @@
+import { describe, expect, it } from "vitest";
+
+import { mintJoinToken, waitFor, withDaemon, withHttpDaemon } from "./helpers/index.js";
+import type { TestEnv } from "./helpers/env.js";
+
+interface WorkerView {
+  readonly id: string;
+  readonly label?: string;
+  readonly connection: "connected" | "disconnected" | "incompatible";
+  readonly drained: boolean;
+  readonly capacity?: { readonly ios: { readonly limit: number } };
+  readonly catalog: readonly {
+    readonly platform: string;
+    readonly models: readonly string[];
+    readonly modelRuntimes: Readonly<Record<string, readonly string[]>>;
+    readonly modelAliases: Readonly<Record<string, readonly string[]>>;
+    readonly modelClasses: Readonly<Record<string, string>>;
+    readonly customModels?: readonly string[];
+    readonly images?: readonly {
+      readonly runtime: string;
+      readonly tag: string;
+      readonly abi: string;
+    }[];
+  }[];
+  readonly host?: {
+    readonly os: string;
+    readonly osVersion: string;
+    readonly arch: string;
+    readonly tools: readonly {
+      readonly platform: string;
+      readonly name: string;
+      readonly version: string;
+      readonly build?: string;
+    }[];
+  };
+}
+
+interface StatusView {
+  readonly daemon: { readonly mode: string };
+  readonly capacity: { readonly ios: { readonly limit: number } };
+  readonly workers?: readonly WorkerView[];
+}
+
+async function listWorkers(gateway: TestEnv): Promise<WorkerView[]> {
+  const result = await gateway.cli(["worker", "list", "--json"]);
+  expect(result.code).toBe(0);
+  return (result.json as { workers: WorkerView[] }).workers;
+}
+
+async function waitForWorkers(
+  gateway: TestEnv,
+  predicate: (workers: WorkerView[]) => boolean,
+  label: string,
+): Promise<WorkerView[]> {
+  let workers: WorkerView[] = [];
+  await waitFor(
+    async () => {
+      workers = await listWorkers(gateway);
+      return predicate(workers);
+    },
+    { label, timeout: 30_000 },
+  );
+  return workers;
+}
+
+function iosLimit(worker: WorkerView | undefined): number {
+  return worker?.capacity?.ios.limit ?? 0;
+}
+
+/** why: The id of the worker an operator would recognize by `label`. Throws rather than degrading
+ * to `""`, which would silently turn "no such worker" into a request for one. */
+function idOf(workers: readonly WorkerView[], label: string): string {
+  const worker = workers.find((candidate) => candidate.label === label);
+  if (worker === undefined) throw new Error(`No worker labelled ${label}`);
+  return worker.id;
+}
+
+function connectionOf(workers: readonly WorkerView[], label: string): string | undefined {
+  return workers.find((worker) => worker.label === label)?.connection;
+}
+
+function iosModels(json: unknown): readonly string[] {
+  const platforms = (json as { platforms: { platform: string; models?: string[] }[] }).platforms;
+  return platforms.find((entry) => entry.platform === "ios")?.models ?? [];
+}
+
+function firstWorkerLabel(workers: readonly WorkerView[]): string {
+  const first = [...workers].sort((left, right) => (left.id < right.id ? -1 : 1))[0];
+  return first?.label ?? "";
+}
+
+function iosEntryOf(views: readonly WorkerView[], label: string) {
+  return views
+    .find((view) => view.label === label)
+    ?.catalog.find((entry) => entry.platform === "ios");
+}
+
+function xcodeOf(views: readonly WorkerView[], label: string) {
+  return views
+    .find((view) => view.label === label)
+    ?.host?.tools.find((tool) => tool.name === "xcode");
+}
+
+function expectSameView(
+  actual: readonly WorkerView[],
+  expected: readonly WorkerView[],
+  label: string,
+): void {
+  const view = actual.find((candidate) => candidate.label === label);
+  const reference = expected.find((candidate) => candidate.label === label);
+  expect(view?.host).toBeDefined();
+  expect(view?.host).toEqual(reference?.host);
+  expect(view?.catalog).toEqual(reference?.catalog);
+}
+
+describe("gateway fleet", () => {
+  it("two workers join, status aggregates them, a kill disconnects one, drain flags the other", async () => {
+    // why: `driver: "none"`: a gateway starts no drivers and warns about every worker-only key in
+    // its config (ADR 0005 §2), so it gets no fake-driver wiring and no capacity seeding.
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+
+    const minted = await gateway.cli(["token", "create", "--role", "worker"]);
+    expect(minted.code).toBe(0);
+    const { secret, token } = minted.json as { secret: string; token: { role: string } };
+    expect(token.role).toBe("worker");
+
+    // why: two workers, each with its own SIMLOCK_HOME (so its own instance identity) and its
+    // own join token, because a gateway pins a token to the first worker that joins with it.
+    const url = `ws://127.0.0.1:${port}`;
+    const workerA = await withDaemon({
+      configOverrides: { gateway: { label: "worker-a", token: secret, url } },
+      // why: Seeded before the daemon starts: the worker reports its catalog as its uplink opens, and
+      // a script written afterwards would only reach the gateway on its 30s periodic refresh.
+      driverScript: { ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] } },
+    });
+    const workerB = await withDaemon({
+      configOverrides: { gateway: { label: "worker-b", token: await mintJoinToken(gateway), url } },
+      driverScript: { ios: { knownModels: ["iPhone 17"], availableOsVersions: ["18.4"] } },
+    });
+
+    const joined = await waitForWorkers(
+      gateway,
+      (workers) =>
+        workers.length === 2 &&
+        // why: The gateway marks a worker connected before its first refresh builds the view, so
+        // "connected" alone can still be a view with no capacity: wait for the capacity too.
+        workers.every((worker) => worker.connection === "connected" && iosLimit(worker) > 0),
+      "both workers connected to the gateway, each with its capacity",
+    );
+    expect(joined.map((worker) => worker.label).sort()).toEqual(["worker-a", "worker-b"]);
+    expect(new Set(joined.map((worker) => worker.id)).size).toBe(2);
+
+    const status = await gateway.cli(["status", "--json"]);
+    expect(status.code).toBe(0);
+    const statusView = status.json as StatusView;
+    expect(statusView.daemon.mode).toBe("gateway");
+    expect(statusView.workers).toHaveLength(2);
+    expect(iosLimit(joined[0])).toBeGreaterThan(0);
+    expect(statusView.capacity.ios.limit).toBe(iosLimit(joined[0]) + iosLimit(joined[1]));
+
+    await waitFor(
+      async () => {
+        const models = iosModels((await gateway.cli(["catalog", "--json"])).json);
+        return models.includes("iPhone 16") && models.includes("iPhone 17");
+      },
+      { label: "the gateway's catalog unions both workers", timeout: 30_000 },
+    );
+    const catalog = await gateway.cli(["catalog", "--json"]);
+    const iosCatalog = (
+      catalog.json as {
+        platforms: { platform: string; modelWorkers?: Record<string, string[]> }[];
+      }
+    ).platforms.find((entry) => entry.platform === "ios");
+    expect(iosCatalog?.modelWorkers?.["iPhone 16"]).toEqual([idOf(joined, "worker-a")]);
+
+    // why: 5. Killing a worker flips its view without anyone polling it: the uplink closing *is* the
+    //    signal (ADR 0005 §6). The gateway's own backstop tick is 30s, and this must not need
+    //    it -- so a short deadline here is the assertion.
+    await workerA.killDaemon();
+    const surviving = await waitForWorkers(
+      gateway,
+      (workers) => connectionOf(workers, "worker-a") === "disconnected",
+      "the killed worker's view flipped to disconnected",
+    );
+    expect(surviving).toHaveLength(2);
+    expect(connectionOf(surviving, "worker-b")).toBe("connected");
+
+    const workerBId = idOf(surviving, "worker-b");
+    const drain = await gateway.cli(["worker", "drain", workerBId]);
+    expect(drain.code).toBe(0);
+    expect(drain.json).toEqual({ drained: true, workerId: workerBId });
+    expect((await listWorkers(gateway)).find((worker) => worker.id === workerBId)?.drained).toBe(
+      true,
+    );
+
+    const refused = await gateway.cli(["worker", "remove", workerBId]);
+    expect(refused.error?.code).toBe("WORKER_CONNECTED");
+    const workerAId = idOf(surviving, "worker-a");
+    const removed = await gateway.cli(["worker", "remove", workerAId]);
+    expect(removed.code).toBe(0);
+    expect(await listWorkers(gateway)).toHaveLength(1);
+
+    const events = await gateway.events();
+    const connectedFacts = events.filter((event) => event.event === "worker.connected");
+    expect(connectedFacts).toHaveLength(2);
+
+    const held = workerB.cliBackground([
+      "lease",
+      "--platform",
+      "ios",
+      "--device",
+      "iPhone 17",
+      "--os",
+      "18.4",
+      "--agent-id",
+      "gw-fleet-c3",
+    ]);
+    const grant = JSON.parse(await held.firstStdoutLine()) as { lease: { id: string } };
+
+    await waitFor(
+      async () => {
+        const latest = await gateway.events();
+        return latest.some(
+          (event) =>
+            event.event === "lease.granted" &&
+            event.module === "lease-lifecycle" &&
+            (event.payload as { leaseId?: string; workerId?: string }).leaseId === grant.lease.id &&
+            (event.payload as { workerId?: string }).workerId === workerBId,
+        );
+      },
+      { label: "worker B's own lease.granted republished onto the gateway's bus", timeout: 20_000 },
+    );
+
+    held.kill("SIGTERM");
+    await held.waitForExit(15_000);
+
+    await workerB.cli(["daemon", "stop"]);
+  });
+
+  it("shows each worker's own pairings, other names, and images in the worker list and their union in the catalog", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const url = `ws://127.0.0.1:${port}`;
+    const installed = ["18.4", "26.0"];
+    await withDaemon({
+      configOverrides: { gateway: { label: "worker-a", token: await mintJoinToken(gateway), url } },
+      driverScript: {
+        ios: {
+          availableOsVersions: installed,
+          images: [{ abi: "arm64", runtime: "26.0", tag: "default" }],
+          knownModels: ["iPhone 16"],
+          modelAliases: { "iPhone 16": ["iphone-16-a"] },
+          modelClasses: { "iPhone 16": "phone" },
+          modelRuntimes: { "iPhone 16": ["18.4"] },
+          toolVersions: [{ build: "16F6", name: "xcode", version: "16.4" }],
+        },
+      },
+    });
+    await withDaemon({
+      configOverrides: { gateway: { label: "worker-b", token: await mintJoinToken(gateway), url } },
+      driverScript: {
+        ios: {
+          availableOsVersions: installed,
+          images: [
+            { abi: "arm64", runtime: "26.0", tag: "default" },
+            { abi: "x86_64", runtime: "26.0", tag: "default" },
+          ],
+          knownModels: ["iPhone 16"],
+          modelAliases: { "iPhone 16": ["iphone-16-b"] },
+          modelClasses: { "iPhone 16": "tablet" },
+          modelRuntimes: { "iPhone 16": ["26.0"] },
+          toolVersions: [{ build: "17A324", name: "xcode", version: "26.0" }],
+        },
+      },
+    });
+
+    const workers = await waitForWorkers(
+      gateway,
+      (views) =>
+        views.length === 2 &&
+        views.every((view) => view.connection === "connected" && view.catalog.length > 0),
+      "both workers connected with their catalogs",
+    );
+    const entryOf = (label: string) => iosEntryOf(workers, label);
+    expect(entryOf("worker-a")).toMatchObject({
+      images: [{ abi: "arm64", runtime: "26.0", tag: "default" }],
+      modelAliases: { "iPhone 16": ["iphone-16-a"] },
+      modelClasses: { "iPhone 16": "phone" },
+      modelRuntimes: { "iPhone 16": ["18.4"] },
+    });
+    expect(entryOf("worker-b")).toMatchObject({
+      images: [
+        { abi: "arm64", runtime: "26.0", tag: "default" },
+        { abi: "x86_64", runtime: "26.0", tag: "default" },
+      ],
+      modelAliases: { "iPhone 16": ["iphone-16-b"] },
+      modelClasses: { "iPhone 16": "tablet" },
+      modelRuntimes: { "iPhone 16": ["26.0"] },
+    });
+
+    const withTools = await waitForWorkers(
+      gateway,
+      (views) =>
+        xcodeOf(views, "worker-a") !== undefined && xcodeOf(views, "worker-b") !== undefined,
+      "both workers report their tool versions",
+    );
+    expect(xcodeOf(withTools, "worker-a")).toEqual({
+      build: "16F6",
+      name: "xcode",
+      platform: "ios",
+      version: "16.4",
+    });
+    expect(xcodeOf(withTools, "worker-b")).toMatchObject({ version: "26.0" });
+    for (const view of withTools) {
+      expect(view.host).toMatchObject({ arch: expect.any(String), os: expect.any(String) });
+    }
+    const operator = await gateway.cli(["token", "create", "--role", "operator"]);
+    const response = await fetch(`http://127.0.0.1:${port}/v1/workers`, {
+      headers: { authorization: `Bearer ${(operator.json as { secret: string }).secret}` },
+    });
+    expect(response.status).toBe(200);
+    const overHttp = ((await response.json()) as { workers: WorkerView[] }).workers;
+    for (const label of ["worker-a", "worker-b"]) expectSameView(overHttp, withTools, label);
+    expect(xcodeOf(overHttp, "worker-a")?.version).toBe("16.4");
+    expect(xcodeOf(overHttp, "worker-b")?.version).toBe("26.0");
+
+    const catalog = await gateway.cli(["catalog", "--json"]);
+    expect(catalog.code).toBe(0);
+    const ios = (catalog.json as { platforms: WorkerView["catalog"] }).platforms.find(
+      (entry) => entry.platform === "ios",
+    );
+    expect(ios?.modelRuntimes).toEqual({ "iPhone 16": ["18.4", "26.0"] });
+    expect(ios?.modelAliases).toEqual({ "iPhone 16": ["iphone-16-a", "iphone-16-b"] });
+    const classOfLabel: Record<string, string | undefined> = {
+      "worker-a": "phone",
+      "worker-b": "tablet",
+    };
+    expect(ios?.modelClasses).toEqual({ "iPhone 16": classOfLabel[firstWorkerLabel(workers)] });
+    expect(ios?.images).toEqual([
+      { abi: "arm64", runtime: "26.0", tag: "default" },
+      { abi: "x86_64", runtime: "26.0", tag: "default" },
+    ]);
+  });
+
+  it("shows each worker's own custom models in the worker list, and marks a model custom in the catalog when any worker does", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const url = `ws://127.0.0.1:${port}`;
+    await withDaemon({
+      configOverrides: { gateway: { label: "worker-a", token: await mintJoinToken(gateway), url } },
+      driverScript: {
+        android: {
+          availableOsVersions: ["35"],
+          customModels: ["My Tablet"],
+          knownModels: ["Pixel 8", "My Tablet"],
+        },
+      },
+    });
+    await withDaemon({
+      configOverrides: { gateway: { label: "worker-b", token: await mintJoinToken(gateway), url } },
+      driverScript: {
+        android: { availableOsVersions: ["35"], knownModels: ["Pixel 8", "My Tablet"] },
+      },
+    });
+
+    const workers = await waitForWorkers(
+      gateway,
+      (views) =>
+        views.length === 2 &&
+        views.every((view) => view.connection === "connected" && view.catalog.length > 0),
+      "both workers connected with their catalogs",
+    );
+    const androidOf = (label: string) =>
+      workers
+        .find((view) => view.label === label)
+        ?.catalog.find((entry) => entry.platform === "android");
+    expect(androidOf("worker-a")?.customModels).toEqual(["My Tablet"]);
+    expect(androidOf("worker-b")?.models).toEqual(["Pixel 8", "My Tablet"]);
+    expect(androidOf("worker-b")).not.toHaveProperty("customModels");
+
+    const catalog = await gateway.cli(["catalog", "--json"]);
+    expect(catalog.code).toBe(0);
+    const android = (catalog.json as { platforms: WorkerView["catalog"] }).platforms.find(
+      (entry) => entry.platform === "android",
+    );
+    expect(android?.customModels).toEqual(["My Tablet"]);
+
+    const human = await gateway.cli(["catalog"]);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain("    My Tablet (custom): 35");
+    expect(human.stdout).toContain("    Pixel 8: 35");
+  });
+
+  it("gives a request with a mode that mode on either worker, and a request with none the default of the worker it landed on", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const url = `ws://127.0.0.1:${port}`;
+    await withDaemon({
+      configOverrides: {
+        gateway: { label: "default-full", token: await mintJoinToken(gateway), url },
+        ios: { defaultMode: "full" },
+      },
+      driverScript: {
+        ios: {
+          availableOsVersions: ["26.0"],
+          knownModels: ["iPhone 16"],
+          slimmableOsVersions: ["26.0"],
+        },
+      },
+    });
+    await withDaemon({
+      configOverrides: {
+        gateway: { label: "default-slim", token: await mintJoinToken(gateway), url },
+        ios: { defaultMode: "slim" },
+      },
+      driverScript: {
+        ios: {
+          availableOsVersions: ["26.0"],
+          knownModels: ["iPhone 17"],
+          slimmableOsVersions: ["26.0"],
+        },
+      },
+    });
+    await waitForWorkers(
+      gateway,
+      (views) =>
+        views.length === 2 &&
+        views.every((view) => view.connection === "connected" && view.catalog.length > 0),
+      "both workers connected with their catalogs",
+    );
+
+    const leaseMode = async (device: string, mode: readonly string[]) => {
+      const leased = await gateway.cli(
+        ["lease", "--platform", "ios", "--device", device, "--detach", ...mode],
+        { timeout: 30_000 },
+      );
+      expect(leased.code, leased.stderr).toBe(0);
+      const grant = leased.json as {
+        readonly device: { readonly mode: string };
+        readonly lease: { readonly id: string; readonly worker?: { readonly label?: string } };
+      };
+      expect((await gateway.cli(["release", grant.lease.id], { timeout: 30_000 })).code).toBe(0);
+      return { mode: grant.device.mode, worker: grant.lease.worker?.label };
+    };
+
+    await expect(leaseMode("iPhone 16", [])).resolves.toEqual({
+      mode: "full",
+      worker: "default-full",
+    });
+    await expect(leaseMode("iPhone 16", ["--mode", "slim"])).resolves.toEqual({
+      mode: "slim",
+      worker: "default-full",
+    });
+    await expect(leaseMode("iPhone 17", [])).resolves.toEqual({
+      mode: "slim",
+      worker: "default-slim",
+    });
+    await expect(leaseMode("iPhone 17", ["--mode", "full"])).resolves.toEqual({
+      mode: "full",
+      worker: "default-slim",
+    });
+  });
+
+  it("grants --device 'iphone 16 pro' and --device pixel_7 through a gateway by the worker's own names", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const minted = await gateway.cli(["token", "create", "--role", "worker"]);
+    const { secret } = minted.json as { secret: string };
+    await withDaemon({
+      configOverrides: {
+        gateway: { label: "worker", token: secret, url: `ws://127.0.0.1:${port}` },
+      },
+      driverScript: {
+        android: {
+          availableOsVersions: ["35"],
+          knownModels: ["Pixel 7"],
+          modelAliases: { "Pixel 7": ["pixel_7"] },
+        },
+        ios: { availableOsVersions: ["26.0"], knownModels: ["iPhone 16 Pro"] },
+      },
+    });
+    await waitForWorkers(
+      gateway,
+      (views) =>
+        views.length === 1 && views[0]?.connection === "connected" && views[0].catalog.length === 2,
+      "the worker connected with both catalogs",
+    );
+
+    const lease = async (platform: string, device: string) => {
+      const leased = await gateway.cli(
+        ["lease", "--platform", platform, "--device", device, "--detach", "--no-wait"],
+        { timeout: 30_000 },
+      );
+      expect(leased.code, leased.stderr).toBe(0);
+      const grant = leased.json as {
+        readonly device: { readonly spec: { readonly model: string } };
+        readonly lease: { readonly id: string };
+      };
+      expect((await gateway.cli(["release", grant.lease.id], { timeout: 30_000 })).code).toBe(0);
+      return grant.device.spec.model;
+    };
+
+    await expect(lease("ios", "iphone 16 pro")).resolves.toBe("iPhone 16 Pro");
+    await expect(lease("android", "pixel_7")).resolves.toBe("Pixel 7");
+  });
+
+  it("grants an Android --class phone request on the worker holding a warm Pixel, not on one with free capacity", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const pixels = {
+      android: {
+        availableOsVersions: ["34"],
+        defaultModels: { phone: ["Pixel 8"] },
+        knownModels: ["Pixel 8"],
+        modelClasses: { "Pixel 8": "phone" },
+      },
+    } as const;
+    const join = async (label: string, warm: boolean) =>
+      withDaemon({
+        configOverrides: {
+          gateway: { label, token: await mintJoinToken(gateway), url: `ws://127.0.0.1:${port}` },
+          ...(warm
+            ? {
+                warmPool: {
+                  targets: [{ count: 1, model: "Pixel 8", osVersion: "34", platform: "android" }],
+                },
+              }
+            : {}),
+        },
+        driverScript: pixels,
+        fakeDriverPlatforms: ["android"],
+      });
+    await join("worker-warm", true);
+    const freeWorker = await join("worker-free", false);
+    await waitForWorkers(
+      gateway,
+      (views) =>
+        views.length === 2 &&
+        views.every((view) => view.connection === "connected" && view.catalog.length > 0),
+      "both workers connected with their catalogs",
+    );
+
+    // why: the worker's warm pool keeps the Pixel ready, and until the gateway's view shows it ready a request could miss it.
+    let warmDevice: { id: string } | undefined;
+    await waitFor(
+      async () => {
+        const status = await gateway.cli(["status", "--json"]);
+        const devices = (status.json as { devices?: { id: string; state: string }[] }).devices;
+        warmDevice = devices?.find((device) => device.state === "ready");
+        return warmDevice !== undefined;
+      },
+      { label: "the warm device ready in the gateway's view", timeout: 30_000 },
+    );
+    await freeWorker.driverLog.clear();
+
+    const leased = await gateway.cli(
+      ["lease", "--platform", "android", "--class", "phone", "--detach"],
+      { timeout: 30_000 },
+    );
+
+    expect(leased.code, leased.stderr).toBe(0);
+    const grant = leased.json as {
+      device: { id: string };
+      lease: { worker?: { label?: string } };
+    };
+    expect(grant.device.id).toBe(warmDevice?.id);
+    expect(grant.lease.worker?.label).toBe("worker-warm");
+    const work = (await freeWorker.driverLog.calls()).filter((call) =>
+      ["provision", "makeReady"].includes(call.operation),
+    );
+    expect(work).toEqual([]);
+  });
+
+  it("grants --class phone with --os '>=18' through a gateway on a worker whose runtime is in the range, and nothing else", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const join = async (label: string, osVersion: string) =>
+      withDaemon({
+        configOverrides: {
+          gateway: { label, token: await mintJoinToken(gateway), url: `ws://127.0.0.1:${port}` },
+        },
+        driverScript: {
+          ios: {
+            availableOsVersions: [osVersion],
+            defaultModels: { phone: ["iPhone 17"] },
+            knownModels: ["iPhone 17"],
+            modelClasses: { "iPhone 17": "phone" },
+          },
+        },
+        fakeDriverPlatforms: ["ios"],
+      });
+    await join("worker-old", "17.5");
+    await join("worker-new", "26.0");
+    await waitForWorkers(
+      gateway,
+      (views) =>
+        views.length === 2 &&
+        views.every((view) => view.connection === "connected" && view.catalog.length > 0),
+      "both workers connected with their catalogs",
+    );
+
+    const leased = await gateway.cli(
+      ["lease", "--platform", "ios", "--class", "phone", "--os", ">=18", "--detach"],
+      { timeout: 30_000 },
+    );
+
+    expect(leased.code, leased.stderr).toBe(0);
+    const grant = leased.json as {
+      device: { spec: { osVersion: string } };
+      lease: { worker?: { label?: string } };
+    };
+    expect(grant.device.spec.osVersion).toBe("26.0");
+    expect(grant.lease.worker?.label).toBe("worker-new");
+  });
+
+  it("refuses an uplink whose token is not a worker join token", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const operator = await gateway.cli(["token", "create", "--role", "operator"]);
+    const { secret } = operator.json as { secret: string };
+    await withDaemon({
+      configOverrides: { gateway: { token: secret, url: `ws://127.0.0.1:${port}` } },
+    });
+
+    let rejected: { reason?: string; workerId?: string } | undefined;
+    await waitFor(
+      async () => {
+        const events = await gateway.events();
+        rejected = events.find((event) => event.event === "worker.rejected")?.payload as
+          | { reason?: string; workerId?: string }
+          | undefined;
+        return rejected?.reason === "forbidden";
+      },
+      { label: "the gateway reported the refused uplink", timeout: 20_000 },
+    );
+    expect(rejected?.workerId).toBeDefined();
+
+    expect(await listWorkers(gateway)).toEqual([]);
+  });
+
+  it("pins a join token to the first worker that joins with it, refuses a second worker with it as worker-mismatch, and lists the token with the first worker's id", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const minted = await gateway.cli(["token", "create", "--role", "worker"]);
+    const { secret, token } = minted.json as { secret: string; token: { id: string } };
+    const uplink = { token: secret, url: `ws://127.0.0.1:${port}` };
+    await withDaemon({ configOverrides: { gateway: { ...uplink, label: "first" } } });
+    const [first] = await waitForWorkers(
+      gateway,
+      (workers) => workers.length === 1 && workers[0]?.connection === "connected",
+      "the first worker joined",
+    );
+
+    await withDaemon({ configOverrides: { gateway: { ...uplink, label: "second" } } });
+
+    let rejected: { reason?: string; workerId?: string; label?: string } | undefined;
+    await waitFor(
+      async () => {
+        rejected = (await gateway.events()).find((event) => event.event === "worker.rejected")
+          ?.payload as typeof rejected;
+        return rejected !== undefined;
+      },
+      { label: "the gateway reported the second worker's refused uplink", timeout: 20_000 },
+    );
+    expect(rejected).toMatchObject({
+      label: "second",
+      reason: "worker-mismatch",
+      workerId: expect.any(String),
+    });
+    expect(rejected?.workerId).not.toBe(first?.id);
+    const listed = await gateway.cli(["token", "list"]);
+    expect(listed.code, listed.stderr).toBe(0);
+    expect((listed.json as { tokens: unknown[] }).tokens).toEqual([
+      expect.objectContaining({ id: token.id, workerId: first?.id }),
+    ]);
+    expect((await listWorkers(gateway)).map((worker) => [worker.label, worker.connection])).toEqual(
+      [["first", "connected"]],
+    );
+  });
+
+  it("through a gateway, a caller-chosen lease ID comes back with no worker prefix, renews and releases by that ID, and a second request for it is LEASE_ID_TAKEN", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const { secret } = (await gateway.cli(["token", "create", "--role", "worker"])).json as {
+      secret: string;
+    };
+    await withDaemon({
+      configOverrides: {
+        gateway: { label: "worker", token: secret, url: `ws://127.0.0.1:${port}` },
+      },
+      driverScript: { ios: { availableOsVersions: ["26.0"], knownModels: ["iPhone 16 Pro"] } },
+    });
+    await waitForWorkers(
+      gateway,
+      (views) =>
+        views.length === 1 && views[0]?.connection === "connected" && views[0].catalog.length > 0,
+      "the worker connected with its catalog",
+    );
+    const lease = (agentId: string, extra: readonly string[]) =>
+      gateway.cli(
+        [
+          "lease",
+          "--platform",
+          "ios",
+          "--device",
+          "iPhone 16 Pro",
+          "--agent-id",
+          agentId,
+          "--detach",
+          ...extra,
+        ],
+        {
+          timeout: 30_000,
+        },
+      );
+
+    const chosen = await lease("agent-a", ["--lease-id", "ad-7f3a"]);
+    expect(chosen.code, chosen.stderr).toBe(0);
+    expect((chosen.json as { lease: { id: string } }).lease.id).toBe("ad-7f3a");
+
+    const clash = await lease("agent-b", ["--lease-id", "ad-7f3a"]);
+    expect(clash.code).toBe(13);
+    expect(clash.error).toMatchObject({ code: "LEASE_ID_TAKEN" });
+
+    const renewed = await gateway.cli(["lease", "renew", "ad-7f3a"], { timeout: 30_000 });
+    expect(renewed.code, renewed.stderr).toBe(0);
+    expect((await gateway.cli(["release", "ad-7f3a"], { timeout: 30_000 })).code).toBe(0);
+
+    const generated = await lease("agent-a", []);
+    expect(generated.code, generated.stderr).toBe(0);
+    expect((generated.json as { lease: { id: string } }).lease.id).toMatch(/^[^.]+\.lse_/);
+  });
+
+  it("through a gateway, a caller re-sending a chosen lease ID after its lease ended gets LEASE_ENDED", async () => {
+    const { env: gateway, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { host: "127.0.0.1", port } },
+      role: "gateway",
+      driver: "none",
+    }));
+    const url = `ws://127.0.0.1:${port}`;
+    const driverScript = { ios: { availableOsVersions: ["26.0"], knownModels: ["iPhone 16 Pro"] } };
+    const workerA = await withDaemon({
+      configOverrides: { gateway: { label: "worker-a", token: await mintJoinToken(gateway), url } },
+      driverScript,
+    });
+    const workerB = await withDaemon({
+      configOverrides: { gateway: { label: "worker-b", token: await mintJoinToken(gateway), url } },
+      driverScript,
+    });
+    const bothConnected = () =>
+      waitForWorkers(
+        gateway,
+        (views) =>
+          views.length === 2 &&
+          views.every((view) => view.connection === "connected" && view.catalog.length > 0),
+        "both workers connected with their catalogs",
+      );
+    await bothConnected();
+    const lease = (agentId: string, leaseId: string, ttl = "1h") =>
+      gateway.cli(
+        [
+          "lease",
+          "--platform",
+          "ios",
+          "--device",
+          "iPhone 16 Pro",
+          "--agent-id",
+          agentId,
+          "--detach",
+          "--lease-id",
+          leaseId,
+          "--ttl",
+          ttl,
+        ],
+        { timeout: 30_000 },
+      );
+    // why: only the gateway's own rejections: a worker's are relayed with its `workerId`.
+    const rejections = async () =>
+      (await gateway.events())
+        .filter(
+          (event) => event.event === "lease.rejected" && !("workerId" in (event.payload as object)),
+        )
+        .map((event) => (event.payload as { reason: string }).reason);
+    const ended =
+      /^Lease (\S+) ended at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z; choose a new lease id$/;
+    const expectEnded = async (agentId: string, leaseId: string) => {
+      const retry = await lease(agentId, leaseId);
+      expect(retry.code, leaseId).toBe(13);
+      expect(retry.error, leaseId).toMatchObject({
+        code: "LEASE_ENDED",
+        message: expect.stringMatching(ended),
+      });
+      expect(retry.error?.message.match(ended)?.[1], leaseId).toBe(leaseId);
+    };
+    const waitForEnded = async (leaseId: string) => {
+      await waitFor(async () => (await lease("agent-b", leaseId)).error?.code === "LEASE_ENDED", {
+        label: `a retry of ${leaseId} is refused with LEASE_ENDED`,
+        timeout: 90_000,
+      });
+      expect((await rejections()).at(-1), leaseId).toBe("lease-ended");
+    };
+
+    expect((await lease("agent-a", "end-released")).code).toBe(0);
+    expect((await gateway.cli(["release", "end-released"], { timeout: 30_000 })).code).toBe(0);
+    await expectEnded("agent-b", "end-released");
+    expect(await rejections()).toEqual(["lease-ended"]);
+
+    expect((await lease("agent-a", "end-expired", "2s")).code).toBe(0);
+    await waitForEnded("end-expired");
+
+    expect((await lease("agent-a", "end-missing", "2s")).code).toBe(0);
+    await workerA.killDaemon();
+    await workerB.killDaemon();
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    await workerA.startDaemon();
+    await workerB.startDaemon();
+    await waitForEnded("end-missing");
+
+    expect((await lease("agent-a", "end-rebuilt")).code).toBe(0);
+    await gateway.restartDaemon();
+    await expectEnded("agent-b", "end-released");
+    await bothConnected();
+    await waitFor(async () => (await gateway.cli(["release", "end-rebuilt"])).code === 0, {
+      label: "the restarted gateway releases a lease it rebuilt from its workers' views",
+      timeout: 60_000,
+    });
+    await expectEnded("agent-b", "end-rebuilt");
+    expect((await rejections()).at(-1), "end-rebuilt").toBe("lease-ended");
+
+    expect((await lease("agent-a", "end-gap", "2s")).code).toBe(0);
+    const holder = (await gateway.events()).find(
+      (event) =>
+        event.event === "lease.granted" &&
+        (event.payload as { leaseId?: string }).leaseId === "end-gap",
+    )?.payload as { workerId: string };
+    await gateway.killDaemon();
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    await gateway.startDaemon();
+    const views = await bothConnected();
+    const other = views.find((view) => view.id !== holder.workerId)?.id ?? "";
+    expect((await gateway.cli(["worker", "drain", other])).code).toBe(0);
+    const refused = await lease("agent-b", "end-gap");
+    expect(refused.code).toBe(13);
+    expect(refused.error).toMatchObject({ code: "LEASE_ENDED" });
+    expect((await rejections()).at(-1)).toBe("worker-failed");
+    expect((await gateway.cli(["worker", "undrain", other])).code).toBe(0);
+    expect((await gateway.cli(["worker", "drain", holder.workerId])).code).toBe(0);
+    const granted = await lease("agent-b", "end-gap");
+    expect(granted.code, granted.stderr).toBe(0);
+    expect((granted.json as { lease: { id: string } }).lease.id).toBe("end-gap");
+
+    await workerA.withConfig({ lease: { endedIdRetentionMs: 1 } }, () =>
+      workerB.withConfig({ lease: { endedIdRetentionMs: 1 } }, () =>
+        gateway.withConfig({ lease: { endedIdRetentionMs: 1 } }, async () => {
+          await bothConnected();
+          const again = await lease("agent-c", "end-released");
+          expect(again.code, again.stderr).toBe(0);
+        }),
+      ),
+    );
+  }, 300_000);
+});

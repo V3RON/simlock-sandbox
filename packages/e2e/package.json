@@ -1,0 +1,48 @@
+{
+  "name": "@simlock/e2e",
+  "version": "0.9.0",
+  "description": "A device provider that leases iOS simulators and Android emulators from a simlock farm for the e2e test runner.",
+  "homepage": "https://incubator.callstack.com/simlock/docs/using-devices/ci",
+  "bugs": {
+    "url": "https://github.com/V3RON/simlock-sandbox/issues"
+  },
+  "license": "MIT",
+  "author": "Szymon Chmal <szymon@chmal.it> (V3RON)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/callstackincubator/simlock",
+    "directory": "packages/e2e"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.js",
+    "!dist/**/*.test.d.ts",
+    "!dist/config.sample.*",
+    "README.md"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "devDependencies": {
+    "@e2e-dev/mobile": "0.12.9",
+    "agent-device": "0.21.41",
+    "e2e": "0.25.0"
+  },
+  "peerDependencies": {
+    "@e2e-dev/mobile": ">=0.12.9 <1",
+    "agent-device": ">=0.21.40"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
