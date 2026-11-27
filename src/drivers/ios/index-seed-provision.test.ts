@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi, describe } from "vitest";
 import { DriverCrashError } from "../../core/index.js";
 import {
   ScriptedProcessRunner,
+  type ScriptedProcessExpectation,
   MemoryFilesystem,
   FakeClock,
   type ProcessResult,
@@ -160,58 +161,33 @@ describe("IosSimctlDriver", () => {
 
   it("an iOS lease of a kind whose seed simulator is gone is granted on a new seed, made once and without a simctl call for the gone one", async () => {
     const goneUdid = "00000000-0000-0000-0000-0000000000cc";
-    const copyUdid = "00000000-0000-0000-0000-000000000002";
-    const cloneInvocation = sourcesSimctl("clone", seedUdid, driverData.name, deviceRoot);
     const cases = [
-      { name: "folder present", made: 0, seed: seedUdid, setFolder: true, twice: false },
-      { name: "deleted by hand", made: 1, seed: goneUdid, setFolder: true, twice: false },
-      { name: "sources set missing", made: 1, seed: goneUdid, setFolder: false, twice: false },
-      { name: "two provisions at once", made: 1, seed: goneUdid, setFolder: true, twice: true },
-    ];
+      { name: "folder present", gone: undefined, provisions: 1 },
+      { name: "deleted by hand", gone: "seed", provisions: 1 },
+      { name: "sources set missing", gone: "set", provisions: 1 },
+      { name: "two provisions at once", gone: "seed", provisions: 2 },
+    ] as const;
 
-    for (const { name, made, seed, setFolder, twice } of cases) {
-      const database = await seededDatabase({ udid: seed });
+    for (const { name, gone, provisions } of cases) {
+      const database = await seededDatabase({ udid: gone === undefined ? seedUdid : goneUdid });
       const filesystem = new MemoryFilesystem();
       await plantManagedDevice(filesystem);
-      await filesystem.mkdirp(`${deviceRoot}/${copyUdid}/data`);
-      const [create, boot, bootstatus, listapps, shutdown, seedClone, deleteThrowaway] =
-        throwawaySeedSteps();
-      const make = [
-        create,
-        boot,
-        bootstatus,
-        listapps,
-        shutdown,
-        { ...seedClone, onSpawn: () => plantSeedClone(filesystem) },
-        deleteThrowaway,
-      ];
-      const clones = [cloneInvocation, cloneInvocation].map((match) => ({
-        match,
-        result: { code: 0, stderr: "", stdout: `${copyUdid}\n` },
-      }));
-      const runner = new ScriptedProcessRunner([
-        { match: listInvocation, result: { code: 0, stderr: "", stdout: listFixture } },
-        ...(twice
-          ? [{ match: listInvocation, result: { code: 0, stderr: "", stdout: listFixture } }]
-          : []),
-        ...(made === 0 ? [] : make),
-        ...(twice ? clones : clones.slice(0, 1)),
-      ]);
+      const runner = new ScriptedProcessRunner(
+        await goneSeedScript(filesystem, provisions, gone !== undefined),
+      );
       const driver = await createDriver(runner, new FakeClock(), filesystem, database);
-      if (seed !== seedUdid) {
-        await filesystem.rm(`${sourcesSetPath}/${seed}`);
-        if (!setFolder) await filesystem.rm(sourcesSetPath);
-      }
+      if (gone === "seed") await filesystem.rm(`${sourcesSetPath}/${goneUdid}`);
+      if (gone === "set") await filesystem.rm(sourcesSetPath);
 
       const grants = await Promise.all(
-        twice ? [driver.provision(spec), driver.provision(spec)] : [driver.provision(spec)],
+        Array.from({ length: provisions }, () => driver.provision(spec)),
       );
 
-      expect(grants.length, name).toBe(twice ? 2 : 1);
+      expect(grants.length, name).toBe(provisions);
       expect(
         runner.calls.filter((call) => call.args[3] === "create"),
         name,
-      ).toHaveLength(made);
+      ).toHaveLength(gone === undefined ? 0 : 1);
       expect(
         runner.calls.filter((call) => call.args.includes(goneUdid)),
         name,
@@ -491,6 +467,36 @@ describe("IosSimctlDriver", () => {
     },
   );
 });
+
+/** why: the simctl calls of `provisions` leases of one kind: a list each, the make of a new seed when `makesSeed` (its folder appears when its clone runs, as simctl would make it), and a clone of the seed for each. */
+async function goneSeedScript(
+  filesystem: MemoryFilesystem,
+  provisions: number,
+  makesSeed: boolean,
+): Promise<ScriptedProcessExpectation[]> {
+  const copyUdid = "00000000-0000-0000-0000-000000000002";
+  await filesystem.mkdirp(`${deviceRoot}/${copyUdid}/data`);
+  const [create, boot, bootstatus, listapps, shutdown, seedClone, deleteThrowaway] =
+    throwawaySeedSteps();
+  const make = [
+    create,
+    boot,
+    bootstatus,
+    listapps,
+    shutdown,
+    { ...seedClone, onSpawn: () => plantSeedClone(filesystem) },
+    deleteThrowaway,
+  ];
+  const lists = Array.from({ length: provisions }, () => ({
+    match: listInvocation,
+    result: { code: 0, stderr: "", stdout: listFixture },
+  }));
+  const clones = Array.from({ length: provisions }, () => ({
+    match: sourcesSimctl("clone", seedUdid, driverData.name, deviceRoot),
+    result: { code: 0, stderr: "", stdout: `${copyUdid}\n` },
+  }));
+  return [...lists, ...(makesSeed ? make : []), ...clones];
+}
 
 /** why: Records the mode each `mkdirp` was asked for, because `MemoryFilesystem` creates every directory owner-only by default and so cannot show a caller that left the mode out. */
 class ModeRecordingFilesystem extends MemoryFilesystem {
