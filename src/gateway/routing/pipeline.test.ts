@@ -1,0 +1,264 @@
+import { describe, expect, it } from "vitest";
+
+import { catalogFixture, statusFixture } from "../test-support.js";
+import type { WorkerView } from "../worker-registry.js";
+import {
+  explainStages,
+  type FilterStage,
+  type RankStage,
+  runStages,
+  type WorkerReason,
+} from "./pipeline.js";
+
+const REQUEST = { model: "iPhone 17", platform: "ios" as const };
+
+function view(id: string): WorkerView {
+  return {
+    capacity: statusFixture().capacity,
+    catalog: catalogFixture([{ models: ["iPhone 17"], platform: "ios", runtimes: ["26.0"] }])
+      .platforms,
+    connection: "connected",
+    devices: [],
+    drained: false,
+    id,
+    lastSeenAt: 1,
+    leases: [],
+  };
+}
+
+function rank(name: string, scores: Record<string, number>, settles = false): RankStage {
+  return {
+    appliesToPhysical: true,
+    kind: "rank",
+    name,
+    score: (worker) => scores[worker.id] ?? 0,
+    settles,
+  };
+}
+
+function only(...ids: string[]): FilterStage {
+  return {
+    appliesToPhysical: true,
+    check: (worker) => (ids.includes(worker.id) ? undefined : { reason: "busy" }),
+    kind: "filter",
+  };
+}
+function dropping(drops: Record<string, WorkerReason>): FilterStage {
+  return {
+    appliesToPhysical: true,
+    check: (worker) => drops[worker.id],
+    kind: "filter",
+  };
+}
+function zeroing(scores: Record<string, number>, reasons: Record<string, WorkerReason>): RankStage {
+  return {
+    ...rank("zeroing", scores),
+    zeroReason: (worker) => reasons[worker.id],
+  };
+}
+
+describe("routing pipeline", () => {
+  const workers = [view("wrk_a"), view("wrk_b"), view("wrk_c")];
+
+  it("a rank stage whose best score is zero changes nothing", () => {
+    const decides = rank("decides", { wrk_a: 1, wrk_b: 1, wrk_c: 1 });
+    const abstains = rank("abstains", { wrk_a: 0, wrk_b: -3, wrk_c: 0 });
+    const narrows = rank("narrows", { wrk_b: 2, wrk_c: 2 });
+
+    expect(runStages([decides, abstains, narrows], REQUEST, workers)).toEqual({
+      stage: "narrows",
+      workerId: "wrk_b",
+    });
+    expect(runStages([decides, abstains], REQUEST, workers)).toEqual({
+      stage: "decides",
+      workerId: "wrk_a",
+    });
+  });
+
+  it("no worker is picked when no rank stage decided", () => {
+    const abstains = rank("abstains", {});
+
+    expect(runStages([], REQUEST, workers)).toBeUndefined();
+    expect(runStages([only("wrk_a", "wrk_b", "wrk_c")], REQUEST, workers)).toBeUndefined();
+    expect(runStages([abstains], REQUEST, workers)).toBeUndefined();
+  });
+
+  it("a settling rank that decides ends the walk, also when it removes no worker", () => {
+    const settlesKeepingAll = rank("settles", { wrk_a: 1, wrk_b: 1, wrk_c: 1 }, true);
+    const later = rank("later", { wrk_c: 5 });
+
+    expect(runStages([settlesKeepingAll, later], REQUEST, workers)).toEqual({
+      stage: "settles",
+      workerId: "wrk_a",
+    });
+    const keepsAll = rank("keeps-all", { wrk_a: 1, wrk_b: 1, wrk_c: 1 });
+    expect(runStages([keepsAll, later], REQUEST, workers)).toEqual({
+      stage: "later",
+      workerId: "wrk_c",
+    });
+  });
+
+  it("a settling rank that abstains does not end the walk", () => {
+    const settlesAbstaining = rank("settles", {}, true);
+    const later = rank("later", { wrk_c: 5 });
+
+    expect(runStages([settlesAbstaining, later], REQUEST, workers)).toEqual({
+      stage: "later",
+      workerId: "wrk_c",
+    });
+  });
+
+  it("with one worker and a deciding rank, that worker is picked and that rank is the deciding stage", () => {
+    const decides = rank("decides", { wrk_b: 1 });
+
+    expect(runStages([decides], REQUEST, [view("wrk_b")])).toEqual({
+      stage: "decides",
+      workerId: "wrk_b",
+    });
+  });
+
+  it("names the last rank that removed a worker, not a later rank that decided without removing any", () => {
+    const removes = rank("removes", { wrk_b: 1, wrk_c: 1 });
+    const keepsBoth = rank("keeps-both", { wrk_b: 3, wrk_c: 3 });
+
+    expect(runStages([removes, keepsBoth], REQUEST, workers)).toEqual({
+      stage: "removes",
+      workerId: "wrk_b",
+    });
+  });
+
+  it("does not credit a filter with the decision, even when it removed workers", () => {
+    const decides = rank("decides", { wrk_a: 1, wrk_b: 1, wrk_c: 1 });
+
+    expect(runStages([only("wrk_c"), decides], REQUEST, workers)).toEqual({
+      stage: "decides",
+      workerId: "wrk_c",
+    });
+  });
+
+  it("picks the first remaining worker in ascending worker id, whatever order the views came in", () => {
+    const decides = rank("decides", { wrk_a: 1, wrk_b: 1, wrk_c: 1 });
+
+    expect(runStages([decides], REQUEST, [...workers].reverse())).toEqual({
+      stage: "decides",
+      workerId: "wrk_a",
+    });
+  });
+
+  it("adds a stage to a list and removes it again without any other stage changing what it does", () => {
+    const keepsAB = only("wrk_a", "wrk_b");
+    const prefersB = rank("prefers-b", { wrk_a: 1, wrk_b: 2 });
+    const decides = rank("decides", { wrk_a: 1, wrk_b: 1 });
+    const dropsB = only("wrk_a");
+
+    const base = runStages([keepsAB, decides], REQUEST, workers);
+    const withPrefersB = [keepsAB, prefersB, decides];
+    const added = runStages(withPrefersB, REQUEST, workers);
+    const addedFilter = runStages([keepsAB, dropsB, prefersB, decides], REQUEST, workers);
+    // why: Removed from the list that just ran with it, after it ran: the shared stage objects
+    // must carry nothing over, so the result is the literal the list without it gives.
+    const removed = runStages(
+      withPrefersB.filter((stage) => stage !== prefersB),
+      REQUEST,
+      workers,
+    );
+
+    expect(base).toEqual({ stage: "decides", workerId: "wrk_a" });
+    expect(added).toEqual({ stage: "prefers-b", workerId: "wrk_b" });
+    expect(addedFilter).toEqual({ stage: "decides", workerId: "wrk_a" });
+    expect(removed).toEqual({ stage: "decides", workerId: "wrk_a" });
+  });
+  it("runStages never calls a stage whose appliesToPhysical is false for a physical request, and calls it for a virtual one", () => {
+    const calls: string[] = [];
+    const skippedFilter = {
+      appliesToPhysical: false,
+      check: () => {
+        calls.push("skipped-filter");
+        return undefined;
+      },
+      kind: "filter",
+    } as FilterStage;
+    const skippedRank = {
+      appliesToPhysical: false,
+      kind: "rank",
+      name: "skipped-rank",
+      score: () => {
+        calls.push("skipped-rank");
+        return 9;
+      },
+      settles: false,
+    } as RankStage;
+    const kept = {
+      appliesToPhysical: true,
+      kind: "rank",
+      name: "kept",
+      score: () => {
+        calls.push("kept");
+        return 1;
+      },
+      settles: false,
+    } as RankStage;
+
+    const physical = runStages(
+      [skippedFilter, skippedRank, kept],
+      { ...REQUEST, physical: true },
+      workers,
+    );
+
+    expect(calls).toContain("kept");
+    expect(calls).not.toContain("skipped-filter");
+    expect(calls).not.toContain("skipped-rank");
+    expect(physical).toEqual({ stage: "kept", workerId: "wrk_a" });
+
+    calls.length = 0;
+    runStages([skippedFilter, skippedRank, kept], { ...REQUEST, physical: false }, workers);
+
+    expect(calls).toContain("skipped-filter");
+    expect(calls).toContain("skipped-rank");
+  });
+});
+
+describe("explainStages", () => {
+  const workers = [view("wrk_a"), view("wrk_b"), view("wrk_c"), view("wrk_d")];
+  const drained: WorkerReason = { reason: "drained" };
+  const busy: WorkerReason = { reason: "busy" };
+  const ramFull: WorkerReason = { capacityReason: "ram-budget", reason: "full" };
+  const noPhysical: WorkerReason = { reason: "no-free-physical" };
+
+  it("gives each view its first filter reason in stage order, else its first rank zero reason, else none", () => {
+    const first = dropping({ wrk_a: drained });
+    const second = dropping({ wrk_a: busy, wrk_b: busy });
+    const ranks = zeroing(
+      { wrk_a: 0, wrk_b: 0, wrk_c: 0, wrk_d: 1 },
+      { wrk_b: ramFull, wrk_c: ramFull },
+    );
+    const later = {
+      ...rank("later", { wrk_a: 0, wrk_b: 0, wrk_c: 0, wrk_d: 1 }),
+      zeroReason: () => noPhysical,
+    };
+
+    expect(explainStages([first, second, ranks, later], REQUEST, workers)).toEqual([
+      { reason: drained, workerId: "wrk_a" },
+      { reason: busy, workerId: "wrk_b" },
+      { reason: ramFull, workerId: "wrk_c" },
+      { workerId: "wrk_d" },
+    ]);
+  });
+
+  it("answers in worker id order, and skips a stage a physical request does not meet", () => {
+    const virtualOnly: FilterStage = { ...dropping({ wrk_a: busy }), appliesToPhysical: false };
+    const unsorted = [workers[1] as WorkerView, workers[0] as WorkerView];
+
+    expect(explainStages([virtualOnly], REQUEST, unsorted).map((entry) => entry.workerId)).toEqual([
+      "wrk_a",
+      "wrk_b",
+    ]);
+    expect(explainStages([virtualOnly], { ...REQUEST, physical: true }, workers)[0]).toEqual({
+      workerId: "wrk_a",
+    });
+    expect(explainStages([virtualOnly], REQUEST, workers)[0]).toEqual({
+      reason: busy,
+      workerId: "wrk_a",
+    });
+  });
+});

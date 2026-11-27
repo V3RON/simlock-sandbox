@@ -1,0 +1,788 @@
+import type { DeviceClass, Platform } from "./schemas.js";
+
+const DEVICE_NOT_ENROLLABLE_REASONS = [
+  "not-connected",
+  "network-only",
+  "untrusted",
+  "developer-mode-off",
+  "os-too-old",
+  "unsupported-kind",
+  "locked",
+  "unreadable",
+  "virtual-device",
+  "enrolled-on-other-platform",
+  "enrolled-under-other-id",
+] as const;
+
+export type DeviceNotEnrollableReason = (typeof DEVICE_NOT_ENROLLABLE_REASONS)[number];
+
+export type ErrorKind = "transport" | "protocol" | "domain";
+
+export interface ErrorDetailsMap {
+  BAD_FRAME: Record<string, never>;
+  HANDSHAKE_REQUIRED: Record<string, never>;
+  BAD_REQUEST: Record<string, never>;
+  UNKNOWN_REQUEST: Record<string, never>;
+  PROTOCOL_VERSION_UNSUPPORTED: {
+    readonly client: { readonly min: number; readonly max: number };
+    readonly daemon: { readonly min: number; readonly max: number };
+    readonly daemonVersion: string;
+  };
+  ADMIN_AUTHENTICATION_FAILED: Record<string, never>;
+  FORBIDDEN: Record<string, never>;
+
+  DAEMON_STOPPING: Record<string, never>;
+  DAEMON_STARTUP_FAILED: Record<string, never>;
+  DAEMON_CONNECTION_LOST: Record<string, never>;
+  // why: ADR 0081 §3: a remote typed client could not reach the farm at its URL (nothing listening, no answer in 10 s, a proxy's 502, no session path), as the local client's `DAEMON_CONNECTION_LOST` says for a socket.
+  REMOTE_UNREACHABLE: { readonly url: string };
+  // why: the farm refused the token at the upgrade, or ended the session when the token was revoked; HTTP has answered this code at 401 all along.
+  UNAUTHENTICATED: Record<string, never>;
+
+  NO_CAPACITY: {
+    readonly capacityReason?:
+      | "device-limit"
+      | "ram-budget"
+      | "memory-pressure"
+      | "global-running-limit"
+      | "platform-running-limit";
+  };
+  QUEUE_TIMEOUT: { readonly requestId: string };
+  PROVISION_FAILED: Record<string, never>;
+  REQUESTER_ALREADY_LEASED: { readonly requesterId: string; readonly existingLeaseId?: string };
+  /** why: a missing `leaseId`, `runId` or `label` on either side counts as different, so a retry
+   * that adds or drops one conflicts instead of replaying. */
+  IDEMPOTENCY_CONFLICT: Record<string, never>;
+  /** why: `lease.request` named a `leaseId` an active lease or a waiting request already holds
+   * (ADR 0020). The daemon stores nothing for it; a gateway can also meet it after storing the
+   * request, when a worker's grant carries an ID the gateway already routes elsewhere. */
+  LEASE_ID_TAKEN: { readonly leaseId: string };
+  /** why: `lease.request` named a `leaseId` whose lease ended within `lease.endedIdRetentionMs`
+   * (ADR 0074 §4); `endedAt` is when, in milliseconds since the epoch. The request is stored nowhere. */
+  LEASE_ENDED: { readonly leaseId: string; readonly endedAt: number };
+  /** why: the gateway's admission command (ADR 0074 §1) refused the request; `reason` is the command's own, 1 to 500 characters. */
+  ADMISSION_DENIED: { readonly reason: string };
+  /** why: the gateway's admission command could not decide, and the gateway fails closed; `cause` names why, at most 600 characters. */
+  ADMISSION_FAILED: { readonly cause: string };
+  NO_DRIVER: { readonly platform: Platform };
+  CAPABILITY_MISSING: { readonly capabilities: readonly string[] };
+  RELAY_TARGET_MISSING: { readonly target: string };
+  RUNTIME_MISSING: {
+    readonly platform: Platform;
+    readonly osVersion: string;
+    readonly downloadable: boolean;
+  };
+  UNKNOWN_MODEL: {
+    readonly platform: Platform;
+    readonly model?: string;
+    readonly class?: DeviceClass;
+  };
+  /** why: an iOS lease or warm target whose resolved mode the worker's `ios.modes` does not list (ADR 0082 §3). */
+  MODE_UNAVAILABLE: {
+    readonly platform: "ios";
+    readonly mode: "slim" | "full";
+    readonly served: readonly ("slim" | "full")[];
+  };
+  INSUFFICIENT_DISK_SPACE: {
+    readonly platform: Platform;
+    readonly requiredBytes: number;
+    readonly availableBytes: number;
+  };
+  LICENSE_NOT_ACCEPTED: { readonly platform: Platform; readonly componentName: string };
+  DOWNLOAD_TIMEOUT: {
+    readonly platform: Platform;
+    readonly component: string;
+    readonly timeoutMs: number;
+  };
+  /**
+   * why: ADR 0010 §4: an explicit component install under `downloads.policy: "never"`. No role and
+   * no operation overrides that policy, so the install never starts.
+   */
+  DOWNLOADS_DISABLED: { readonly policy: "never" };
+  COMPONENT_NOT_OWNED: Record<string, never>;
+  COMPONENT_IN_USE: { readonly devices: number; readonly foreignDevices: number };
+  COMPONENT_BUSY: Record<string, never>;
+  UNKNOWN_LEASE: { readonly leaseId: string };
+  /** why: a save that ended the lease but kept no baseline: the driver could not make the source. */
+  BASELINE_SAVE_FAILED: { readonly name: string; readonly leaseId: string };
+  /** why: ADR 0090 §4: `simlock seed` could not settle a kind's seed: the make or the settle failed, or its 60 minutes ran out. */
+  SEED_SETTLE_FAILED: {
+    readonly platform: Platform;
+    readonly model: string;
+    readonly reason: "failed" | "timed-out";
+  };
+  UNKNOWN_BASELINE: { readonly name: string };
+  /** why: a lease request named a baseline and a field it also named differs; `field` is the first that differs. */
+  BASELINE_MISMATCH: {
+    readonly baseline: string;
+    readonly field: "platform" | "model" | "osVersion" | "mode" | "imageTag";
+  };
+  /** why: a lease request named a baseline whose runtime or image is gone; `reason` is the driver's own wording. */
+  BASELINE_STALE: { readonly baseline: string; readonly reason: string };
+  BASELINE_IN_USE: { readonly name: string; readonly leaseId: string };
+  TUNNEL_UNSUPPORTED: Record<string, never>;
+  TUNNEL_PORT_IN_USE: Record<string, never>;
+  TUNNEL_BAD_PORT: Record<string, never>;
+  TUNNEL_LIMIT: Record<string, never>;
+  TUNNEL_FAILED: Record<string, never>;
+  TUNNEL_UNAVAILABLE: Record<string, never>;
+  TUNNEL_DISCONNECTED: Record<string, never>;
+  TUNNEL_CALLER_PORT_IN_USE: Record<string, never>;
+  TUNNEL_LEASE_ENDED: Record<string, never>;
+  DEVICE_NOT_ENROLLABLE: {
+    readonly platform: Platform;
+    readonly id: string;
+    readonly reason: DeviceNotEnrollableReason;
+    readonly canonicalId?: string;
+  };
+  DEVICE_BUSY: { readonly id: string; readonly reason: "leased" | "reclaiming" | "busy" };
+  UNKNOWN_DEVICE: { readonly id: string };
+  PASSTHROUGH_REFUSED: { readonly tool: string };
+  UNKNOWN_PASSTHROUGH_TOOL: { readonly tool: string };
+  EXEC_TIMEOUT: Record<string, never>;
+  /** why: ADR 0067 §5: the lease file named by `stdinFile` could not be read to its end after `bytesRead` bytes, and the command was stopped. */
+  STDIN_FILE_FAILED: { readonly name: string; readonly bytesRead: number };
+  /** why: `device.rotate` on a lease that is not on an iOS phone or tablet simulator, or on a foldable one; `class` is the physical class, the simulator's model family, or `emulator`. */
+  ROTATION_UNSUPPORTED: {
+    readonly leaseId: string;
+    readonly platform: Platform;
+    readonly physical: boolean;
+    readonly class: string;
+  };
+  /** why: `device.rotate` could not reach the lease's input helper; `reason` is the driver's text, cut to 200 characters. */
+  INPUT_UNAVAILABLE: { readonly leaseId: string; readonly reason: string };
+  /** why: ADR 0067 §4: a lease's file upload passed 2 GiB. */
+  FILE_TOO_LARGE: { readonly name: string };
+  /** why: ADR 0067 §4: an upload would take a lease's folder past 4 GiB. */
+  LEASE_FILES_FULL: { readonly leaseId: string; readonly usedBytes: number };
+  UNKNOWN_FILE: { readonly name: string };
+  /** why: ADR 0067 §6: no byte of an upload's body arrived for 330 s. */
+  UPLOAD_STALLED: { readonly name: string };
+  /** why: ADR 0067 §2: another request is uploading the same file name. */
+  FILE_BUSY: { readonly name: string };
+  DOCTOR_UNAVAILABLE: Record<string, never>;
+  HISTORY_NOT_KEPT: { readonly oldestTs: number };
+  HISTORY_UNAVAILABLE: Record<string, never>;
+  NUKE_UNAVAILABLE: Record<string, never>;
+  DAEMON_UPDATING: Record<string, never>;
+  UPDATE_UNSUPPORTED_INSTALL: Record<string, never>;
+  UPDATE_RESOLVE_FAILED: Record<string, never>;
+  UPDATE_SHARED_INSTALL: Record<string, never>;
+  INTERNAL: Record<string, never>;
+  GATEWAY_NOT_PRESENT: Record<string, never>;
+  SERVICE_FAILED: Record<string, never>;
+  UNSUPPORTED_IN_GATEWAY_MODE: { readonly operation: string };
+  /**
+   * why: ADR 0012 §2: the mirror of `UNSUPPORTED_IN_GATEWAY_MODE`. The operation exists, this daemon
+   * is a worker, and the operation only applies to a gateway's workers: `worker.drain`,
+   * `worker.undrain`, `worker.remove` and `worker.install-component`. Not `UNKNOWN_REQUEST`: the
+   * operation is known, it just does not apply to a single host.
+   */
+  UNSUPPORTED_IN_WORKER_MODE: { readonly operation: string };
+  WORKER_CONNECTED: { readonly workerId: string };
+  /** why: `worker.drain`/`worker.undrain` naming a worker the gateway has no view of. (`worker.remove`
+   * answers `{removed: false}` instead: forgetting something already forgotten is done, not an
+   * error.) */
+  UNKNOWN_WORKER: { readonly workerId: string };
+  // why: ADR 0042 §2: `worker.update` names a worker the gateway knows but has no open uplink to.
+  WORKER_NOT_CONNECTED: { readonly workerId: string };
+  /**
+   * why: ADR 0005 §28: the worker that owns this lease (or would serve this request) has no open
+   * uplink. `kind: "transport"`, because it says the same thing `DAEMON_CONNECTION_LOST` says
+   * one hop further out -- the operation did not fail on its merits, the machine that would
+   * decide is unreachable. Declared here now, with the rest of the closed set; #118 is what
+   * throws it, once there is a lease to forward.
+   */
+  WORKER_UNREACHABLE: { readonly workerId: string };
+
+  /** why: `alerts.test` naming a destination the gateway's config does not list, or a gateway with none. */
+  UNKNOWN_ALERT_DESTINATION: { readonly destination: string };
+
+  /**
+   * why: `alerts.test`: the receiver did not take the sample. `status` is a non-2xx answer; `error` is
+   * `timeout`, a network code such as `ECONNREFUSED`, or `network-error`. Never the error's own
+   * message, which can hold the destination's URL.
+   */
+  ALERT_SEND_FAILED: {
+    readonly destination: string;
+    readonly status?: number;
+    readonly error?: string;
+  };
+
+  /** why: ADR §7's forward-compatibility escape hatch: a code the client does not know (a newer
+   * daemon) wraps as this instead of throwing a parse failure. Never sent by a daemon this
+   * version of the contract can produce -- purely a client-side wrapping target. */
+  UNKNOWN_DAEMON_ERROR: { readonly code: string; readonly message: string };
+
+  /** why: ADR §10: the outcome `requestLease`'s `AbortSignal` surfaces for all four abort paths.
+   * Never sent by the daemon over the wire -- purely a client-side construction, the same way
+   * `UNKNOWN_DAEMON_ERROR` is. Kept in the closed set (rather than a separate ad hoc class) so
+   * callers can `isSimlockError(e) && e.code === "CANCELLED"` exactly like any other outcome. */
+  CANCELLED: Record<string, never>;
+}
+
+export type SimlockErrorCode = keyof ErrorDetailsMap;
+
+/** why: The subset of `SimlockErrorCode` whose `ErrorDetailsMap` entry actually declares a field --
+ * i.e. every code above except the `Record<string, never>` ("no details") ones. Structural
+ * assignability to `Record<string, never>`, not `keyof`: an index-signature-only type's `keyof`
+ * is `string`, not `never`, so a `keyof ... extends never` test would (wrongly) call every code
+ * "declared" -- only a shape whose every property-value-type is itself assignable to `never`
+ * (i.e. `Record<string, never>` itself) is actually empty. */
+type CodeWithDeclaredDetails = {
+  [Code in SimlockErrorCode]: ErrorDetailsMap[Code] extends Record<string, never> ? never : Code;
+}[SimlockErrorCode];
+
+const CODES_WITH_DECLARED_DETAILS_BY_CODE: Record<CodeWithDeclaredDetails, true> = {
+  PROTOCOL_VERSION_UNSUPPORTED: true,
+  REMOTE_UNREACHABLE: true,
+  QUEUE_TIMEOUT: true,
+  NO_CAPACITY: true,
+  REQUESTER_ALREADY_LEASED: true,
+  LEASE_ID_TAKEN: true,
+  LEASE_ENDED: true,
+  ADMISSION_DENIED: true,
+  ADMISSION_FAILED: true,
+  NO_DRIVER: true,
+  CAPABILITY_MISSING: true,
+  RELAY_TARGET_MISSING: true,
+  RUNTIME_MISSING: true,
+  UNKNOWN_MODEL: true,
+  MODE_UNAVAILABLE: true,
+  HISTORY_NOT_KEPT: true,
+  INSUFFICIENT_DISK_SPACE: true,
+  FILE_TOO_LARGE: true,
+  LEASE_FILES_FULL: true,
+  UNKNOWN_FILE: true,
+  STDIN_FILE_FAILED: true,
+  UPLOAD_STALLED: true,
+  FILE_BUSY: true,
+  LICENSE_NOT_ACCEPTED: true,
+  DOWNLOAD_TIMEOUT: true,
+  DOWNLOADS_DISABLED: true,
+  COMPONENT_IN_USE: true,
+  UNKNOWN_LEASE: true,
+  BASELINE_SAVE_FAILED: true,
+  SEED_SETTLE_FAILED: true,
+  UNKNOWN_BASELINE: true,
+  BASELINE_MISMATCH: true,
+  BASELINE_STALE: true,
+  BASELINE_IN_USE: true,
+  ROTATION_UNSUPPORTED: true,
+  INPUT_UNAVAILABLE: true,
+  DEVICE_NOT_ENROLLABLE: true,
+  DEVICE_BUSY: true,
+  UNKNOWN_DEVICE: true,
+  PASSTHROUGH_REFUSED: true,
+  UNKNOWN_PASSTHROUGH_TOOL: true,
+  UNSUPPORTED_IN_GATEWAY_MODE: true,
+  UNSUPPORTED_IN_WORKER_MODE: true,
+  WORKER_CONNECTED: true,
+  UNKNOWN_WORKER: true,
+  WORKER_NOT_CONNECTED: true,
+  WORKER_UNREACHABLE: true,
+  ALERT_SEND_FAILED: true,
+  UNKNOWN_ALERT_DESTINATION: true,
+  UNKNOWN_DAEMON_ERROR: true,
+};
+
+export const CODES_WITH_DECLARED_DETAILS: ReadonlySet<SimlockErrorCode> = new Set(
+  Object.keys(CODES_WITH_DECLARED_DETAILS_BY_CODE) as CodeWithDeclaredDetails[],
+);
+
+/** why: the CLI exit code of a background `simlock lease` whose lease Simlock took back; it is no error code, so it has no row in `ERROR_TABLE`. */
+export const LEASE_LOST_EXIT_CODE = 14;
+
+export interface ErrorTableEntry<Code extends SimlockErrorCode = SimlockErrorCode> {
+  readonly code: Code;
+  readonly kind: ErrorKind;
+  readonly cliExitCode: number;
+  readonly httpStatus: number;
+}
+
+// fallow-ignore-next-line complexity -- one exhaustive table is the point (ADR §7: "columns of
+// the same error table, not second mappings").
+export const ERROR_TABLE: { readonly [Code in SimlockErrorCode]: ErrorTableEntry<Code> } = {
+  BAD_FRAME: { code: "BAD_FRAME", kind: "protocol", cliExitCode: 2, httpStatus: 400 },
+  HANDSHAKE_REQUIRED: {
+    code: "HANDSHAKE_REQUIRED",
+    kind: "protocol",
+    cliExitCode: 1,
+    httpStatus: 400,
+  },
+  BAD_REQUEST: { code: "BAD_REQUEST", kind: "protocol", cliExitCode: 2, httpStatus: 400 },
+  UNKNOWN_REQUEST: { code: "UNKNOWN_REQUEST", kind: "protocol", cliExitCode: 2, httpStatus: 400 },
+  PROTOCOL_VERSION_UNSUPPORTED: {
+    code: "PROTOCOL_VERSION_UNSUPPORTED",
+    kind: "protocol",
+    cliExitCode: 1,
+    httpStatus: 400,
+  },
+  ADMIN_AUTHENTICATION_FAILED: {
+    code: "ADMIN_AUTHENTICATION_FAILED",
+    kind: "protocol",
+    cliExitCode: 1,
+    httpStatus: 401,
+  },
+  FORBIDDEN: { code: "FORBIDDEN", kind: "protocol", cliExitCode: 1, httpStatus: 403 },
+  DAEMON_STOPPING: { code: "DAEMON_STOPPING", kind: "transport", cliExitCode: 1, httpStatus: 503 },
+  DAEMON_STARTUP_FAILED: {
+    code: "DAEMON_STARTUP_FAILED",
+    kind: "transport",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  DAEMON_CONNECTION_LOST: {
+    code: "DAEMON_CONNECTION_LOST",
+    kind: "transport",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  REMOTE_UNREACHABLE: {
+    code: "REMOTE_UNREACHABLE",
+    kind: "transport",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  UNAUTHENTICATED: { code: "UNAUTHENTICATED", kind: "protocol", cliExitCode: 1, httpStatus: 401 },
+  NO_CAPACITY: { code: "NO_CAPACITY", kind: "domain", cliExitCode: 11, httpStatus: 503 },
+  QUEUE_TIMEOUT: { code: "QUEUE_TIMEOUT", kind: "domain", cliExitCode: 10, httpStatus: 500 },
+  PROVISION_FAILED: { code: "PROVISION_FAILED", kind: "domain", cliExitCode: 1, httpStatus: 500 },
+  REQUESTER_ALREADY_LEASED: {
+    code: "REQUESTER_ALREADY_LEASED",
+    kind: "domain",
+    cliExitCode: 13,
+    httpStatus: 409,
+  },
+  // why: 409 like `REQUESTER_ALREADY_LEASED`, its neighbour: the request contradicts one already
+  // stored. Exit 2, the "you asked the wrong thing" class -- retrying the same call never helps.
+  IDEMPOTENCY_CONFLICT: {
+    code: "IDEMPOTENCY_CONFLICT",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 409,
+  },
+  LEASE_ID_TAKEN: {
+    code: "LEASE_ID_TAKEN",
+    kind: "domain",
+    cliExitCode: 13,
+    httpStatus: 409,
+  },
+  // why: 409 and exit 13 like `LEASE_ID_TAKEN`: the id clashes with a lease that recently ended.
+  LEASE_ENDED: {
+    code: "LEASE_ENDED",
+    kind: "domain",
+    cliExitCode: 13,
+    httpStatus: 409,
+  },
+  // why: the operator's policy said no (403) or could not answer (503, the gateway fails closed); exit 16 for both: the policy, not the request's shape, decided.
+  ADMISSION_DENIED: {
+    code: "ADMISSION_DENIED",
+    kind: "domain",
+    cliExitCode: 16,
+    httpStatus: 403,
+  },
+  ADMISSION_FAILED: {
+    code: "ADMISSION_FAILED",
+    kind: "domain",
+    cliExitCode: 16,
+    httpStatus: 503,
+  },
+  NO_DRIVER: { code: "NO_DRIVER", kind: "domain", cliExitCode: 12, httpStatus: 422 },
+  CAPABILITY_MISSING: {
+    code: "CAPABILITY_MISSING",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 422,
+  },
+  RELAY_TARGET_MISSING: {
+    code: "RELAY_TARGET_MISSING",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  RUNTIME_MISSING: { code: "RUNTIME_MISSING", kind: "domain", cliExitCode: 12, httpStatus: 422 },
+  UNKNOWN_MODEL: { code: "UNKNOWN_MODEL", kind: "domain", cliExitCode: 12, httpStatus: 422 },
+  MODE_UNAVAILABLE: { code: "MODE_UNAVAILABLE", kind: "domain", cliExitCode: 12, httpStatus: 422 },
+  INSUFFICIENT_DISK_SPACE: {
+    code: "INSUFFICIENT_DISK_SPACE",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 422,
+  },
+  LICENSE_NOT_ACCEPTED: {
+    code: "LICENSE_NOT_ACCEPTED",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 422,
+  },
+  UNKNOWN_LEASE: { code: "UNKNOWN_LEASE", kind: "domain", cliExitCode: 1, httpStatus: 404 },
+  // why: a lease's file routes (ADR 0067): a refused upload or a missing file is a fact about the request, not a state of the host.
+  FILE_TOO_LARGE: { code: "FILE_TOO_LARGE", kind: "domain", cliExitCode: 1, httpStatus: 413 },
+  LEASE_FILES_FULL: { code: "LEASE_FILES_FULL", kind: "domain", cliExitCode: 1, httpStatus: 413 },
+  UNKNOWN_FILE: { code: "UNKNOWN_FILE", kind: "domain", cliExitCode: 1, httpStatus: 404 },
+  STDIN_FILE_FAILED: { code: "STDIN_FILE_FAILED", kind: "domain", cliExitCode: 1, httpStatus: 500 },
+  UPLOAD_STALLED: { code: "UPLOAD_STALLED", kind: "domain", cliExitCode: 1, httpStatus: 408 },
+  FILE_BUSY: { code: "FILE_BUSY", kind: "domain", cliExitCode: 1, httpStatus: 409 },
+  // why: a lease's tunnel socket refuses with these (ADR 0054 section 7), so every surface reports them alike.
+  TUNNEL_UNSUPPORTED: {
+    code: "TUNNEL_UNSUPPORTED",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 422,
+  },
+  TUNNEL_PORT_IN_USE: {
+    code: "TUNNEL_PORT_IN_USE",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 409,
+  },
+  TUNNEL_BAD_PORT: { code: "TUNNEL_BAD_PORT", kind: "domain", cliExitCode: 1, httpStatus: 422 },
+  TUNNEL_LIMIT: { code: "TUNNEL_LIMIT", kind: "domain", cliExitCode: 1, httpStatus: 409 },
+  TUNNEL_FAILED: { code: "TUNNEL_FAILED", kind: "domain", cliExitCode: 1, httpStatus: 502 },
+  TUNNEL_UNAVAILABLE: {
+    code: "TUNNEL_UNAVAILABLE",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  TUNNEL_DISCONNECTED: {
+    code: "TUNNEL_DISCONNECTED",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  TUNNEL_CALLER_PORT_IN_USE: {
+    code: "TUNNEL_CALLER_PORT_IN_USE",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 409,
+  },
+  TUNNEL_LEASE_ENDED: {
+    code: "TUNNEL_LEASE_ENDED",
+    kind: "domain",
+    cliExitCode: 14,
+    httpStatus: 410,
+  },
+  // why: A device that cannot be enrolled is a fact about the device, as `RUNTIME_MISSING` is about
+  // the host: 422 and 12. A busy device passes once what holds it ends, as `NO_CAPACITY` does:
+  // 409 and 11. An unknown device is the "what you named does not exist" class: 404 and 12.
+  DEVICE_NOT_ENROLLABLE: {
+    code: "DEVICE_NOT_ENROLLABLE",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 422,
+  },
+  DEVICE_BUSY: { code: "DEVICE_BUSY", kind: "domain", cliExitCode: 11, httpStatus: 409 },
+  UNKNOWN_DEVICE: { code: "UNKNOWN_DEVICE", kind: "domain", cliExitCode: 12, httpStatus: 404 },
+  // why: Both are caller errors -- a refused verb and an unknown wrapper are things the request got
+  // wrong, not states of the host -- so they take the usage exit code and a 4xx.
+  PASSTHROUGH_REFUSED: {
+    code: "PASSTHROUGH_REFUSED",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 422,
+  },
+  UNKNOWN_PASSTHROUGH_TOOL: {
+    code: "UNKNOWN_PASSTHROUGH_TOOL",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 422,
+  },
+  // why: The command ran, and ran too long: a 504 for the same reason a proxy uses one (the thing
+  // this daemon was waiting on never finished), and 10 -- the exit code the other "you ran
+  // out of time" outcome (`QUEUE_TIMEOUT`) already uses -- so a script branching on "timed
+  // out" does not need a second number for the second kind of wait.
+  EXEC_TIMEOUT: { code: "EXEC_TIMEOUT", kind: "domain", cliExitCode: 10, httpStatus: 504 },
+  // why: a fact about the lease's device, as `RUNTIME_MISSING` is about the host: 422 and 12.
+  ROTATION_UNSUPPORTED: {
+    code: "ROTATION_UNSUPPORTED",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 422,
+  },
+  // why: the helper that takes the touch is down, like `DOCTOR_UNAVAILABLE`: 503 and 1.
+  INPUT_UNAVAILABLE: { code: "INPUT_UNAVAILABLE", kind: "domain", cliExitCode: 1, httpStatus: 503 },
+  DOWNLOAD_TIMEOUT: {
+    code: "DOWNLOAD_TIMEOUT",
+    kind: "domain",
+    cliExitCode: 10,
+    httpStatus: 504,
+  },
+  // why: Configuration, not the caller, refuses the download: 403, and 12 with the other "this
+  // machine cannot provide that component" outcomes (`RUNTIME_MISSING`, `INSUFFICIENT_DISK_SPACE`).
+  DOWNLOADS_DISABLED: {
+    code: "DOWNLOADS_DISABLED",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 403,
+  },
+  // why: A refused removal: 409, the component is not in a state that allows it. 12 for the two that
+  // a retry does not change on its own (not Simlock's; in use until its devices are deleted),
+  // 11 for the one that passes once the platform's install or removal ends, like `NO_CAPACITY`.
+  COMPONENT_NOT_OWNED: {
+    code: "COMPONENT_NOT_OWNED",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 409,
+  },
+  COMPONENT_IN_USE: {
+    code: "COMPONENT_IN_USE",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 409,
+  },
+  BASELINE_IN_USE: {
+    code: "BASELINE_IN_USE",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 409,
+  },
+  UNKNOWN_BASELINE: {
+    code: "UNKNOWN_BASELINE",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 404,
+  },
+  BASELINE_MISMATCH: {
+    code: "BASELINE_MISMATCH",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 422,
+  },
+  BASELINE_STALE: { code: "BASELINE_STALE", kind: "domain", cliExitCode: 12, httpStatus: 422 },
+  COMPONENT_BUSY: { code: "COMPONENT_BUSY", kind: "domain", cliExitCode: 11, httpStatus: 409 },
+  BASELINE_SAVE_FAILED: {
+    code: "BASELINE_SAVE_FAILED",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 500,
+  },
+  SEED_SETTLE_FAILED: {
+    code: "SEED_SETTLE_FAILED",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 500,
+  },
+  DOCTOR_UNAVAILABLE: {
+    code: "DOCTOR_UNAVAILABLE",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  NUKE_UNAVAILABLE: { code: "NUKE_UNAVAILABLE", kind: "domain", cliExitCode: 1, httpStatus: 503 },
+  DAEMON_UPDATING: { code: "DAEMON_UPDATING", kind: "domain", cliExitCode: 1, httpStatus: 503 },
+  UPDATE_UNSUPPORTED_INSTALL: {
+    code: "UPDATE_UNSUPPORTED_INSTALL",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 409,
+  },
+  UPDATE_RESOLVE_FAILED: {
+    code: "UPDATE_RESOLVE_FAILED",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 502,
+  },
+  UPDATE_SHARED_INSTALL: {
+    code: "UPDATE_SHARED_INSTALL",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 409,
+  },
+  HISTORY_NOT_KEPT: { code: "HISTORY_NOT_KEPT", kind: "domain", cliExitCode: 12, httpStatus: 422 },
+  HISTORY_UNAVAILABLE: {
+    code: "HISTORY_UNAVAILABLE",
+    kind: "domain",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  INTERNAL: { code: "INTERNAL", kind: "domain", cliExitCode: 1, httpStatus: 500 },
+  // why: never sent over HTTP (the CLI and MCP raise it before they connect); the table needs a value.
+  GATEWAY_NOT_PRESENT: {
+    code: "GATEWAY_NOT_PRESENT",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 404,
+  },
+  // why: never sent over HTTP (the CLI raises it when a service manager call fails); the table needs a value.
+  SERVICE_FAILED: { code: "SERVICE_FAILED", kind: "domain", cliExitCode: 1, httpStatus: 500 },
+  // why: 501, not 400/503: the request was well-formed and the daemon is healthy -- this endpoint
+  // simply does not implement that operation, which is exactly what "Not Implemented" says.
+  // `cliExitCode: 2` puts it with the other "you asked the wrong thing" outcomes.
+  UNSUPPORTED_IN_GATEWAY_MODE: {
+    code: "UNSUPPORTED_IN_GATEWAY_MODE",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 501,
+  },
+  UNSUPPORTED_IN_WORKER_MODE: {
+    code: "UNSUPPORTED_IN_WORKER_MODE",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 501,
+  },
+  // why: 409, like every other "the resource is not in a state that allows this": the worker is
+  // there, connected, and removing it is a contradiction rather than a missing thing. Exit 2
+  // for the same reason `UNSUPPORTED_IN_GATEWAY_MODE` takes it -- the caller asked for
+  // something that cannot apply, rather than hitting a state of the fleet.
+  WORKER_CONNECTED: { code: "WORKER_CONNECTED", kind: "domain", cliExitCode: 2, httpStatus: 409 },
+  // why: Exit 12, beside `UNKNOWN_MODEL`: the "what you named does not exist" class, which a script
+  // branches on differently from "the fleet is busy" or "that cannot apply here".
+  UNKNOWN_WORKER: { code: "UNKNOWN_WORKER", kind: "domain", cliExitCode: 12, httpStatus: 404 },
+  WORKER_NOT_CONNECTED: {
+    code: "WORKER_NOT_CONNECTED",
+    kind: "domain",
+    cliExitCode: 2,
+    httpStatus: 409,
+  },
+  WORKER_UNREACHABLE: {
+    code: "WORKER_UNREACHABLE",
+    kind: "transport",
+    cliExitCode: 1,
+    httpStatus: 503,
+  },
+  // why: exit 12 beside `UNKNOWN_WORKER`: what you named does not exist.
+  UNKNOWN_ALERT_DESTINATION: {
+    code: "UNKNOWN_ALERT_DESTINATION",
+    kind: "domain",
+    cliExitCode: 12,
+    httpStatus: 404,
+  },
+  // why: 502, the gateway worked and the receiver it called did not take the sample.
+  ALERT_SEND_FAILED: {
+    code: "ALERT_SEND_FAILED",
+    kind: "transport",
+    cliExitCode: 1,
+    httpStatus: 502,
+  },
+  UNKNOWN_DAEMON_ERROR: {
+    code: "UNKNOWN_DAEMON_ERROR",
+    kind: "protocol",
+    cliExitCode: 1,
+    httpStatus: 500,
+  },
+  // why: Never sent over the wire (see the field comment on `ErrorDetailsMap.CANCELLED`); the
+  // `httpStatus` follows the conventional "client closed request" code even though HTTP never
+  // actually produces this error today.
+  CANCELLED: { code: "CANCELLED", kind: "domain", cliExitCode: 1, httpStatus: 499 },
+};
+
+/**
+ * Renders a schema validation failure as the one-line `path: message; path: message` string
+ * every transport puts in a `BAD_REQUEST`'s message.
+ *
+ * One function rather than the four identical copies that used to sit in `Dispatcher`,
+ * `DaemonServer`, the typed client, and the HTTP app: each threw its own error class around
+ * the same rendering, so the rendering is what they actually shared -- and a caller reading
+ * `path: message` off a socket, an HTTP body, or a client rejection is entitled to the same
+ * string in all three. Structurally typed over the issue list rather than importing zod's
+ * `ZodIssue`, so this stays a formatting utility with no opinion about which schema library
+ * produced the issues.
+ */
+export function describeSchemaIssues(
+  issues: readonly { readonly path: readonly PropertyKey[]; readonly message: string }[],
+): string {
+  return issues
+    .map((issue) =>
+      issue.path.length === 0 ? issue.message : `${issue.path.join(".")}: ${issue.message}`,
+    )
+    .join("; ");
+}
+
+/**
+ * `SimlockError<Code>` carries `details` typed exactly for its own `Code`. A bare
+ * `SimlockError` (the default `Code = SimlockErrorCode`) does NOT narrow on `.code ===` checks
+ * -- a generic class's fields are not a discriminated union to the type checker. Use
+ * `AnySimlockError` (below) for that; `isSimlockError` produces one from an `unknown` catch
+ * value.
+ */
+export class SimlockError<Code extends SimlockErrorCode = SimlockErrorCode> extends Error {
+  constructor(
+    readonly code: Code,
+    readonly kind: ErrorKind,
+    message: string,
+    readonly details: ErrorDetailsMap[Code],
+  ) {
+    super(message);
+    this.name = "SimlockError";
+  }
+}
+
+/**
+ * The same class, expressed as a discriminated union over every code -- this is the type that
+ * actually narrows: `if (isSimlockError(e) && e.code === "REQUESTER_ALREADY_LEASED")` narrows
+ * `e.details` to `{requesterId, existingLeaseId?}` because each union member's `code` and
+ * `details` share one type parameter.
+ */
+export type AnySimlockError = { [Code in SimlockErrorCode]: SimlockError<Code> }[SimlockErrorCode];
+
+export function isSimlockError(error: unknown): error is AnySimlockError {
+  return error instanceof SimlockError;
+}
+
+/** why: the worker's admission and the gateway's both refuse an ended lease id, so the message lives once. */
+export function leaseEndedError(leaseId: string, endedAt: number): SimlockError<"LEASE_ENDED"> {
+  return new SimlockError(
+    "LEASE_ENDED",
+    "domain",
+    `Lease ${leaseId} ended at ${new Date(endedAt).toISOString()}; choose a new lease id`,
+    { endedAt, leaseId },
+  );
+}
+
+/** why: the gateway's refusals by its admission command (ADR 0074 §1), worded once. */
+export function admissionDeniedError(reason: string): SimlockError<"ADMISSION_DENIED"> {
+  return new SimlockError(
+    "ADMISSION_DENIED",
+    "domain",
+    `The gateway's admission policy refused this request: ${reason}`,
+    { reason },
+  );
+}
+
+export function admissionFailedError(cause: string): SimlockError<"ADMISSION_FAILED"> {
+  return new SimlockError(
+    "ADMISSION_FAILED",
+    "domain",
+    `The gateway's admission policy could not decide on this request (${cause})`,
+    { cause },
+  );
+}
+
+/** why: the CLI and MCP raise this one error from two places, so the wording lives once. */
+export function gatewayNotPresentError(): SimlockError<"GATEWAY_NOT_PRESENT"> {
+  return new SimlockError(
+    "GATEWAY_NOT_PRESENT",
+    "domain",
+    "No gateway on this machine. Start one with: simlock --gateway daemon start",
+    {},
+  );
+}
+
+/**
+ * Builds a typed `SimlockError` from a raw wire `{code, message}` (and optional already-parsed
+ * `details`), the client-side half of ADR §7's forward-compatibility rule: a `code` this
+ * contract does not recognize wraps as `UNKNOWN_DAEMON_ERROR` with the raw code and message
+ * preserved, rather than throwing a parse failure. This is deliberately permissive about
+ * `details` -- it trusts the caller's parsed value rather than re-validating per-code detail
+ * shapes against `ErrorDetailsMap`, since the wire's `error.details` has no schema of its own
+ * yet (today's daemon does not even send one for most codes -- see `respondError` in
+ * `src/daemon/server-connection.ts`, which now accepts but does not populate `details` for most
+ * cases). Tightening this with real per-code detail schemas is left as follow-up.
+ */
+export function fromWireError(code: string, message: string, details?: unknown): AnySimlockError {
+  const entry = (ERROR_TABLE as Record<string, ErrorTableEntry>)[code];
+  if (entry === undefined) {
+    return new SimlockError("UNKNOWN_DAEMON_ERROR", "protocol", message, {
+      code,
+      message,
+    }) as AnySimlockError;
+  }
+  return new SimlockError(
+    entry.code,
+    entry.kind,
+    message,
+    (details ?? {}) as never,
+  ) as AnySimlockError;
+}

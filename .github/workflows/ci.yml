@@ -1,0 +1,378 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Deny by default; every job opts in to exactly what it needs.
+permissions: {}
+
+env:
+  COREPACK_ENABLE_PROJECT_SPEC: "0"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # why: `pnpm check` runs these one after another in ~5 min; split, the slowest part (one e2e
+  # shard) sets the wall time. Keep the steps below in step with `pnpm check`.
+  static:
+    name: Static checks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # why: the comment lint diffs against origin/main.
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Typecheck
+        run: pnpm run typecheck && pnpm run typecheck:e2e
+      - name: Lint
+        run: pnpm run lint && pnpm run lint:comments && pnpm run lint:tests
+      - name: Format
+        run: pnpm run format:check
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Unit tests
+        run: pnpm run test:unit
+
+  # why: the Windows paths are otherwise tested only by passing `platform: "win32"` on Linux;
+  # bash is Git Bash, which the repository's tooling needs on Windows (ADR 0087 section 6).
+  # One runner spends 11 to 17 minutes in the tests, where every other job ends within 5, so
+  # they run in three shards.
+  windows-unit:
+    name: Unit tests (Windows) (${{ matrix.shard }}/3)
+    needs: changes
+    # Runs unless Changes said there is nothing to test, so a broken Changes job runs it.
+    if: ${{ !cancelled() && needs.changes.outputs.windows != 'false' }}
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # why: one red shard must not cancel the others, or their failures go unreported.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Unit tests
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: pnpm run test:unit --shard="$SHARD/3"
+
+  timing:
+    name: Timing tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Timing tests
+        run: pnpm run test:timing
+
+  e2e:
+    name: E2E (${{ matrix.shard }}/3)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    strategy:
+      # why: one red shard must not cancel the others, or their failures go unreported.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build
+        run: pnpm run build && pnpm run build:e2e
+      - name: E2E tests
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: pnpm exec vitest run --project e2e --tags-filter='!slow' --shard="$SHARD/3"
+
+  # why: the Swift tests are the only proof of the capture program's lifecycle (stop on a dead
+  # daemon, the envelope, the panel follower), and `swift test` builds every target of the package,
+  # including the one that links CoreDevice symbols first shipped with Xcode 27, so only the
+  # xcode-27 image builds it (as in release.yml).
+  swift:
+    name: Swift tests
+    runs-on: xcode-27
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Swift tests
+        run: swift test --package-path vendor/screen-capture
+
+  # why: branch protection requires the check named Quality, so this job stands for all of the
+  # above. `always()` makes it report a failure when a job it needs fails, where a job skipped
+  # by a failed need would count as passed; a Windows job skipped by Changes leaves it green.
+  quality:
+    name: Quality
+    needs: [static, unit, windows-unit, timing, e2e, swift]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for result in $RESULTS; do
+            case $result in
+              success | skipped) ;;
+              *) echo "a job Quality needs ended $result" >&2; exit 1 ;;
+            esac
+          done
+
+  # Decides whether the Console lane and the Windows unit job have work to do. A workflow-level
+  # `paths` filter would leave a required check pending forever on a PR it skips; a job skipped
+  # by `if` reports success instead. Pushes to main always run both.
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      console: ${{ steps.filter.outputs.console }}
+      windows: ${{ steps.filter.outputs.windows }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # A pull_request run checks out the merge commit; its first parent is the base.
+          fetch-depth: 2
+      - name: Files the console lane and the Windows unit job depend on
+        id: filter
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "console=true" >>"$GITHUB_OUTPUT"
+            echo "browsers=all" >>"$GITHUB_OUTPUT"
+            echo "windows=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The daemon and the CLI the console fixtures start reach almost all of src/, so any
+          # source file counts; so do the UI, the console specs, their helpers and the build
+          # config. Unit tests, docs, agent config and the other e2e files do not.
+          # --no-renames lists a moved file's old path too.
+          changed=$(git diff --name-only --no-renames HEAD^1 HEAD)
+          if printf '%s\n' "$changed" | grep -v -E '^(src|ui)/.*\.test\.tsx?$' | grep -q -E \
+            '^(src/|ui/|e2e/(console|fake-driver|helpers)/|playwright\.config\.ts$|package\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|turbo\.json$|tsconfig[^/]*\.json$|\.github/workflows/ci\.yml$)'; then
+            echo "console=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "console=false" >>"$GITHUB_OUTPUT"
+          fi
+          # The Windows shards run when the tests' result can differ on Windows: a change to
+          # the code and tests under src/, ui/ and packages/, to a script, workflow step or
+          # tool config the tests run, or to a root file that sets how they build, run and
+          # check out. A file the tests only read as text (docs, website pages, agent config,
+          # e2e sources, the other workflows) gets the same answer from the Linux unit job,
+          # which runs on every pull request.
+          if printf '%s\n' "$changed" | grep -q -E \
+            '^(src/|ui/|packages/|scripts/|\.agents/scripts/|package\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|turbo\.json$|tsconfig[^/]*\.json$|vitest[^/]*\.config\.ts$|lefthook\.yml$|\.gitattributes$|\.oxlintrc\.json$|\.dependency-cruiser[^/]*$|\.github/workflows/(ci|release)\.yml$)'; then
+            echo "windows=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "windows=false" >>"$GITHUB_OUTPUT"
+          fi
+
+  console-lane:
+    name: Console (${{ matrix.shard }}/2)
+    needs: changes
+    # Runs unless Changes said there is nothing to test, so a broken Changes job runs the lane.
+    if: ${{ !cancelled() && needs.changes.outputs.console != 'false' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    strategy:
+      # why: one red shard must not cancel the others, or their failures go unreported.
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Browser lane
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: pnpm test:console --project=chromium --shard="$SHARD/2"
+
+  # why: branch protection requires the check named Console, so this job stands for the sharded
+  # lane. `always()` makes it report a failure when a shard fails, where a job skipped by a failed
+  # need would count as passed; a lane skipped by Changes leaves it green.
+  console:
+    name: Console
+    needs: [changes, console-lane]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for result in $RESULTS; do
+            case $result in
+              success | skipped) ;;
+              *) echo "a job Console needs ended $result" >&2; exit 1 ;;
+            esac
+          done
+
+  fallow:
+    name: Fallow
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.8.1+sha512.f64ba907507f5ceafe06c8d38e6052d0179444580ec1279ddd5bfc11cb48aa8a2644b66598e07e761da84872a9fc57d5f902b87fa49d024198d558612aabbe45 --activate
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Fallow analysis
+        run: pnpm fallow --ci --format github-annotations
+
+  # why: checked on the PR's merge commit, so a PR whose bump main has already taken (two PRs
+  # moving 34 to 35) fails here although its own branch passes.
+  protocol-bump:
+    name: Protocol bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Contract shape and protocol range change together
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: node .agents/scripts/protocol-bump-check.mjs --base "origin/$BASE_REF"
+
+  # why: checked on the PR's whole range, so a surface change in one commit and its page in a
+  # later one pass together.
+  docs-surface:
+    name: Docs surface
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Public surface and website pages change together
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: node .agents/scripts/docs-surface-check.mjs --base "origin/$BASE_REF"

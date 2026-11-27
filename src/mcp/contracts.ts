@@ -1,0 +1,114 @@
+import { z } from "zod";
+
+import {
+  absentReasonSchema,
+  deviceStateSchema,
+  INPUT_ORIENTATIONS,
+  leaseRecordSchema,
+  leaseRequestFields,
+  OPERATIONS,
+  physicalClassSchema,
+  platformSchema,
+  refuseModelWithClass,
+} from "../contract/index.js";
+
+/**
+ * why: `lease.request`'s input, minus the fields this tool never lets the caller set (also `requires`, ADR 0026):
+ * `requesterId` (session-controlled -- see `main.ts`'s requester resolution, never
+ * caller-supplied, for the same reason the daemon never lets a request rename its own
+ * principal), `fleetRequestId` (a gateway's own mark on its dispatch to a worker, ADR 0021) and
+ * `metadata` (context for a gateway's admission command, ADR 0074 §3: not an agent session's need).
+ * `ttlMs` is no longer omitted: ADR 0004 accepts it on every request, so this tool
+ * inherits it from the contract like every other field -- `lease.defaultTtlMs` when the caller
+ * names none, `BAD_REQUEST` above `lease.maxTtlMs`. `mode` is the device mode, inherited the
+ * same way: `slim` or `full`, absent for the worker's default, anything else `BAD_REQUEST`.
+ * `imageTag` is inherited too, bounded by the contract. `model` and `class` are both optional and
+ * refused together (ADR 0015 §1) by the contract's own refinement when the request reaches
+ * `lease.request`, not here: a refined schema has no `.shape`, so the SDK would list the tool with
+ * no fields at all. A malformed `osVersion` is refused the same way, by the contract's own check
+ * when the request reaches `lease.request`: the MCP side adds no second check.
+ */
+export const leaseSimulatorInputSchema = leaseRequestFields.omit({
+  fleetRequestId: true,
+  metadata: true,
+  requesterId: true,
+  requires: true,
+  runId: true,
+});
+
+/**
+ * why: The tool's input with the contract's model-or-class check on top, for the handler to run
+ * before asking: the SDK lists and validates the plain object above, which is all it can read.
+ */
+export const leaseSimulatorCheckedInputSchema =
+  leaseSimulatorInputSchema.superRefine(refuseModelWithClass());
+
+/** `lease.request`'s output verbatim -- the device/lease/timing grant. */
+export const leaseSimulatorOutputSchema = OPERATIONS["lease.request"].output;
+
+export const listDevicesInputSchema = OPERATIONS["catalog.get"].input;
+
+const physicalDeviceSchema = z.object({
+  workerId: z.string().optional(),
+  platform: platformSchema,
+  model: z.string(),
+  osVersion: z.string(),
+  class: physicalClassSchema.optional(),
+  state: deviceStateSchema,
+  absentReason: absentReasonSchema.optional(),
+});
+
+export const listDevicesOutputSchema = OPERATIONS["catalog.get"].output.extend({
+  physicalDevices: z.array(physicalDeviceSchema),
+});
+
+export const releaseSimulatorInputSchema = OPERATIONS["lease.release"].input;
+export const releaseSimulatorOutputSchema = OPERATIONS["lease.release"].output.extend({
+  released: z.literal(true),
+});
+
+export const leaseStatusInputSchema = OPERATIONS["lease.list"].input;
+
+/**
+ * why: `lease.list` returns `{leases: LeaseRecord[]}`, filtered by the daemon to the owner
+ * principal only -- it can include leases this session never requested (see
+ * `McpSession#status`'s doc comment). `session.ts` narrows that array down to at most one
+ * entry -- the lease this session's own `lease()` call obtained, if any -- before this schema
+ * flattens it onto a `held` discriminant. `held` is this tool's own word for "the lease this
+ * session is renewing", not a daemon-side lease mode; there is only one kind of lease (ADR
+ * 0004). Flat and all-optional -- not a discriminated union -- because the MCP SDK validates
+ * `structuredContent` against `outputSchema` as a plain object shape.
+ */
+export const leaseStatusOutputSchema = leaseRecordSchema.partial().extend({ held: z.boolean() });
+
+export const runOnDeviceInputSchema = OPERATIONS["device.exec"].input.omit({
+  leaseId: true,
+  requesterId: true,
+  stdinFile: true,
+});
+
+export const runOnDeviceOutputSchema = z.object({
+  exitCode: z.number(),
+  stderr: z.string(),
+  stdout: z.string(),
+  truncated: z.boolean(),
+});
+
+export type LeaseSimulatorInput = z.infer<typeof leaseSimulatorInputSchema>;
+export type LeaseSimulatorOutput = z.infer<typeof leaseSimulatorOutputSchema>;
+export type ListDevicesInput = z.infer<typeof listDevicesInputSchema>;
+export type PhysicalDevice = ListDevicesOutput["physicalDevices"][number];
+export type ListDevicesOutput = z.infer<typeof listDevicesOutputSchema>;
+export type ReleaseSimulatorInput = z.infer<typeof releaseSimulatorInputSchema>;
+export type ReleaseSimulatorOutput = z.infer<typeof releaseSimulatorOutputSchema>;
+export type LeaseStatusOutput = z.infer<typeof leaseStatusOutputSchema>;
+export const rotateDeviceInputSchema = z.object({ orientation: z.string().min(1).max(64) });
+
+export const rotateDeviceOutputSchema = z.object({
+  leaseId: z.string(),
+  orientation: z.enum(INPUT_ORIENTATIONS),
+});
+
+export type RotateDeviceInput = z.infer<typeof rotateDeviceInputSchema>;
+export type RotateDeviceOutput = z.infer<typeof rotateDeviceOutputSchema>;
+export type RunOnDeviceInput = z.infer<typeof runOnDeviceInputSchema>;

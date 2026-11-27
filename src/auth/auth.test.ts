@@ -1,0 +1,374 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { OPERATIONS } from "../contract/index.js";
+import {
+  FakeClock,
+  FakeKeySetFetcher,
+  MemoryFilesystem,
+  NoopLogger,
+  type TokenSecrets,
+} from "../ports/index.js";
+import { AdminAuthenticationFailedError, AuthError, createAuth, type TokenRole } from "./index.js";
+import { tokensOwner } from "./token-store.js";
+import { authStrategies } from "./strategies/index.js";
+import type { AuthConfig, AuthStrategyDefinition, StrategyAnswer } from "./strategy.js";
+import { createAuthWith, openMemoryStateDatabase, proxyAuthConfig } from "./testing.js";
+
+const dataDirectory = "/home/agent/.simlock";
+const config: AuthConfig = { enabled: true, host: "127.0.0.1", port: 4700 };
+
+class FakeTokenSecrets implements TokenSecrets {
+  #next = 0;
+
+  generateSecret(): string {
+    this.#next += 1;
+    return `slk_generated-${this.#next}`;
+  }
+
+  hash(secret: string): string {
+    return `hash:${secret}`;
+  }
+}
+
+interface SeedToken {
+  readonly id: string;
+  readonly secret: string;
+  readonly role: TokenRole;
+  readonly label?: string;
+}
+
+const seeds: readonly SeedToken[] = [
+  { id: "tok_agent", secret: "slk_agent", role: "agent", label: "ci-runner" },
+  { id: "tok_bare", secret: "slk_bare", role: "agent" },
+  { id: "tok_operator", secret: "slk_operator", role: "operator", label: "ops" },
+  { id: "tok_worker", secret: "slk_worker", role: "worker", label: "mac-mini" },
+];
+
+async function options() {
+  const filesystem = new MemoryFilesystem();
+  const secrets = new FakeTokenSecrets();
+  await filesystem.mkdirp(dataDirectory);
+  const { database } = await openMemoryStateDatabase([tokensOwner]);
+  for (const { id, secret, role, label } of seeds) {
+    database
+      .prepare("INSERT INTO tokens (id, hash, role, label, created_at) VALUES (?, ?, ?, ?, ?)")
+      .run(id, secrets.hash(secret), role, label ?? null, 1);
+  }
+  return {
+    config,
+    database,
+    dataDirectory,
+    filesystem,
+    secrets,
+    idGenerator: { generate: () => "id" },
+    clock: new FakeClock(1_000),
+    logger: new NoopLogger(),
+    keySetFetcher: new FakeKeySetFetcher(),
+  };
+}
+
+function headers(authorization?: string): Headers {
+  return new Headers(authorization === undefined ? {} : { authorization });
+}
+
+describe("authenticateRequest with the token strategy", () => {
+  it.each([
+    { authorization: undefined, status: 401, message: "Missing bearer token" },
+    { authorization: "Basic x", status: 401, message: "Missing bearer token" },
+    { authorization: "Bearer ", status: 401, message: "Missing bearer token" },
+    { authorization: "bearer slk_agent", status: 401, message: "Missing bearer token" },
+    { authorization: "Bearer slk_unknown", status: 401, message: "Unknown bearer token" },
+    { authorization: "Bearer abc", status: 401, message: "Unknown bearer token" },
+    {
+      authorization: "Bearer slk_worker",
+      status: 403,
+      message: "A worker join token can only open an uplink, not call the HTTP API",
+    },
+  ])("answers $status $message for Authorization $authorization", async (row) => {
+    const auth = createAuth(await options());
+
+    const refusal = await auth.authenticateRequest(headers(row.authorization)).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(refusal).toBeInstanceOf(AuthError);
+    expect(refusal).toMatchObject({ status: row.status, message: row.message });
+    expect((refusal as AuthError).details).toBeUndefined();
+  });
+
+  it("trims the bearer value before reading it, as the HTTP check does today", async () => {
+    const auth = createAuth(await options());
+
+    await expect(auth.authenticateRequest(headers("Bearer   slk_agent  "))).resolves.toMatchObject({
+      principal: "tok_agent",
+    });
+    await expect(auth.authenticateRequest(headers("Bearer    "))).rejects.toMatchObject({
+      message: "Missing bearer token",
+    });
+  });
+
+  it("identifies a known slk_ token with its id as principal, its label as name, its role, via token, not ambient", async () => {
+    const auth = createAuth(await options());
+
+    await expect(auth.authenticateRequest(headers("Bearer slk_agent"))).resolves.toEqual({
+      principal: "tok_agent",
+      name: "ci-runner",
+      role: "agent",
+      via: "token",
+      ambient: false,
+    });
+    await expect(auth.authenticateRequest(headers("Bearer slk_bare"))).resolves.toMatchObject({
+      principal: "tok_bare",
+      name: "tok_bare",
+    });
+    await expect(auth.authenticateRequest(headers("Bearer slk_operator"))).resolves.toMatchObject({
+      principal: "tok_operator",
+      role: "operator",
+    });
+  });
+});
+
+describe("authenticateRequest over several strategies", () => {
+  const identity = {
+    principal: "p",
+    name: "n",
+    role: "agent",
+    via: "second",
+    ambient: false,
+  } as const;
+
+  function fake(
+    name: string,
+    answer: StrategyAnswer,
+    asked: string[],
+    enabled = true,
+  ): AuthStrategyDefinition {
+    return {
+      name,
+      enabled: () => enabled,
+      create: () => ({
+        authenticate: async () => {
+          asked.push(name);
+          return answer;
+        },
+      }),
+    };
+  }
+
+  it("lets the second strategy identify when the first answers not-mine", async () => {
+    const asked: string[] = [];
+    const auth = createAuthWith(
+      [
+        fake("first", { kind: "not-mine", sawCredential: false }, asked),
+        fake("second", { kind: "identified", identity }, asked),
+      ],
+      await options(),
+    );
+
+    await expect(auth.authenticateRequest(headers("Bearer x"))).resolves.toEqual(identity);
+    expect(asked).toEqual(["first", "second"]);
+  });
+
+  it("stops at a rejected answer, never asks the second, and uses its message and details", async () => {
+    const asked: string[] = [];
+    const auth = createAuthWith(
+      [
+        fake("first", { kind: "rejected", message: "Token expired", details: { at: 5 } }, asked),
+        fake("second", { kind: "identified", identity }, asked),
+      ],
+      await options(),
+    );
+
+    await expect(auth.authenticateRequest(headers("Bearer x"))).rejects.toMatchObject({
+      status: 401,
+      message: "Token expired",
+      details: { at: 5 },
+    });
+    expect(asked).toEqual(["first"]);
+  });
+
+  it("stops at a forbidden answer, never asks the second, and uses its message", async () => {
+    const asked: string[] = [];
+    const auth = createAuthWith(
+      [
+        fake("first", { kind: "forbidden", message: "No authority" }, asked),
+        fake("second", { kind: "identified", identity }, asked),
+      ],
+      await options(),
+    );
+
+    await expect(auth.authenticateRequest(headers("Bearer x"))).rejects.toMatchObject({
+      status: 403,
+      message: "No authority",
+    });
+    expect(asked).toEqual(["first"]);
+  });
+
+  it("never asks a definition whose enabled(config) is false", async () => {
+    const asked: string[] = [];
+    const auth = createAuthWith(
+      [
+        fake(
+          "first",
+          { kind: "identified", identity: { ...identity, via: "first" } },
+          asked,
+          false,
+        ),
+        fake("second", { kind: "identified", identity }, asked),
+      ],
+      await options(),
+    );
+
+    await expect(auth.authenticateRequest(headers("Bearer x"))).resolves.toEqual(identity);
+    expect(asked).toEqual(["second"]);
+  });
+});
+
+describe("the registry", () => {
+  it("has a contract schema under configSchema.http for every definition that owns a config key", () => {
+    const contractHttp = OPERATIONS["config.get"].output.shape.http.shape as Record<
+      string,
+      { safeParse(value: unknown): { success: boolean; data?: unknown } } | undefined
+    >;
+    const owning = authStrategies.flatMap((definition) =>
+      definition.config === undefined ? [] : [definition.config],
+    );
+
+    const samples: Record<string, readonly unknown[]> = {
+      proxyAuth: [
+        proxyAuthConfig,
+        { ...proxyAuthConfig, signOutUrl: "https://team.example/logout" },
+        { ...proxyAuthConfig, audience: undefined },
+        { ...proxyAuthConfig, issuer: 7 },
+        "x",
+      ],
+    };
+
+    expect(authStrategies.map((definition) => definition.name)).toEqual(["token", "proxy"]);
+    expect(owning.map(({ key }) => key)).toContain("proxyAuth");
+    for (const { key, schema, defaults } of owning) {
+      const mirrored = contractHttp[key];
+      expect(mirrored, key).toBeDefined();
+      if (defaults !== undefined) {
+        expect(mirrored?.safeParse(defaults)).toEqual(schema.safeParse(defaults));
+      }
+      for (const sample of samples[key] ?? []) {
+        expect(mirrored?.safeParse(sample).success, `${key} ${JSON.stringify(sample)}`).toBe(
+          schema.safeParse(sample).success,
+        );
+      }
+    }
+    expect(
+      owning.find(({ key }) => key === "proxyAuth")?.schema.safeParse(proxyAuthConfig).success,
+    ).toBe(true);
+  });
+});
+
+describe("resolveHelloRole", () => {
+  it("resolves agent with no credential, admin for an operator token and for the admin secret, and refuses anything else", async () => {
+    const opts = await options();
+    const auth = createAuth(opts);
+    await auth.adminSecret.persist();
+    const adminSecret = (await opts.filesystem.readFile(`${dataDirectory}/admin.token`)).trim();
+
+    await expect(auth.resolveHelloRole({})).resolves.toBe("agent");
+    await expect(auth.resolveHelloRole({ principal: "someone" })).resolves.toBe("agent");
+    await expect(auth.resolveHelloRole({ credential: "slk_operator" })).resolves.toBe("admin");
+    await expect(auth.resolveHelloRole({ credential: adminSecret })).resolves.toBe("admin");
+    await expect(auth.resolveHelloRole({ credential: "slk_agent" })).rejects.toThrow(
+      AdminAuthenticationFailedError,
+    );
+    await expect(auth.resolveHelloRole({ credential: "not-a-secret" })).rejects.toThrow(
+      AdminAuthenticationFailedError,
+    );
+  });
+
+  it("checks the token store before the admin secret, so a failing token read fails loudly even for the admin secret", async () => {
+    const opts = await options();
+    const auth = createAuth(opts);
+    await auth.adminSecret.persist();
+    const adminSecret = (await opts.filesystem.readFile(`${dataDirectory}/admin.token`)).trim();
+    const failure = new Error("database is locked");
+    vi.spyOn(opts.database, "prepare").mockImplementation(() => {
+      throw failure;
+    });
+
+    await expect(auth.resolveHelloRole({ credential: adminSecret })).rejects.toBe(failure);
+  });
+});
+
+describe("authenticateUplink", () => {
+  it("answers unauthenticated for none and unknown, forbidden for a token that is not a worker's, accept with the token id for a worker token", async () => {
+    const auth = createAuth(await options());
+
+    await expect(auth.authenticateUplink(undefined, "wrk_a")).resolves.toBe("unauthenticated");
+    await expect(auth.authenticateUplink("slk_unknown", "wrk_a")).resolves.toBe("unauthenticated");
+    await expect(auth.authenticateUplink("slk_operator", "wrk_a")).resolves.toBe("forbidden");
+    await expect(auth.authenticateUplink("slk_agent", "wrk_a")).resolves.toBe("forbidden");
+    await expect(auth.authenticateUplink("slk_worker", "wrk_a")).resolves.toEqual({
+      outcome: "accept",
+      tokenId: "tok_worker",
+    });
+  });
+
+  it("pins a worker token to the first worker id that joins with it: that id is accepted again, another or an empty one is worker-mismatch", async () => {
+    const auth = createAuth(await options());
+    const accepted = { outcome: "accept", tokenId: "tok_worker" };
+
+    await expect(auth.authenticateUplink("slk_worker", "")).resolves.toBe("worker-mismatch");
+    await expect(auth.authenticateUplink("slk_worker", undefined)).resolves.toBe("worker-mismatch");
+    await expect(auth.authenticateUplink("slk_worker", "wrk_a")).resolves.toEqual(accepted);
+    await expect(auth.authenticateUplink("slk_worker", "wrk_a")).resolves.toEqual(accepted);
+    await expect(auth.authenticateUplink("slk_worker", "wrk_b")).resolves.toBe("worker-mismatch");
+    expect((await auth.tokens.list()).find((token) => token.id === "tok_worker")?.workerId).toBe(
+      "wrk_a",
+    );
+  });
+
+  it("refuses a worker id outside [A-Za-z0-9_-]{1,128} as worker-mismatch before the token is pinned, and accepts a UUID", async () => {
+    const auth = createAuth(await options());
+    const uuid = "4b1e9c2a-6d3f-4a8e-9b2c-7f1d0e5a3c68";
+
+    for (const id of ["*", ".", "..", "a/b", "a b", "a".repeat(129)]) {
+      await expect(auth.authenticateUplink("slk_worker", id)).resolves.toBe("worker-mismatch");
+    }
+    expect((await auth.tokens.list()).find((token) => token.id === "tok_worker")?.workerId).toBe(
+      undefined,
+    );
+    await expect(auth.authenticateUplink("slk_worker", uuid)).resolves.toEqual({
+      outcome: "accept",
+      tokenId: "tok_worker",
+    });
+    await expect(
+      createAuth(await options()).authenticateUplink("slk_worker", "a".repeat(128)),
+    ).resolves.toEqual({ outcome: "accept", tokenId: "tok_worker" });
+  });
+
+  it("accepts exactly one of two first joins with one worker token at once, and refuses the other as worker-mismatch", async () => {
+    const auth = createAuth(await options());
+
+    const answers = await Promise.all([
+      auth.authenticateUplink("slk_worker", "wrk_a"),
+      auth.authenticateUplink("slk_worker", "wrk_b"),
+    ]);
+
+    expect(answers).toEqual([{ outcome: "accept", tokenId: "tok_worker" }, "worker-mismatch"]);
+  });
+
+  it("refuses a worker id another worker token is pinned to as worker-mismatch, until that token is revoked", async () => {
+    const auth = createAuth(await options());
+    const { record, secret } = await auth.tokens.create("worker", "replacement");
+    await expect(auth.authenticateUplink("slk_worker", "wrk_a")).resolves.toMatchObject({
+      outcome: "accept",
+    });
+
+    await expect(auth.authenticateUplink(secret, "wrk_a")).resolves.toBe("worker-mismatch");
+    await auth.tokens.revoke("tok_worker");
+
+    await expect(auth.authenticateUplink(secret, "wrk_a")).resolves.toEqual({
+      outcome: "accept",
+      tokenId: record.id,
+    });
+  });
+});

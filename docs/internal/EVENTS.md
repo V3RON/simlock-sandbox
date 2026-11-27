@@ -1,0 +1,295 @@
+# Events
+
+Catalog of business events carried on the daemon's event bus. Naming and
+authoring rules live in [agent-rules/events.md](agent-rules/events.md) —
+in short: `subject.past-tense-fact`, emitted post-commit, facts not commands.
+
+> Status: **planned catalog** — update the Status column as events are
+> implemented, and add new events here in the same change that introduces them.
+
+> **The event `id` is a one-time exception to additive-only** for the event
+> history, taken by [ADR 0014](adr/0014-an-event-has-one-id-minted-where-the-fact-happened.md)
+> the way ADR 0004's was: every envelope gains a required `id`, and a stored
+> event without one is not replayed. History from before the upgrade
+> is not shown.
+
+> **The payload removals in the lease rows are a deliberate exception to
+> events rule 6** ("treat payload shape as a public contract: additive
+> changes only"), granted by [ADR
+> 0004](adr/0004-ttl-first-leases-on-every-transport.md) in its Consequences:
+> `lease.granted` loses `mode` and `lease.released` loses the `closed` and
+> `orphaned` reasons, since neither concept exists any more — there is no
+> connection close to release on, and no startup sweep to orphan anything.
+> The ADR takes that exception once, while the package is 0.x; this note
+> records it here so the catalogue does not read as a silent rule violation.
+>
+> [ADR 0007](adr/0007-a-lease-request-chooses-the-device-mode.md) §13 takes
+> the same exception once more: `lease.requested` and `lease.rejected` carry
+> the request, and `device.provisioned` the spec, so `full` leaves those
+> payloads and `mode` enters (`requestSpec.mode`, `spec.mode`).
+>
+> [ADR 0015](adr/0015-a-lease-request-is-a-set-of-constraints.md) §9 takes
+> it a third time: `lease.requested` and `lease.rejected` carry the request
+> as it arrived, so `requestSpec.model` becomes optional (a request naming a
+> class or nothing has none) and `requestSpec.class` enters. Making a
+> required key optional is not additive. The exception covers
+> `request.dispatched` too, which names the same request: `model` becomes
+> optional and `class` enters, for the same reason.
+>
+> [ADR 0021](adr/0021-a-gateway-dispatch-is-a-probe-and-names-its-fleet-request.md)
+> narrows ADR 0014 §6's "a worker's own events ... show what they always
+> showed": a worker's events for a gateway's dispatch (a probe) carry
+> `fleetRequestId`, and a refused probe is `lease.declined`, not
+> `lease.rejected`. Its events for local requests are unchanged.
+
+## Lease lifecycle
+
+| Event | Payload (key fields) | Emitted when | Emitter | Status |
+|---|---|---|---|---|
+| `lease.requested` | request id, request spec (platform, `model` only when the request named one, `class` when it named one -- a request naming neither carries neither, ADR 0015 §9, os version -- an exact version or an OS range as typed, ADR 0015 §2, device `mode` as the request named it -- absent when it named none, since the worker's default is applied after this event, ADR 0007 §2; `imageTag` when the request named one, #214, additive; `physical: true` when the request asked for an enrolled physical device, ADR 0022, additive; `baseline`, the name, when the request named one, #1207, additive; `except`, the list as the request named it, when it named one, ADR 0066 §1, additive), requester, wait policy, `fleetRequestId` on a worker's event for a gateway's dispatch (a probe; ADR 0021 §3, additive, events rule 6) | a lease request is accepted by the daemon and stored; the request id is the stored request's, so an observer can match this event to it (#72 added the id; additive, events rule 6) | LeaseAcquisitionCoordinator (worker) / FleetLeaseCoordinator (gateway, ADR 0005 §11 — its own fleet queue's admission, before any worker is chosen) | implemented |
+| `lease.queued` | request id, queue position (counted in the request's own line, ADR 0022 §3: a physical request waits apart from simulator and emulator requests) | no capacity; request entered the wait queue | LeaseAcquisitionCoordinator (worker) / FleetLeaseCoordinator (gateway) | implemented |
+| `lease.granted` | lease id, device id, requester, request id, source (`warm`/`booted`/`provisioned`, ADR 0016 §2: the kind of the plan that granted it -- an eviction never grants by itself, so the plan made after it decides; a physical grant is `warm`, ADR 0022 §3; a ready warm device shut down and booted again for a request with `except` is `booted`, because the requester waited for a boot, ADR 0066 §2), `fleetRequestId` when the grant served a probe (ADR 0021 §3, additive), the device's `platform` (`ios` or `android`), `baseline: { name, version }` when the device is a copy of a baseline (#1207, additive) | a device was assigned and handed out | LeaseLifecycle | implemented (payload per ADR 0004 pending) |
+| `lease.renewed` | lease id, new deadline | a `lease.renew` succeeded — whether it came from `simlock lease renew`, `POST /v1/leases/{id}/renew`, or the renew timer a running `simlock lease` / MCP session keeps over its own lease. There is one renew path and this is it | LeaseLifecycle | implemented (payload per ADR 0004 pending) |
+| `lease.released` | lease id, device id, reason (explicit/killed/device-lost), owner id | an explicit `lease.release` (which is what a `simlock lease` holder does on its way out, and what `lease.release-run` does to each lease of a run), (killed) an operator `release --all` or `nuke`, or (device-lost) a leased device could not be recovered after it stopped running outside simlock, or a daemon start found its device not running, or (device-lost, ADR 0022 §7) a physical device was not present for the grace period (`health.stableObservations` reads in a row, `health.probeIntervalMs` apart; emitted by the `PhysicalDeviceWatcher` through `LeaseReleaseCoordinator.endForAbsentDevice`; the device becomes `absent` in the same write and nothing is wiped), and the device of that lease was wiped and returned to the pool, left waiting in `reclaiming` on a platform the daemon could not list, or marked missing. Closing a connection is not a release and never emits this | LeaseLifecycle | implemented (payload per ADR 0004 pending) |
+| `lease.expired` | lease id, device id, owner id | the lease's deadline passed with no `lease.renew` behind it — the grant-time TTL, or the TTL of the last renew, simply ran out. This is the one way a lease ends without somebody asking, and the only bound on a holder that was killed outright | LeaseLifecycle | implemented (payload per ADR 0004 pending) |
+| `lease.rejected` | request id, requester (both required on every reason, additive, ADR 0016 §2), request spec (as on `lease.requested`, so `baseline` when the request named one, #1207; `full` replaced by `mode`, ADR 0007 §13; `model` optional and `class` added, ADR 0015 §9; `osVersion` may be a range as typed, ADR 0015 §2), reason (timeout/no-wait/unresolvable-spec/no-worker/already-leased/lease-id-taken/lease-ended/admission-denied/admission-failed/boot-timeout/killed/updating/cancelled/daemon-restarted/worker-failed), `code` and `worker` on `worker-failed` (ADR 0021 §4, additive; `worker`, never `workerId`, which marks a relayed event, ADR 0014 §6) | a request ended without a grant. A worker emits it only for its local requests; a probe ends in `lease.declined` there (ADR 0021 §2). A gateway emits it for every ending that is not a grant (ADR 0021 §4): its own reasons, `unresolvable-spec` for the last cannot-serve refusal whether or not the request had queued, and `worker-failed` for any other failure on the worker it went to -- a terminal refusal, a failure after progress, `WORKER_UNREACHABLE`, `INTERNAL`, a dispatch timeout, a worker's own `REQUESTER_ALREADY_LEASED` or `LEASE_ID_TAKEN` -- with `code` the error code the caller got and `worker` the worker. A worker's `PROVISION_FAILED` before it pushed progress is not among them (after progress it is a failure after progress, relayed as it is): the gateway walks on to the next worker, and only when every worker that could take the request has failed so does it end `worker-failed` with code `PROVISION_FAILED` and the last worker (#637). `dispose()` emits nothing, so a request still open when a gateway stops has no ending event (ADR 0021 §5 plans for usage to close those at the next `daemon.started`; not built yet). `already-leased` means the requester already has a waiting request on the same platform, or holds `lease.maxPerRequester` leases in scope (ADR 0023): the requester's leases of the request's platform when the limit is per platform, all of its leases when it is a number, where the leases it waits for count too; a worker skips the held-lease count for a probe, so it declines a probe `already-leased` only for a waiting one on its platform. A request refused at admission (`killed`, `updating`, `already-leased`, `lease-id-taken`, `lease-ended`, `admission-denied`, `admission-failed`) was never stored and has no `lease.requested` (except a gateway's `lease-id-taken` after a grant, below); it carries the id minted for it before the check, the one the stored request would have had; on a gateway (ADR 0009 §4, §8) `no-worker` is rows 1 and 5 of the fast-fail table (`NO_CAPACITY`: no worker takes requests, or none that does can serve it) and `unresolvable-spec` rows 2 to 4 (`NO_DRIVER`, `UNKNOWN_MODEL`, `RUNTIME_MISSING`) and `CAPABILITY_MISSING` (a request whose `requires` no connected worker able to serve it meets with every name `available`, run on the table a second time on the capable views; ADR 0026, narrows ADR 0009), emitted in the dispatch walk before the request is queued, so a request rejected on arrival emits no `lease.queued`, and a waiting one is rejected when the views change (additive, events rule 6). A request a worker refused with one of those codes or with `CAPABILITY_MISSING` (ADR 0009 §5, ADR 0026) and the table later ends with that stored refusal gets a gateway `unresolvable-spec`, whether or not it had entered the gateway queue (the worker only declined it, ADR 0021 §4); `daemon-restarted` is a request still waiting when the daemon stopped, settled as failed when it starts again (#72; widens a published vocabulary, which events rule 6 allows as additive). The reason list can grow: a consumer must tolerate a reason it does not know; `cancelled` is an explicit cancel of a waiter, either a single-request cancel (`cancelPending` on the leasing module, backing `DELETE /v1/lease-requests/{id}`) or a run's cleanup (`lease.release-run`, which cancels every waiting request of the run it may release) of a waiter not yet dispatched (queued, or admitted and not yet walked on a gateway, #1492) -- one with device work already in flight is reported `not-cancellable` instead, the same envelope the queue timeout already uses; a physical waiter has no device work, only a presence read, so it is cancelled in any state | LeaseAcquisitionCoordinator / WaitQueue / LeaseStartup (worker) / FleetLeaseCoordinator (gateway) | implemented |
+| `lease.declined` | `{ requestId, fleetRequestId, requester, requestSpec, reason }` -- `reason` takes `lease.rejected`'s values; `requestSpec` (with `baseline` when the request named one, #1207) is there for the same reason as on `lease.rejected`: a decline at admission has no `lease.requested` (ADR 0021 §2) | a worker refused or failed a probe, a `lease.request` carrying `fleetRequestId` (ADR 0021 §1), whatever the reason (`no-wait`, `unresolvable-spec`, `already-leased`, `lease-id-taken`, `lease-ended`, `boot-timeout`, `killed`, `daemon-restarted` at the next start) and however far the work got. The gateway owns the outcome of a probe, so the worker never rejects one and never queues one: where it would queue (a second failed provision) it declines and answers `PROVISION_FAILED`. The event depends only on the request being a probe, never on whether the gateway will retry. A local request is rejected exactly as before | LeaseAcquisitionCoordinator / WaitQueue / LeaseStartup (worker) | implemented |
+
+On a **gateway**, `lease.requested`, `lease.queued` and `lease.rejected` are its own fleet queue's facts (ADR 0005 §11/§14),
+emitted by `FleetLeaseCoordinator` and never by the worker whose device is
+eventually granted — `lease.granted`/`renewed`/`released`/`expired` for a fleet
+lease arrive already relayed from the owning worker (see "Fleet (gateway
+mode)" below), so a gateway never emits those four itself. Every request a gateway ends while it runs has one ending of its own (ADR 0021 §4): `request.granted`, or `lease.rejected`. `already-leased`
+on a gateway is the fleet-wide one-lease-per-requester check (§14, keyed on
+`requesterId`), answered from the gateway's own lease index before any
+worker is ever contacted. `lease-id-taken` (ADR 0020; widens a published vocabulary, which events rule 6 allows as additive) is a `leaseId` an active lease or a waiting request already holds; on a gateway it is the gateway's own leases and requests, checked the same way, and a worker's own refusal of it is that worker's `lease.declined` and, on the gateway, a `lease.rejected` with reason `worker-failed` and code `LEASE_ID_TAKEN` (ADR 0021 §4). `lease-ended` (ADR 0074 §4; additive) is a `leaseId` whose lease ended within `lease.endedIdRetentionMs`, checked after `lease-id-taken` with no `lease.requested`; a worker refuses its own leases' ids, a gateway the ends its workers reported (a worker's own refusal on a dispatch is `worker-failed` with code `LEASE_ENDED`). `admission-denied` and `admission-failed` (ADR 0074 §1; additive) are a gateway's: its admission command refused the request with a reason, or could not decide and the gateway failed closed. They are emitted after the checks run again under the lock, with no `lease.requested`; a request cancelled while the command runs is `cancelled`. A gateway also emits `lease-id-taken` when a grant arrives for a bare id its index already routes to another worker: the new worker's lease is released and the request ends with it.
+
+## Capacity and queue
+
+| Event | Payload (key fields) | Emitted when | Emitter | Status |
+|---|---|---|---|---|
+| `capacity.changed` | per platform (`ios`, `android`) and `global`: running, max running, reserved, warm; `ramBudget` (used bytes, limit bytes) only under the `resource` capacity strategy | a worker's capacity figures differ from the last ones emitted: after a registry commit, or after a provisioning or boot reservation is taken or released. Emitted once when the daemon has started, so every run begins with a step; two consecutive events never carry equal figures. The figures are the ones `simlock status` reports | CapacityObserver (worker) | implemented |
+| `queue.changed` | depth, `physical: true` when the physical line changed (ADR 0022 §3, additive, events rule 6) | the number of requests waiting in a queue changed: a request joined it or left it. A queue has two lines; `depth` is the changed line's, and the event without `physical` is the virtual line's. Emitted once when the daemon has started. A worker emits it for its own queue and a gateway for its fleet queue; a worker's events a gateway relays carry `workerId`, and the gateway's own do not | WaitQueue (worker) / FleetLeaseCoordinator (gateway) | implemented |
+| `warm-pool.target-missed` | `{ platform, model, osVersion?, mode, origin, count, ready, reason }` — `origin` is always `configured`: the event is for the `warmPool.targets` entries, never for a kind the pool learned, and `count` is the configured count (ADR 0038 §8); `osVersion` is the resolved one, or the configured one for a target that did not resolve, and absent when it names none and did not resolve; `reason` is the one reason the pool records for the target (`warm-pool/policy.ts` for one that resolved, `warm-pool/converger.ts` for one the resolver refused), the one `short` carries in `status.get` (the one reason `simlock status` shows as the target's `short`, but never `disabled`, since a pool that is off reports no target: `no-driver`, `runtime-missing`, `unknown-model`, `mode-unavailable`, `unresolvable`, `boot-failed`, `device-limit`, `running-limit`, `reserve`, `ram-budget` or `memory-pressure`) | a warm pool target went short: after a pass the pool could do nothing for a target that has fewer ready devices than its count, and it was not already missed (ADR 0017 §7). Emitted once the pass's actions have run (events rule 3), once per report on that edge (targets that resolve to one spec are one report and emit one event between them, with their counts added; each target the resolver refuses emits its own), not on each short pass after, nor when a retry or a boot fills it and it is short again; the edge is kept per configured target, and only ready devices reaching its count end the miss, so a target met in between and missed again emits again. A target that is filling, held by `warmPool.maxConcurrentBoots` or waiting behind a queued request the pool could not serve is not short | WarmPool (worker) | implemented |
+
+## Device lifecycle
+
+| Event | Payload (key fields) | Emitted when | Emitter | Status |
+|---|---|---|---|---|
+| `device.provisioned` | device id, spec (`physical: false`, always, ADR 0022 §1: a physical device never emits this event, additive; `mode: "slim"` for a device planned slim, absent for a full one -- the one place the planned mode is visible, ADR 0007 §9; `imageTag` for a device whose request named one, #214, additive; `baseline: { name, version }` for a copy of a baseline, #1207, additive), driver, duration | driver `provision` committed to registry | Registry | implemented |
+| `device.ready` | device id, boot duration, the device's `platform` (`ios` or `android`) | readiness probe passed (on iOS simulators, boot completion and a successful installer probe) | Registry | implemented |
+| `device.reclaimed` | device id, strategy (erase/snapshot/wipe/uninstall, ADR 0022 §4), duration, `missingApps` for a physical device (enrollment-list apps no longer installed: reported, not reinstalled; additive) | fresh-state reclaim of a physical device finished. Never emitted for a virtual device: every simulator and emulator is deleted when its lease ends (`device.deleted`, initiator `lease-end`), whatever `lease.identity` says (ADR 0061 §2) | Registry | implemented |
+| `device.purge-failed` | device id, lease id, attempted strategy (erase/snapshot/wipe/delete/uninstall), duration, stable error summary | release-time purge failed (including the deferred wipe a daemon start runs in the background, ADR 0019 §2; a physical device read not present emits nothing and becomes `absent`), or (strategy `delete`, #75) the shutdown or delete that ends a `fresh` device's lease failed; the device enters `quarantined` (see below) rather than rejoining the pool. `delete` widens a published vocabulary (events rule 6 allows additive changes): a consumer must tolerate a strategy it does not know | ReclaimCoordinator (strategy `delete`: ReclaimCoordinator's spent-device path) | implemented |
+| `device.quarantined` | device id, max retries, next retry deadline, platform, cause kind (`purge-failed`, `shutdown-failed`, `delete-failed` or `stalled`), stalled state (`stalled` only), message (the other three, at most 300 characters) | a device committed to `quarantined` — present in the registry, still counted as running when it is a virtual device, not eligible for a grant. Fires immediately after `device.purge-failed` for a release-time purge or delete failure (`reclaiming`/`shutdown → quarantined`), or on its own for a stalled-transition timeout (see `device.stalled-transition-detected`), for a returned physical device whose reclaim failed while it was present (ADR 0022 §8: there is no lease for `device.purge-failed` to name), or for a shut-down device whose boot for a waiter failed and whose destroy failed too (#403: `shutdown → quarantined`, the lease engine handing it over lease-less; cause `delete-failed`) | QuarantineCoordinator | implemented |
+| `device.quarantine-recovered` | device id, attempts, reclaim strategy (erase/snapshot/wipe/uninstall), `missingApps` for a physical device (additive), the device's `platform` (`ios` or `android`) | a quarantined device's retried purge succeeded; it returned to `ready`/`shutdown` and rejoined the warm pool. Never emitted for a spent `fresh` device (`mayBeGranted` false): its retry is a delete, and a successful one emits `device.deleted` with initiator `lease-end` (`lease-engine` for a device that never served a lease) | QuarantineCoordinator | implemented |
+| `device.quarantine-abandoned` | device id, attempts, the device's `platform` (`ios` or `android`) | a quarantined device exhausted its configured retry budget (`warmPool.quarantine.maxRetries`) — purge retries, or delete retries for a spent `fresh` device — and was destroyed, or, for a physical device, unenrolled: Simlock never destroys one (safety rule 2, ADR 0022 §4) | QuarantineCoordinator | implemented |
+| `device.quarantine-stranded` | device id, attempts, stable error summary, the device's `platform` (`ios` or `android`) | a quarantined device exhausted its retry budget (purge or delete retries) and the destroy that should have retired it also failed; it stays `quarantined` with no further retry until an operator intervenes | QuarantineCoordinator | implemented |
+| `device.shutdown` | device id, initiator (rule/command; `daemon-stop` when a stopping daemon shut down an idle device, #1056; `warm-pool` when the warm pool shut an idle device down, over the running limit, with `warmPool.enabled: false`, to keep `warmPool.reserveRunning` running slots free, or because a ready device that never served a lease and that no `warmPool.targets` entry and no kind the pool learned from a lease keeps has been idle past `idle.shutdownAfterMs`, or to displace it: an idle device shut down so a newer learned kind, or a configured target, can boot into its slot; `lease-engine` when a ready warm device failed the reboot a lease with `except` asked of it, ADR 0066 §2; `virtual-devices-off` when startup shut down an idle device of a platform whose `<platform>.virtualDevices` is false, ADR 0084 §2) | device stopped, still on disk | Registry; ReclaimCoordinator for interrupted reclaim recovery | implemented |
+| `device.deleted` | device id, initiator (`lease-end` when a `fresh` device's lease ended and its delete completed — from ReclaimCoordinator, at startup convergence, or retried from quarantine; #75. `doctor` when `doctor --fix` marked a missing device, or startup's lease reconciler found a leased device absent from a platform it could read and ended the lease in the same write, ADR 0019 §2. `operator` when `device remove` unenrolled a physical device, ADR 0022 §2. `quarantine` when a physical device's quarantine retries ran out and it was unenrolled, ADR 0022 §4; `lease-engine` when a device that failed to boot for a lease was destroyed in cleanup, or when quarantine's delete retry removed a device that never served a lease; `cleanup-reaper` when the cleanup reaper destroyed a device; `nuke` when `nuke` destroyed it; `baseline-save` when `baseline save` kept a copy of the device and deleted it; `baseline-remove` when `baseline remove` deleted an idle device made from the baseline; `baseline-replaced` when a newer baseline version replaced the one an idle device was made from and the device was deleted; `virtual-devices-off` when startup deleted an idle device of a platform whose `<platform>.virtualDevices` is false, ADR 0084 §2), physical (the record's own flag: `true` for an enrolled physical device, `false` for a simulator or emulator; additive, events rule 6) | device removed from the registry, and from disk for a virtual device; a physical device is only forgotten and nothing is sent to it | Registry | implemented |
+| `device.enrolled` | device id, platform, driver device id (the canonical ID), model, OS version, class (phone/tablet), app count, reenrolled, initiator (`operator` or `auto`) | an admin's `device add`, or the worker's auto-enroller under `devices.autoEnroll` (ADR 0073), wrote a physical device `ready` (ADR 0022 §2). `reenrolled` is `true` when the device already had a `ready`, `quarantined` or `absent` record, which kept its registry ID and took a fresh read of model, OS version, class and apps | Registry | implemented |
+| `device.absence-detected` | device id, previous state (ready/leased/reclaiming), absent reason (locked/untrusted/not-present) | an enrolled physical device became `absent` (ADR 0022 §2, §7, §8): the `PhysicalDeviceWatcher` read it not present `health.stableObservations` times in a row (a leased device's lease ends first, `lease.released` device-lost, in the same write), or `ReclaimCoordinator` found it not present after a failed reclaim (`reclaiming → absent`, no `device.purge-failed`, no `device.quarantined`). Emitted after the commit | Registry (the watcher's writes, the reclaim's failure path) | implemented |
+| `device.returned` | device id, OS version | the watcher read an `absent` physical device present, and the return reclaim it started committed `absent → reclaiming` with the OS version the read reports (ADR 0022 §7). Emitted after that commit; the reclaim then emits `device.reclaimed` | Registry (written by `ReclaimCoordinator`'s return reclaim) | implemented |
+| `device.foreign-state-detected` | device id, platform, expected (running/stopped), observed (running/stopped) | doctor reconcile found a managed device's observed boot state disagreeing with the committed registry state | Doctor | implemented |
+| `device.foreign-provenance-detected` | device id, platform, detail (erased/mark-mismatch/durable-mark-missing) | doctor reconcile found a managed device's provenance marks no longer proving Simlock owns it | Doctor | implemented |
+| `device.stalled-transition-detected` | device id, platform, state (provisioning/reclaiming), age, threshold | doctor reconcile found a `provisioning`/`reclaiming` device whose time in that state exceeds a driver-derived threshold (`stalledTransition.thresholdMultiplier` over `Driver.estimate`, floored at `stalledTransition.minimumThresholdMs`) — the driver call meant to resolve the transition never did | Doctor | implemented |
+| `device.crash-detected` | device id, lease id, platform, observed | a leased device was observed `stopped` for `health.stableObservations` consecutive ticks | LeaseHealthMonitor | implemented |
+| `device.recovered` | device id, lease id, attempts, duration, the device's `platform` (`ios` or `android`) | a crashed leased device was rebooted under its existing lease and passed readiness | LeaseHealthMonitor | implemented |
+| `device.recovery-failed` | device id, lease id, attempts, reason, error, the device's `platform` (`ios` or `android`) | recovery could not restore a leased device (absent from driver reality, provenance drift, or attempts exhausted) and its lease was released | LeaseHealthMonitor | implemented |
+| `device.orphan-purged` | driver device id, platform, device root | `simlock doctor --purge-orphans` destroyed a device that sat inside a validly-marked Simlock device root with no registry record — see [ADR 0001](adr/0001-simlock-owned-device-roots.md) | Doctor | implemented |
+| `device.slimmed` | device id, address, platform (ios), categories, label count, duration, signature, unknown labels | *after* the boot's readback (`launchctl print-disabled system`) shows every managed label as written, and the overrides file write succeeded or was already as wanted (ADR 0060) | driver-diagnostics | implemented |
+
+`device.slimmed` reports a fact committed to the *simulator's own launchd database*, not to the
+Simlock registry (ADR 0002, `docs/internal/adr/0002-opt-in-slim-ios-simulators.md`) -- so events rule 3 ("emit post-commit
+only") is satisfied by waiting for that commit to become observable, not by waiting on a registry
+write: the driver writes the launchd overrides file while the simulator is shut down, boots it once, and only fires
+`onSlimmed` once the readback shows the overrides in force. The registry's own `device.ready` for that same boot is a separate,
+later event, emitted through the normal readiness path once the driver call returns. A boot with a lease's except list (ADR 0066) reports `categories` as the smaller list (the worker's slim set minus the excepted categories), `signature` as that list's signature and `labelCount` as the labels written `true`, so a kept label that a slimmed category also lists is not counted and a worker's `ios.slim.exclude` name is (ADR 0083); a boot that writes no label `true` is granted `full` and emits none. A slim
+request on a runtime older than iOS 18.5 is resolved to a full spec before planning (ADR 0007
+§4), so it never reaches a slim boot. A *skipped* slim on a slim-spec device -- its runtime id
+didn't parse, the overrides file could not be written, or the readback disagreed or failed -- is deliberately not an event: it isn't a fact worth putting in front of every event-bus
+consumer, just operator diagnostics, so it's a `warn` log line (`daemon.driver-discovery`) instead.
+
+## Components
+
+| Event | Payload (key fields) | Emitted when | Emitter | Status |
+|---|---|---|---|---|
+| `component.install-started` | platform, component id (the string the install was asked for: an iOS runtime version, `latest`, or a bare major; an Android API level), requester id (of the request that started the install, when known: a lease request's requester, or the principal that ran `component install`) | once per install, after the free-disk check passed and disk was set aside, just before `xcodebuild -downloadPlatform` / `sdkmanager --install` runs | component-installer | implemented |
+| `component.installed` | platform, component id, version (the exact version now installed), already present (`true` when the installer ran and found the component already there), duration, requester id | once per install, when the installer finished **and** a fresh read confirmed the component — never on a bare exit 0 | component-installer | implemented |
+| `component.install-failed` | platform, component id, duration, stable error summary, requester id | once per install, when it failed: the installer failed (a license retry included), it ran out of `downloads.timeoutMs`, the daemon stopped, the installer exited 0 but a fresh read could not confirm the component, or the component installed but its record could not be stored | component-installer | implemented |
+| `component.removed` | platform, component id (the version the removal was asked for), version (the exact version removed), size in bytes (when it could be read), residue (when something stayed on disk: what, and how to reclaim it), requester id (the admin principal that ran `component remove`) | once per removal, after the platform's own removal (`simctl runtime delete` / `sdkmanager --uninstall`) finished, a fresh read confirmed the component is gone, and Simlock's record of installing it was deleted — never for a dry run or a refused removal | component-installer | implemented |
+
+## Baselines
+
+| Event | Payload (key fields) | Emitted when | Emitter | Status |
+|---|---|---|---|---|
+| `baseline.saved` | name, version, platform, model, OS version, mode, image tag (when the device has one), size in bytes (when it could be counted), lease id (the lease the save ended), requester id (the admin principal that ran `baseline save`) | once per save, after the `baselines` row is committed and before the saved device is deleted | BaselineService | implemented |
+| `baseline.removed` | name, version, reason (`operator` for `baseline remove`, `nuke` for `nuke --delete-devices`, `replaced` when a newer save of the name dropped it), requester id (the principal that ran the command; absent for a removal nobody asked for) | once per version deleted, after its row is deleted | BaselineService | implemented |
+| `baseline.stale` | name, version, reason (the driver's words: the runtime, image or emulator that changed, or an iOS baseline saved without a lineage record) | when a check finds a baseline stale that had no stale reason before (again after it was fresh in between). The check runs at start, after `component.removed`, after a save, and before `baseline list` and `doctor` answer | BaselineService | implemented |
+
+`BaselineService` (`src/core/baselines.ts`) is the only emitter; drivers keep and destroy the sources but never emit (architecture rule 5).
+
+`ComponentInstaller` (`src/core/component-installer.ts`) is the only emitter (ADR 0010 §3):
+drivers install but never emit (architecture rule 5). The events fire once per install, not
+once per request that joined it, and only for an install that reached the driver -- a call
+that ends as `already-installed` from `findComponent`, as not needed, or refused by the disk
+reservation (`InsufficientDiskSpaceError`) emits nothing. `component.installed` is emitted after
+the component record is committed to the registry (events rule 3); with `alreadyPresent: true`
+nothing was recorded (ADR 0010 §5). `requesterId` is the requester whose call started the
+install. [flows/device-selection.md](flows/device-selection.md) shows how a missing
+component gets to this point. The requester hears the install through its own `downloading`
+progress stage, a direct call chain from the installer, not these events (architecture rule 5).
+
+`component.removed` has the same single emitter (ADR 0010 §8). `ComponentInstaller.remove`
+emits it after the driver's `removeComponent` returned and the component record was deleted
+from the registry (events rule 3); a dry run, a refusal (`COMPONENT_NOT_OWNED`,
+`COMPONENT_IN_USE`, `COMPONENT_BUSY`) and a driver failure emit nothing, and a failure keeps the
+record. `requesterId` is the admin session's principal, never a caller-supplied id (safety rule
+6). `residue` is the driver's text, carried unread: on iOS it names the never-used default-set
+simulators the removal left unavailable and the asset-store download `simctl runtime delete`
+left behind (#79), each when there is one.
+
+## Seeds
+
+| Event | Payload (key fields) | Emitted when | Emitter | Status |
+|---|---|---|---|---|
+| `seed.settle-started` | platform, model, OS version, image tag (when the seed has one), source id (the quick seed being settled), leases (the plain leases copied from it), trigger (`background` or `operator`) | once per settle, after the settler holds its creation reservation and component claim and as it calls the driver's `settleSeed`; never for a seed an operator asked for that is settled already, and never for the make `simlock seed` runs first | SeedSettler | implemented |
+| `seed.settle-ended` | platform, model, OS version, image tag (when the seed has one), source id (the quick seed), outcome (`settled`, `cap` when the copy never went idle within 15 minutes and was saved anyway, `failed`, `aborted`), reason (only on `aborted`: `memory-pressure`, `daemon-stopping` or `nuke`), message (only on `failed`: the driver's, at most 500 characters), new source id and size in bytes (only on `settled` and `cap`), duration in milliseconds | once per `seed.settle-started`, after the driver returned or threw, and so after its swap of the settled seed for the quick one is committed | SeedSettler | implemented |
+
+`SeedSettler` (`src/core/seed-settle/`) is the only emitter; drivers settle but never emit (architecture rule 5). An aborted settle keeps its quick seed and is chosen again later (ADR 0090 §2).
+
+## System
+
+| Event | Payload (key fields) | Emitted when | Emitter | Status |
+|---|---|---|---|---|
+| `daemon.started` | version, config snapshot (`gateway.token`, when set, reads `[redacted]`: the payload reaches the ring and `history.db`, which are not a token's place the way `config.json` is (`config.get` also reads `[redacted]` unless asked with `showSecrets`, #1097); masked rather than dropped so the keys stay the same, #170) | daemon finished startup + reconcile | DaemonServer | implemented |
+| `daemon.stopping` | reason | graceful shutdown began (reason `signal` when the process got SIGTERM, ADR 0041 §4) | DaemonServer | implemented |
+| `daemon.update-started` | from, to, forced | an update began: `daemon.update` resolved the version and entered `waiting` or `installing` (ADR 0042 §11); `forced` is whether it was asked with `force` at the start | UpdateCoordinator | implemented |
+| `daemon.update-failed` | stage (`installing` or `restarting`), from, to, message (at most 2000 characters) | an update ended without a new daemon: the updater reported a failed line or exited non-zero while this daemon runs (it serves again), or a rolled back update's result file was read at start (ADR 0042 §7, §8) | UpdateCoordinator | implemented |
+| `disk.pressure-detected` | free bytes, threshold | free disk crossed under the configured threshold (edge-triggered: once per crossing, not once per tick while it persists) | CleanupReaper | implemented |
+| `memory.pressure-changed` | from, to (`none`, `warming-paused`, `new-devices-paused`), cause (the new step's reading: trigger `level` or `floor`, availablePercent, level on macOS, floorPercent for a floor trigger; absent to `none`) | a worker's memory pressure step changed: once per change, never per reading; no usable reading drops the step at once (ADR 0068 §5) | MemoryPressureTracker | implemented |
+| `cleanup.executed` | rule name, action, target, reason | cleanup executor committed a proposed action | CleanupExecutor | implemented |
+| `doctor.reconciled` | drift findings | daemon reconciliation completed | Doctor | implemented |
+| `driver.root-rejected` | platform, root path, reason (not-absolute/missing-marker/invalid-marker/wrong-instance/symlink/wrong-owner/wrong-permissions/non-empty-unowned-root/unreadable/invalid-device-set/device-set-changed) | a driver's device root failed ownership validation at startup, or (iOS) `drivers.ios.deviceSet` was not `simlock` or `default`, conflicted with `drivers.ios.deviceRoot` or with `ios.simulator.headless: false`, or was switched with simulators left in the set being given up (ADR 0048; `root` is then the configured value or the set holding them), so that platform's driver did not start | DaemonServer | implemented |
+| `driver.adb-server-rejected` | port, reason (occupied/start-failed/invalid-port) | Simlock's own adb server could not be established — the port was occupied by a server it does not own, the server it started never began listening, or the configured port is not usable — so the Android driver did not start | DaemonServer | implemented |
+
+## Fleet (gateway mode)
+
+These are the facts a daemon running as a **gateway** emits about the fleet
+connected to it ([ADR 0005](adr/0005-gateway-and-worker-modes.md)). A worker
+never emits them — it has no workers or fleet queue of its own — and a
+gateway emits none of the device-lifecycle facts above on its own behalf,
+because it owns no devices.
+
+| Event | Payload (key fields) | Emitted when | Emitter | Status |
+|---|---|---|---|---|
+| `worker.connected` | worker id, label, worker's daemon version | a worker's uplink opened and its `hello` completed, so the gateway can drive it. A worker whose `hello` found no overlapping protocol range emits nothing: it is in the registry as `incompatible`, which is where an operator finds it | WorkerRegistry | implemented |
+| `worker.rejected` | reason (`unauthenticated`/`forbidden`/`worker-mismatch`), worker id, label, occasionally a count | an uplink was turned away at the door, before any session existed: `unauthenticated` (`401`) for a missing or unrecognized join token — a revoked or mistyped one lands here — `forbidden` (`403`) for a real token whose role is not `worker`, and `worker-mismatch` (`403`) for a join token pinned to another worker id, a worker id another token is pinned to, or a claimed id outside `[A-Za-z0-9_-]{1,128}` (empty included; refused before any pin) (a token is pinned to the first worker id that joins with it; `token revoke` frees both). Version skew is deliberately not one of these: that uplink authenticated, so the worker enters the registry as `incompatible` and emits nothing (see the note below the table). A refused peer proves no identity, so `workerId` and `label` are only what the connection claimed and may be absent. `count`, present only above one, is how many identical (reason, claimed id) refusals the *previous* coalescing window absorbed — `GatewayService` computes it before calling into the registry, so a flood of refused dials collapses to one event per window rather than one per attempt, since the ring buffer they land in is bounded by count, not bytes | WorkerRegistry | implemented |
+| `worker.disconnected` | worker id, label, lease count | a worker's uplink closed. `leaseCount` is what its view still shows it holding — how much is stranded, and why the view is kept rather than dropped, not ended: the gateway never guesses a lease is gone before the worker says so | WorkerRegistry | implemented |
+| `worker.removed` | worker id, label, reason (operator/retention) | a disconnected worker's view was forgotten: by `simlock worker remove`, or because every gateway-issued lease on it had expired and `gateway.disconnectedRetentionMs` elapsed. Never emitted for a connected worker (`WORKER_CONNECTED` refuses that) | WorkerRegistry | implemented |
+| `worker.drain-started` | worker id, label | `simlock worker drain` flagged a worker: it keeps its leases and receives no new dispatches | WorkerRegistry | implemented |
+| `worker.drain-ended` | worker id, label | `simlock worker undrain` cleared that flag. Nothing else ends a drain: the flag lives in the gateway's persisted worker registry, so it survives both a worker reconnect and a gateway restart | WorkerRegistry | implemented |
+| `request.dispatched` | `{ requestId, workerId, requesterId, platform, model?, class?, mode?, physical?, reason, stage, queuedMs }` — `model` is the exact model the request named and `class` the class it named; a request names at most one, and one naming neither carries neither (ADR 0015 §9); `mode` is the device mode the request named, `slim` or `full`, and absent when it named none (ADR 0009 §8); `physical` is `true` when the request asked for a physical device and absent otherwise; `reason` is the routing policy's own `warm-hit`/`free-capacity` distinction (ADR 0005 §13): `warm-hit` when the deciding stage is `warm-hit`, `free-capacity` otherwise; a physical pick is `warm-hit` with stage `warm-hit`, matching `lease.granted.source` `warm` (ADR 0022 §9); `stage` names the routing stage that decided (ADR 0009 §1, §8); `queuedMs` how long the request sat queued before this dispatch | the gateway's fleet queue sent a queued request to a worker with `noWait: true`, and the worker took it — the grant itself, or its first `progress` push, whichever arrives first (ADR 0005 §11: device work having started means the request is that worker's now). An immediate `NO_CAPACITY` is a stale view, not a dispatch, and emits nothing — the request stays queued, and that worker is not sent it again until its reported state changes (ADR 0009 §5); a `noWait` request fails with `NO_CAPACITY` instead, unless another worker takes it at once | FleetLeaseCoordinator | implemented |
+| `request.granted` | `{ requestId, worker, leaseId, workerLeaseId }` -- `leaseId` is the gateway lease id and `workerLeaseId` the worker's; `worker`, never `workerId`, because `payload.workerId` marks a relayed event (ADR 0014 §6) | the gateway handed a fleet request's grant to its caller (ADR 0021 §4): after the lease index accepted it, and only if the waiter was still open. A grant given back for ADR 0020's mismatched id, one the lease index refused (the request ends in `lease-id-taken`), and one that lands after the waiter was settled (timeout, cancel, or the gateway stopping) emit nothing. A worker's push of this name is refused by the worker link (it is in `GATEWAY_OWN_EVENTS` with the six `worker.*` events and `request.dispatched`) | FleetLeaseCoordinator | implemented |
+
+Drain and undrain are idempotent, and an event is a fact about a *change*:
+draining an already-drained worker succeeds and emits nothing.
+
+`worker.rejected` exists because the alternative is silence (ADR 0005 §22): a
+worker whose credential is refused produces no `worker.connected`, and
+without this fact an operator staring at `simlock worker list` sees a machine
+that simply never appears, with nothing anywhere to say why. It is
+deliberately *not* a `worker.disconnected` with another reason — nothing
+connected, so nothing disconnected, and a fact whose subject never existed
+should not borrow the vocabulary of one that did.
+
+**A protocol mismatch is neither of those.** That uplink presented a valid
+join token and authenticated; what failed was `hello`'s range negotiation. So
+the worker *does* enter the registry, with `state: "incompatible"` and both
+ranges on its view, visible in `simlock worker list` — which is the whole
+point, since that is the machine an operator has to go and upgrade. It is
+simply never dispatched to, and no `worker.connected` follows, because
+nothing usable connected. That is also why `incompatible` is not one of
+`worker.disconnected`'s reasons: an incompatible worker was never a connected
+worker to lose.
+
+**A relayed event keeps the worker's `id` and `timestamp`** (ADR 0014 §2, §5,
+§6). A gateway republishes a worker's business events through the bus's
+`republish`, whose only caller is the worker link: it mints `seq` and nothing
+else, so one fact has one `id` in the worker's history, the gateway's, both
+rings and both streams, and the two can be joined by it.
+`payload.workerId` is the only mark of a relay; nothing is added to the
+envelope. A relayed line's time is when the fact happened on the worker, so a
+worker's clock skew shows in the gateway's order, and `--since` on the gateway
+filters by that time. `simlock events`, `events.replay`, `GET /v1/events` and
+the console's buffer present a replay by `timestamp`, then `seq`;
+`simlock events --follow` prints live pushes, and the pushes buffered during its
+replay, in arrival order, so a relayed event from a worker whose clock is behind
+prints after a later gateway event. A worker's `id` and
+`timestamp` are claims, bounded by the push schema before the relay sees them: the
+`id` by its pattern, the `timestamp` to the range a JavaScript date holds
+(|t| <= 8.64e15 ms), so no value the console cannot render as a date reaches the
+gateway's bus or history.
+
+**`device.exec` emits no event, and that is deliberate.** It is the one
+operation here with no fact of its own. Running a command against a device is
+not a state change simlock owns — the lease that authorizes it already
+emitted `lease.granted`, the device's own state is untouched, and a fleet
+where every `adb shell input tap` produced a bus event would push everything
+else out of a 1000-entry ring buffer within minutes. An audit trail of what
+agents ran on their devices is a different feature with different retention
+needs, not a line in this catalogue.
+
+**A screen stream emits no event either** (ADR 0031). Watching a device's
+screen changes no lease and no device, the same as `device.exec`, and a viewer
+toggling the console's Screen pane would fill the ring buffer with nothing
+behind it. The daemon log records each stream opened and each one refused.
+
+**Every worker's own business events are republished on the gateway's bus**
+with `workerId` added to the payload, under their original names and with
+their original emitting module — the fact happened in that worker's lease
+engine or reaper, and rewriting either would make the audit trail lie about
+where. That is what makes `simlock events` and `simlock events --follow`
+against a gateway a fleet-wide view (`lease.granted`, `device.ready`,
+`cleanup.executed`, and the rest, each naming the machine it happened on),
+and it is the one place a payload documented above arrives with an extra
+field: additive, and only ever on a gateway. The eight events in this
+section's own table are the gateway's own, and carry no `workerId` beyond
+the worker they are about.
+
+Relayed events are written to the gateway's own event history
+(`history.db`) along with its own, so `simlock events --since` against a
+gateway reaches back across a gateway restart. Two consequences of relaying
+rather than owning: the gateway's history only holds what arrived while its
+uplinks were up (a worker's events from before it connected are not
+backfilled), and a worker's own
+`simlock events` keeps showing exactly what it always did, un-prefixed and
+unaware that anything is watching.
+
+A relayed `lease.expired`/`lease.released`/`device.crash-detected`/
+`device.recovered` names the *worker's own* lease id in its payload, not the
+gateway's — `GatewayOwnerRoutedFacts` (the gateway's `OwnerRoutedFacts`) is
+what resolves the gateway's own lease id, and the `ownerId` to route the
+corresponding `lease-lost`/`device-unhealthy`/`device-recovered` push by,
+from the fleet lease index rather than the relayed payload directly. The
+payload's own `ownerId` is correct for a worker's own local lease (the
+worker never had a reason to touch it), but for a gateway-issued one it is
+whatever that worker echoed back of what the gateway forwarded when it
+granted the lease (ADR §27a) — round-tripped through a machine this gateway
+does not control, not a value it minted itself, so it is resolved from the
+index (which recorded the real answer at grant time) rather than trusted
+verbatim off the wire.
+
+## Conventions recap
+
+- Every event carries: `id` (`evt_` and a unique suffix; it names the event for
+  good and survives a daemon restart), `seq`, `timestamp`, `event`, `payload`,
+  emitting module.
+- The `id` arrived with protocol 10. Events recorded before that upgrade have
+  none and are not shown by `simlock events --since`.
+- Events are appended to an in-memory ring buffer, which `simlock events`
+  without `--since` replays, and to the event history `~/.simlock/history.db`, a SQLite file with one
+  row per event holding the same fields. It survives daemon restarts and
+  crashes, is what `simlock events --since` reads, and is the durable record:
+  no event is copied into `daemon.log`. It is kept for `eventLog.retention` (seven days), and the stored size of its events is bounded by
+  `eventLog.maxBytes`. An `events.jsonl` left by an earlier version is left
+  untouched and never read. See ADR 0006 and ADR 0016.

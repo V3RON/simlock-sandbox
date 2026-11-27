@@ -1,0 +1,587 @@
+import { describe, expect, it } from "vitest";
+
+import { waitFor, withDaemon, withHttpDaemon } from "./helpers/index.js";
+import type { TestEnv } from "./helpers/env.js";
+
+interface RequestResource {
+  readonly id: string;
+  readonly state: string;
+  readonly createdAt: string;
+  readonly lease?: LeasePayload;
+  readonly error?: { readonly code: string; readonly message: string };
+}
+
+interface LeasePayload {
+  readonly id: string;
+  readonly requestId?: string;
+  readonly platform: string;
+  readonly device: string;
+  readonly os: string;
+  readonly udid: string;
+  readonly deviceId: string;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+  readonly ttlMs: number;
+  readonly dataPlane: null;
+}
+
+describe("HTTP API", () => {
+  it("token create -> healthz -> catalog -> lease-request -> granted -> renew -> release, with auth enforced throughout", async () => {
+    const { env, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { enabled: true, host: "127.0.0.1", port } },
+    }));
+    await env.driverScript.set({
+      ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] },
+    });
+
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    // why: 1. Mint an agent token via the CLI: `token create` is a daemon operation, so this
+    //    round-trips to the daemon started above -- the token lands in the state.db that
+    //    daemon owns, which is what this test's later calls authenticate against.
+    const tokenResult = await env.cli(["token", "create", "--role", "agent"]);
+    expect(tokenResult.code).toBe(0);
+    const { secret } = tokenResult.json as { secret: string };
+    const agentAuth = { authorization: `Bearer ${secret}` };
+
+    // why: 2. The gateway is started only after the daemon's own startup convergence
+    //    finishes (see the comment in src/daemon/worker-composition.ts), strictly after the unix
+    //    socket already answers `daemon start` -- so the first HTTP call must tolerate
+    //    a connection refused for a brief window rather than assume the port is live
+    //    the instant `withDaemon()` returns.
+    await waitFor(
+      async () => {
+        try {
+          const response = await fetch(`${baseUrl}/v1/healthz`);
+          return response.ok;
+        } catch {
+          return false;
+        }
+      },
+      { label: "HTTP gateway accepting connections" },
+    );
+    const healthz = await fetch(`${baseUrl}/v1/healthz`);
+    expect(healthz.status).toBe(200);
+    expect(await healthz.json()).toEqual({ ok: true });
+
+    const catalogNoAuth = await fetch(`${baseUrl}/v1/catalog`);
+    expect(catalogNoAuth.status).toBe(401);
+    expect(((await catalogNoAuth.json()) as { error: { code: string } }).error.code).toBe(
+      "UNAUTHENTICATED",
+    );
+
+    const catalogWrongToken = await fetch(`${baseUrl}/v1/catalog`, {
+      headers: { authorization: "Bearer slk_not-a-real-token" },
+    });
+    expect(catalogWrongToken.status).toBe(401);
+    expect(((await catalogWrongToken.json()) as { error: { code: string } }).error.code).toBe(
+      "UNAUTHENTICATED",
+    );
+
+    const catalog = await fetch(`${baseUrl}/v1/catalog`, { headers: agentAuth });
+    expect(catalog.status).toBe(200);
+    expect(await catalog.json()).toMatchObject({
+      platforms: expect.arrayContaining([
+        expect.objectContaining({ platform: "ios", models: ["iPhone 16"], defaultRuntime: "18.4" }),
+      ]),
+    });
+
+    // why: 4. An admin-only route rejects an agent token with 403, not 401 -- the token
+    //    is valid, it just doesn't carry the role this route requires. `GET /v1/devices`
+    //    dispatches `list.get`, which the contract declares `role: "admin"` (ADR 0003 §3);
+    //    `GET /v1/leases` dispatches `lease.list`, which is `role: "agent"` and so is not a
+    //    usable 403 fixture any more.
+    const operatorRouteAsAgent = await fetch(`${baseUrl}/v1/devices`, { headers: agentAuth });
+    expect(operatorRouteAsAgent.status).toBe(403);
+    expect(((await operatorRouteAsAgent.json()) as { error: { code: string } }).error.code).toBe(
+      "FORBIDDEN",
+    );
+
+    const created = await fetch(`${baseUrl}/v1/lease-requests`, {
+      method: "POST",
+      headers: { ...agentAuth, "content-type": "application/json" },
+      body: JSON.stringify({ platform: "ios", device: "iPhone 16", os: "18.4" }),
+    });
+    expect(created.status).toBe(201);
+    expect(created.headers.get("location")).toMatch(/^\/v1\/lease-requests\/req_/);
+    const createdBody = (await created.json()) as { request: RequestResource };
+    const requestId = createdBody.request.id;
+
+    let polled = createdBody.request;
+    while (
+      polled.state !== "granted" &&
+      polled.state !== "failed" &&
+      polled.state !== "cancelled"
+    ) {
+      const response = await fetch(`${baseUrl}/v1/lease-requests/${requestId}?wait=10`, {
+        headers: agentAuth,
+      });
+      expect(response.status).toBe(200);
+      polled = ((await response.json()) as { request: RequestResource }).request;
+    }
+    expect(polled.state, `lease request ${requestId} did not reach granted`).toBe("granted");
+    const lease = polled.lease as LeasePayload;
+    expect(lease).toMatchObject({
+      platform: "ios",
+      device: "iPhone 16",
+      os: "18.4",
+      requestId,
+      dataPlane: null,
+    });
+
+    const secondRequest = await fetch(`${baseUrl}/v1/lease-requests`, {
+      method: "POST",
+      headers: { ...agentAuth, "content-type": "application/json" },
+      body: JSON.stringify({ platform: "ios", device: "iPhone 16", os: "18.4" }),
+    });
+    expect(secondRequest.status).toBe(409);
+    const secondRequestError = (await secondRequest.json()) as {
+      error: { code: string; existingLeaseId?: string };
+    };
+    expect(secondRequestError.error.code).toBe("REQUESTER_ALREADY_LEASED");
+    expect(secondRequestError.error.existingLeaseId).toBe(lease.id);
+
+    const refetched = await fetch(`${baseUrl}/v1/leases/${lease.id}`, { headers: agentAuth });
+    expect(refetched.status).toBe(200);
+    expect(((await refetched.json()) as { lease: LeasePayload }).lease.id).toBe(lease.id);
+
+    const renewed = await fetch(`${baseUrl}/v1/leases/${lease.id}/renew`, {
+      method: "POST",
+      headers: { ...agentAuth, "content-type": "application/json" },
+      body: JSON.stringify({ ttlMs: 120_000 }),
+    });
+    expect(renewed.status).toBe(200);
+    const renewedBody = (await renewed.json()) as {
+      leaseId: string;
+      expiresAt: string;
+      notices: unknown[];
+    };
+    expect(renewedBody).toMatchObject({ leaseId: lease.id, notices: [] });
+    expect(renewedBody.expiresAt).not.toBe(lease.expiresAt);
+
+    const released = await fetch(`${baseUrl}/v1/leases/${lease.id}`, {
+      method: "DELETE",
+      headers: agentAuth,
+    });
+    expect(released.status).toBe(202);
+    expect(await released.json()).toMatchObject({ released: true, device: { id: lease.deviceId } });
+
+    const afterRelease = await fetch(`${baseUrl}/v1/leases/${lease.id}`, { headers: agentAuth });
+    expect(afterRelease.status).toBe(404);
+  });
+
+  it("refuses a ttlMs above lease.maxTtlMs on both routes, whatever shape the request takes", async () => {
+    // why: ADR 0004 §4: over the cap is `400 BAD_REQUEST`, never a silent
+    // clamp and never a `201` that fails later on the request resource.
+    const { env, port } = await withHttpDaemon((port) => ({
+      configOverrides: {
+        http: { enabled: true, host: "127.0.0.1", port },
+        lease: { defaultTtlMs: 60_000, maxTtlMs: 120_000 },
+      },
+    }));
+    await env.driverScript.set({
+      ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] },
+    });
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    const token = await env.cli(["token", "create", "--role", "agent"]);
+    expect(token.code).toBe(0);
+    const agentAuth = {
+      authorization: `Bearer ${(token.json as { secret: string }).secret}`,
+    };
+    const postJson = (path: string, body: unknown): Promise<Response> =>
+      fetch(`${baseUrl}${path}`, {
+        method: "POST",
+        headers: { ...agentAuth, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    const overCap = await postJson("/v1/lease-requests", {
+      platform: "ios",
+      device: "iPhone 16",
+      os: "18.4",
+      ttlMs: 120_001,
+    });
+    expect(overCap.status).toBe(400);
+    expect((await overCap.json()) as { error: { code: string } }).toMatchObject({
+      error: { code: "BAD_REQUEST" },
+    });
+
+    // why: The same request with `allowDownload: true`, which settles its own `201` synchronously
+    // rather than waiting on the dispatch -- the case that used to slip past the cap and fail
+    // later on the request resource instead.
+    const overCapWithDownload = await postJson("/v1/lease-requests", {
+      platform: "ios",
+      device: "iPhone 16",
+      os: "18.4",
+      allowDownload: true,
+      ttlMs: 120_001,
+    });
+    expect(overCapWithDownload.status).toBe(400);
+    expect((await overCapWithDownload.json()) as { error: { code: string } }).toMatchObject({
+      error: { code: "BAD_REQUEST" },
+    });
+
+    expect((await env.cli(["list", "--leases"])).json).toEqual([]);
+
+    const granted = await postJson("/v1/lease-requests", {
+      platform: "ios",
+      device: "iPhone 16",
+      os: "18.4",
+      ttlMs: 120_000,
+    });
+    expect(granted.status).toBe(201);
+    const requestId = ((await granted.json()) as { request: { id: string } }).request.id;
+    let lease: LeasePayload | undefined;
+    await waitFor(
+      async () => {
+        const response = await fetch(`${baseUrl}/v1/lease-requests/${requestId}?wait=10`, {
+          headers: agentAuth,
+        });
+        const body = (await response.json()) as {
+          request: { state: string; lease?: LeasePayload };
+        };
+        lease = body.request.lease;
+        return body.request.state === "granted";
+      },
+      { timeout: 30_000, label: "the at-cap request is granted" },
+    );
+    expect(lease?.ttlMs).toBe(120_000);
+
+    const renewOverCap = await postJson(`/v1/leases/${lease?.id ?? ""}/renew`, { ttlMs: 120_001 });
+    expect(renewOverCap.status).toBe(400);
+    expect((await renewOverCap.json()) as { error: { code: string } }).toMatchObject({
+      error: { code: "BAD_REQUEST" },
+    });
+
+    const renewed = await fetch(`${baseUrl}/v1/leases/${lease?.id ?? ""}/renew`, {
+      method: "POST",
+      headers: agentAuth,
+    });
+    expect(renewed.status).toBe(200);
+    expect((await env.cli(["list", "--leases"])).json).toEqual([
+      expect.objectContaining({ id: lease?.id, ttlMs: 120_000 }),
+    ]);
+
+    await env.cli(["release", lease?.id ?? ""]);
+  });
+
+  it("POST /v1/lease-requests refuses a malformed os range as BAD_REQUEST naming the accepted forms", async () => {
+    const { env, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { enabled: true, host: "127.0.0.1", port } },
+      driverScript: { ios: { availableOsVersions: ["18.4"], knownModels: ["iPhone 16"] } },
+    }));
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const { secret } = (await env.cli(["token", "create", "--role", "agent"])).json as {
+      secret: string;
+    };
+    await waitFor(
+      async () => {
+        try {
+          return (await fetch(`${baseUrl}/v1/healthz`)).ok;
+        } catch {
+          return false;
+        }
+      },
+      { label: "HTTP gateway accepting connections" },
+    );
+
+    const response = await fetch(`${baseUrl}/v1/lease-requests`, {
+      body: JSON.stringify({ device: "iPhone 16", os: "^18", platform: "ios" }),
+      headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" },
+      method: "POST",
+    });
+
+    expect(response.status).toBe(400);
+    const { error } = (await response.json()) as { error: { code: string; message: string } };
+    expect(error.code).toBe("BAD_REQUEST");
+    expect(error.message).toContain("18 - 26");
+  });
+
+  it("POST /v1/lease-requests takes a class, or only a platform, and refuses a device beside a class", async () => {
+    const { env, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { enabled: true, host: "127.0.0.1", port } },
+      driverScript: {
+        ios: {
+          availableOsVersions: ["18.4"],
+          defaultModels: { phone: ["iPhone 16"] },
+          knownModels: ["iPhone 16"],
+          modelClasses: { "iPhone 16": "phone" },
+        },
+      },
+    }));
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const tokenResult = await env.cli(["token", "create", "--role", "agent"]);
+    const { secret } = tokenResult.json as { secret: string };
+    const headers = { authorization: `Bearer ${secret}`, "content-type": "application/json" };
+    await waitFor(
+      async () => {
+        try {
+          return (await fetch(`${baseUrl}/v1/healthz`)).ok;
+        } catch {
+          return false;
+        }
+      },
+      { label: "HTTP gateway accepting connections" },
+    );
+
+    const both = await fetch(`${baseUrl}/v1/lease-requests`, {
+      body: JSON.stringify({ class: "phone", device: "iPhone 16", platform: "ios" }),
+      headers,
+      method: "POST",
+    });
+    expect(both.status).toBe(400);
+    expect(((await both.json()) as { error: { code: string } }).error.code).toBe("BAD_REQUEST");
+
+    const asClass = await fetch(`${baseUrl}/v1/lease-requests`, {
+      body: JSON.stringify({ class: "phone", platform: "ios" }),
+      headers,
+      method: "POST",
+    });
+    expect(asClass.status).toBe(201);
+    const classRequest = ((await asClass.json()) as { request: RequestResource }).request;
+    let classPolled = classRequest;
+    while (classPolled.state !== "granted" && classPolled.state !== "failed") {
+      const response = await fetch(`${baseUrl}/v1/lease-requests/${classRequest.id}?wait=10`, {
+        headers,
+      });
+      classPolled = ((await response.json()) as { request: RequestResource }).request;
+    }
+    expect(classPolled.state).toBe("granted");
+    expect(classPolled.lease).toMatchObject({ device: "iPhone 16", platform: "ios" });
+    await env.cli(["release", classPolled.lease?.id ?? ""]);
+
+    const created = await fetch(`${baseUrl}/v1/lease-requests`, {
+      body: JSON.stringify({ platform: "ios" }),
+      headers,
+      method: "POST",
+    });
+    expect(created.status).toBe(201);
+    const { request } = (await created.json()) as { request: RequestResource };
+    let polled = request;
+    while (polled.state !== "granted" && polled.state !== "failed") {
+      const response = await fetch(`${baseUrl}/v1/lease-requests/${request.id}?wait=10`, {
+        headers,
+      });
+      polled = ((await response.json()) as { request: RequestResource }).request;
+    }
+    expect(polled.state).toBe("granted");
+    expect(polled.lease).toMatchObject({ device: "iPhone 16", os: "18.4", platform: "ios" });
+  });
+
+  it("POST /v1/lease-requests with leaseId grants a lease with exactly that ID, and renew and release name it", async () => {
+    const { env, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { enabled: true, host: "127.0.0.1", port } },
+      driverScript: { ios: { availableOsVersions: ["18.4"], knownModels: ["iPhone 16"] } },
+    }));
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const { secret } = (await env.cli(["token", "create", "--role", "agent"])).json as {
+      secret: string;
+    };
+    const headers = { authorization: `Bearer ${secret}`, "content-type": "application/json" };
+    await waitFor(
+      async () => {
+        try {
+          return (await fetch(`${baseUrl}/v1/healthz`)).ok;
+        } catch {
+          return false;
+        }
+      },
+      { label: "HTTP gateway accepting connections" },
+    );
+
+    const created = await fetch(`${baseUrl}/v1/lease-requests`, {
+      body: JSON.stringify({ device: "iPhone 16", leaseId: "ad-7f3a_01", platform: "ios" }),
+      headers,
+      method: "POST",
+    });
+    expect(created.status).toBe(201);
+    let polled = ((await created.json()) as { request: RequestResource }).request;
+    while (polled.state !== "granted" && polled.state !== "failed") {
+      const response = await fetch(`${baseUrl}/v1/lease-requests/${polled.id}?wait=10`, {
+        headers,
+      });
+      polled = ((await response.json()) as { request: RequestResource }).request;
+    }
+    expect(polled.state).toBe("granted");
+    expect(polled.lease?.id).toBe("ad-7f3a_01");
+
+    const renewed = await fetch(`${baseUrl}/v1/leases/ad-7f3a_01/renew`, {
+      headers,
+      method: "POST",
+    });
+    expect(renewed.status).toBe(200);
+    expect(((await renewed.json()) as { leaseId: string }).leaseId).toBe("ad-7f3a_01");
+
+    const released = await fetch(`${baseUrl}/v1/leases/ad-7f3a_01`, { headers, method: "DELETE" });
+    expect(released.status).toBe(202);
+  });
+
+  it("POST /v1/lease-requests answers 400 BAD_REQUEST for each leaseId the pattern rejects, and 201 for a 64-character one", async () => {
+    const { env, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { enabled: true, host: "127.0.0.1", port } },
+      driverScript: { ios: { availableOsVersions: ["18.4"], knownModels: ["iPhone 16"] } },
+    }));
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const { secret } = (await env.cli(["token", "create", "--role", "agent"])).json as {
+      secret: string;
+    };
+    const headers = { authorization: `Bearer ${secret}`, "content-type": "application/json" };
+    await waitFor(
+      async () => {
+        try {
+          return (await fetch(`${baseUrl}/v1/healthz`)).ok;
+        } catch {
+          return false;
+        }
+      },
+      { label: "HTTP gateway accepting connections" },
+    );
+
+    for (const leaseId of ["", "a".repeat(65), "w1.myid", "my id", "-s", "--help", "_x", "ząb"]) {
+      const response = await fetch(`${baseUrl}/v1/lease-requests`, {
+        body: JSON.stringify({ device: "iPhone 16", leaseId, platform: "ios" }),
+        headers,
+        method: "POST",
+      });
+      expect(response.status, `leaseId ${JSON.stringify(leaseId)}`).toBe(400);
+      expect(
+        ((await response.json()) as { error: { code: string } }).error.code,
+        `leaseId ${JSON.stringify(leaseId)}`,
+      ).toBe("BAD_REQUEST");
+    }
+
+    const longest = await fetch(`${baseUrl}/v1/lease-requests`, {
+      body: JSON.stringify({ device: "iPhone 16", leaseId: "a".repeat(64), platform: "ios" }),
+      headers,
+      method: "POST",
+    });
+    expect(longest.status).toBe(201);
+  });
+
+  it("POST /v1/lease-requests answers 409 LEASE_ID_TAKEN, naming the ID, for an ID an active lease holds", async () => {
+    const { env, port } = await withHttpDaemon((port) => ({
+      configOverrides: { http: { enabled: true, host: "127.0.0.1", port } },
+      driverScript: { ios: { availableOsVersions: ["18.4"], knownModels: ["iPhone 16"] } },
+    }));
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const tokens: string[] = [];
+    for (const _ of [0, 1]) {
+      const result = await env.cli(["token", "create", "--role", "agent"]);
+      tokens.push(`Bearer ${(result.json as { secret: string }).secret}`);
+    }
+    await waitFor(
+      async () => {
+        try {
+          return (await fetch(`${baseUrl}/v1/healthz`)).ok;
+        } catch {
+          return false;
+        }
+      },
+      { label: "HTTP gateway accepting connections" },
+    );
+    const post = (authorization: string) =>
+      fetch(`${baseUrl}/v1/lease-requests`, {
+        body: JSON.stringify({ device: "iPhone 16", leaseId: "ad-7f3a", platform: "ios" }),
+        headers: { authorization, "content-type": "application/json" },
+        method: "POST",
+      });
+
+    const first = await post(tokens[0] ?? "");
+    expect(first.status).toBe(201);
+    // why: The 201 comes with the first progress push; wait for the grant so an active lease holds the ID.
+    const firstId = ((await first.json()) as { request: { id: string } }).request.id;
+    await waitFor(
+      async () => {
+        const response = await fetch(`${baseUrl}/v1/lease-requests/${firstId}?wait=10`, {
+          headers: { authorization: tokens[0] ?? "" },
+        });
+        const body = (await response.json()) as { request: { state: string } };
+        return body.request.state === "granted";
+      },
+      { timeout: 30_000, label: "the first request is granted" },
+    );
+    const second = await post(tokens[1] ?? "");
+    expect(second.status).toBe(409);
+    expect(await second.json()).toMatchObject({
+      error: { code: "LEASE_ID_TAKEN", leaseId: "ad-7f3a" },
+    });
+  });
+
+  describe("GET /v1/stats", () => {
+    const LEASE = ["lease", "--platform", "ios", "--device", "iPhone 16", "--os", "18.4"] as const;
+
+    async function runScript(env: TestEnv): Promise<{ from: string; to: string }> {
+      const from = new Date(Date.now() - 2_000).toISOString();
+      const leased = await env.cli([...LEASE, "--agent-id", "agent-a", "--detach"], {
+        timeout: 60_000,
+      });
+      expect(leased.code).toBe(0);
+      expect(
+        (await env.cli(["release", (leased.json as { lease: { id: string } }).lease.id])).code,
+      ).toBe(0);
+      return { from, to: new Date().toISOString() };
+    }
+
+    async function expectRouteAgreesWithCli(env: TestEnv, port: number) {
+      const operator = (await env.cli(["token", "create", "--role", "operator"])).json as {
+        secret: string;
+      };
+      const agent = (await env.cli(["token", "create", "--role", "agent"])).json as {
+        secret: string;
+      };
+      const { from, to } = await runScript(env);
+      const base = `http://127.0.0.1:${port}/v1/stats?from=${from}&to=${to}`;
+      const operatorAuth = { authorization: `Bearer ${operator.secret}` };
+
+      const route = await fetch(base, { headers: operatorAuth });
+      const withLedger = await fetch(`${base}&ledger=1`, { headers: operatorAuth });
+      const asAgent = await fetch(base, { headers: { authorization: `Bearer ${agent.secret}` } });
+      const cli = await env.cli(["stats", "--from", from, "--to", to, "--json"]);
+
+      expect(route.status).toBe(200);
+      const body = (await route.json()) as { totals: { requests: number } };
+      expect(body).toEqual(cli.json);
+      expect(body).not.toHaveProperty("requests");
+      expect(withLedger.status).toBe(200);
+      const ledgered = (await withLedger.json()) as { requests: { requestId: string }[] };
+      expect(ledgered.requests).toHaveLength(body.totals.requests);
+      expect(asAgent.status).toBe(403);
+    }
+
+    it("with an operator token returns the same body as simlock stats --json for a fixed from/to, without requests, and &ledger=1 adds them, on a single host; an agent token gets 403", async () => {
+      const { env, port } = await withHttpDaemon((port) => ({
+        configOverrides: { http: { enabled: true, host: "127.0.0.1", port } },
+        driverScript: { ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] } },
+      }));
+
+      await expectRouteAgreesWithCli(env, port);
+    }, 240_000);
+
+    it("with an operator token returns the same body as simlock stats --json for a fixed from/to, without requests, and &ledger=1 adds them, on a gateway with one worker; an agent token gets 403", async () => {
+      const { env: gateway, port } = await withHttpDaemon((port) => ({
+        configOverrides: { http: { host: "127.0.0.1", port } },
+        role: "gateway",
+        driver: "none",
+      }));
+      const minted = await gateway.cli(["token", "create", "--role", "worker"]);
+      const { secret } = minted.json as { secret: string };
+      await withDaemon({
+        configOverrides: {
+          gateway: { label: "worker-a", token: secret, url: `ws://127.0.0.1:${port}` },
+        },
+        driverScript: { ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] } },
+      });
+      await waitFor(
+        async () => {
+          const list = await gateway.cli(["worker", "list", "--json"]);
+          const workers = (list.json as { workers: { connection: string }[] }).workers;
+          return workers.length === 1 && workers[0]?.connection === "connected";
+        },
+        { label: "the worker joined", timeout: 30_000 },
+      );
+
+      await expectRouteAgreesWithCli(gateway, port);
+    }, 240_000);
+  });
+});

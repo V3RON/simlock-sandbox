@@ -1,0 +1,659 @@
+import { describe, expect, it, vi } from "vitest";
+import { loadTestRegistry, testComponentWiring, testStateOf } from "./testing.js";
+
+import { EventBus } from "../bus/index.js";
+import {
+  FakeClock,
+  FakeSystemStats,
+  JsonLinesLogger,
+  type Logger,
+  MemoryFilesystem,
+  MemoryLogSink,
+} from "../ports/index.js";
+import { automaticCleanupRules, CleanupReaper, type CleanupRule, type Config } from "./index.js";
+import { FakeDriver } from "./fake-driver.js";
+import { CleanupExecutor } from "./cleanup-executor.js";
+import { DeviceOperationClaims } from "./device-operation-claims.js";
+import { DriverCatalog } from "./driver-catalog.js";
+import { ManagedDeviceLifecycle } from "./managed-device-lifecycle.js";
+import { SerializedDecision } from "./serialized-decision.js";
+import { createTestEngine, type TestEngineConfig } from "../leasing/testing.js";
+
+const gibibyte = 1024 ** 3;
+
+type ReaperTestConfig = TestEngineConfig & Pick<Config, "diskPressure">;
+const spec = { physical: false, model: "iPhone 16", osVersion: "26.5", platform: "ios" } as const;
+
+/**
+ * MemoryFilesystem's free-disk figure is fixed at construction; this
+ * subclass lets one test flip it between ticks to exercise the crossing edge.
+ */
+class MutableFreeDiskFilesystem extends MemoryFilesystem {
+  #freeDiskBytes: number;
+
+  constructor(freeDiskBytes = Number.MAX_SAFE_INTEGER) {
+    super(freeDiskBytes);
+    this.#freeDiskBytes = freeDiskBytes;
+  }
+
+  override async diskFree(): Promise<number> {
+    return this.#freeDiskBytes;
+  }
+
+  setFreeDiskBytes(bytes: number): void {
+    this.#freeDiskBytes = bytes;
+  }
+}
+
+function config(): ReaperTestConfig {
+  return {
+    android: { virtualDevices: true },
+    devices: { autoEnroll: false, deletedRetentionMs: 3_600_000 },
+    ios: { modes: ["slim", "full"], virtualDevices: true },
+    diskPressure: { freeBytesThreshold: 10 * gibibyte },
+    health: {
+      enabled: true,
+      maxConcurrentRecoveries: 1,
+      maxRecoveryAttempts: 3,
+      probeIntervalMs: 30_000,
+      recoveryBackoffMs: 5_000,
+      stableObservations: 2,
+    },
+    stalledTransition: { thresholdMultiplier: 3, minimumThresholdMs: 60_000 },
+    idle: { deleteAfterMs: 30_000, shutdownAfterMs: 10_000 },
+    lease: {
+      defaultTtlMs: 100,
+      maxTtlMs: 100,
+      identity: { ios: "reusable", android: "reusable" },
+      requestRetentionMs: 600_000,
+      endedIdRetentionMs: 600_000,
+      maxRequestRecords: 10_000,
+      maxPerRequester: 1,
+      endWaitMs: 600_000,
+    },
+    capacity: {
+      strategy: "resource",
+      config: {
+        limits: {
+          android: { maxDevices: 1, maxRunning: 1 },
+          ios: { maxDevices: 1, maxRunning: 1 },
+          maxRunning: 1 + 1,
+        },
+        ramBudget: { androidBytesPerDevice: 4 * gibibyte, iosBytesPerDevice: gibibyte },
+      },
+    },
+    warmPool: {
+      enabled: true,
+      maxConcurrentBoots: 1,
+      refillDelayMs: 0,
+      reserveRunning: { android: 0, ios: 0 },
+      targets: [],
+      quarantine: {
+        maxRetries: 3,
+        maxRetryBackoffMs: 300_000,
+        retryBackoffMs: 30_000,
+        retryBackoffMultiplier: 2,
+      },
+    },
+  };
+}
+
+async function createHarness(
+  rules: readonly CleanupRule[],
+  latencyMs: Partial<Record<"destroy" | "shutdown", number>> = {},
+  options: {
+    readonly cleanupConfig?: ReaperTestConfig;
+    readonly filesystem?: MemoryFilesystem;
+    readonly logger?: Logger;
+    readonly targetedDevices?: () => Promise<ReadonlySet<string>>;
+    readonly tickMs?: number;
+    readonly useEngineExecutor?: boolean;
+  } = {},
+) {
+  const clock = new FakeClock(1_000);
+  const filesystem = options.filesystem ?? new MemoryFilesystem();
+  const eventBus = new EventBus(clock);
+  const driver = new FakeDriver({
+    availableOsVersions: ["26.5"],
+    clock,
+    latencyMs,
+    platform: "ios",
+  });
+  let nextId = 1;
+  const registry = await loadTestRegistry({
+    clock,
+    eventBus,
+    idGenerator: { generate: () => `${nextId++}` },
+  });
+  const cleanupConfig = options.cleanupConfig ?? config();
+  const engine = createTestEngine({
+    ...testComponentWiring({
+      clock: clock,
+      drivers: [driver],
+      eventBus: eventBus,
+      registry: registry,
+    }),
+    clock,
+    config: cleanupConfig,
+    drivers: [driver],
+    eventBus,
+    idGenerator: { generate: () => `request-${nextId++}` },
+    registry,
+    state: testStateOf(registry),
+    systemStats: new FakeSystemStats({
+      cpuCount: 8,
+      totalRamBytes: 32 * gibibyte,
+    }),
+  });
+  // These tests seed released and shut-down devices by hand and drive the reaper over them; the
+  // engine's warm pool would boot a device it just saw released back before the reaper looks.
+  engine.dispose();
+  const executor = options.useEngineExecutor
+    ? engine.cleanup
+    : (() => {
+        const claims = new DeviceOperationClaims();
+        const decisions = new SerializedDecision();
+        const catalog = new DriverCatalog([driver]);
+        return new CleanupExecutor({
+          eventBus,
+          lifecycle: new ManagedDeviceLifecycle(catalog, registry, decisions, claims, clock),
+          notifyAvailability: () => {},
+          registry,
+        });
+      })();
+  const reaper = new CleanupReaper({
+    clock,
+    config: cleanupConfig,
+    eventBus,
+    filesystem,
+    executor,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    registry,
+    rules,
+    ...(options.targetedDevices === undefined ? {} : { targetedDevices: options.targetedDevices }),
+    ...(options.tickMs === undefined ? {} : { tickMs: options.tickMs }),
+  });
+
+  return { clock, driver, engine, eventBus, executor, filesystem, reaper, registry };
+}
+
+async function seedReady(harness: Awaited<ReturnType<typeof createHarness>>) {
+  const driverDevice = await harness.driver.provision(spec);
+  const device = await harness.registry.registerDevice({
+    driverData: driverDevice.driverData,
+    driverDeviceId: driverDevice.deviceId,
+    provisionDuration: 0,
+    spec,
+  });
+  await harness.registry.transitionDevice(device.id, "ready", {
+    event: "device.ready",
+    payload: { bootDuration: 0, deviceId: device.id },
+  });
+  return device;
+}
+
+async function seedLeased(harness: Awaited<ReturnType<typeof createHarness>>) {
+  const device = await seedReady(harness);
+  await harness.registry.createLease({
+    deviceId: device.id,
+    requesterId: "agent-1",
+    ownerId: "agent-1",
+    ttlMs: 60_000,
+    ttlDeadline: 2_000,
+  });
+  return device;
+}
+
+/** A device whose lease has just ended, left `ready` or shut down, so the idle rules time it from
+ * now. */
+async function seedReleased(
+  harness: Awaited<ReturnType<typeof createHarness>>,
+  state: "ready" | "shutdown",
+) {
+  const device = await seedLeased(harness);
+  const lease = harness.registry.snapshot.leases.find((entry) => entry.deviceId === device.id);
+  await harness.registry.beginRelease(lease?.id ?? "");
+  await harness.registry.transitionDevice(device.id, "ready", {
+    event: "device.reclaimed",
+    payload: { deviceId: device.id, duration: 0, strategy: "erase" },
+  });
+  if (state === "shutdown") {
+    await harness.registry.transitionDevice(device.id, "shutdown", {
+      event: "device.shutdown",
+      payload: { deviceId: device.id, initiator: "test" },
+    });
+  }
+  return device;
+}
+
+async function seedShutdown(harness: Awaited<ReturnType<typeof createHarness>>) {
+  const device = await seedReady(harness);
+  await harness.driver.shutdown({
+    address: device.address ?? "",
+    deviceId: device.driverDeviceId,
+    driverData: device.driverData,
+  });
+  await harness.registry.transitionDevice(device.id, "shutdown", {
+    event: "device.shutdown",
+    payload: { deviceId: device.id, initiator: "test" },
+  });
+  return device;
+}
+
+async function flush(): Promise<void> {
+  for (let count = 0; count < 100; count += 1) {
+    await Promise.resolve();
+  }
+}
+
+describe("CleanupReaper", () => {
+  it("centrally rejects a malicious rule targeting a leased or unknown device", async () => {
+    const maliciousRule: CleanupRule = {
+      evaluate: () => [
+        { action: "destroy", reason: "ignore safety", rule: "malicious", target: "dev_1" },
+        { action: "destroy", reason: "ignore safety", rule: "malicious", target: "dev_unknown" },
+      ],
+      name: "malicious",
+    };
+    const harness = await createHarness([maliciousRule]);
+    await seedLeased(harness);
+
+    await expect(harness.reaper.run()).resolves.toEqual([]);
+    expect(
+      harness.driver.calls.filter(
+        (call) => call.operation === "shutdown" || call.operation === "destroy",
+      ),
+    ).toEqual([]);
+    expect(harness.registry.snapshot.devices[0]?.state).toBe("leased");
+  });
+
+  it("executes a valid proposal through the driver and committed registry transition", async () => {
+    const rule: CleanupRule = {
+      evaluate: () => [
+        { action: "shutdown", reason: "test cleanup", rule: "test-rule", target: "dev_1" },
+      ],
+      name: "test-rule",
+    };
+    const harness = await createHarness([rule]);
+    await seedReady(harness);
+
+    await expect(harness.reaper.run()).resolves.toEqual([
+      { action: "shutdown", reason: "test cleanup", rule: "test-rule", target: "dev_1" },
+    ]);
+    expect(harness.driver.calls.map((call) => call.operation)).toEqual(["provision", "shutdown"]);
+    expect(harness.registry.snapshot.devices[0]?.state).toBe("shutdown");
+    expect(harness.eventBus.replay().at(-1)).toMatchObject({
+      event: "cleanup.executed",
+      payload: {
+        action: "shutdown",
+        reason: "test cleanup",
+        ruleName: "test-rule",
+        target: "dev_1",
+      },
+    });
+  });
+
+  it("dedupes shutdown and destroy in favor of destroy, and dry-run is side-effect-free", async () => {
+    const rule: CleanupRule = {
+      evaluate: () => [
+        { action: "shutdown", reason: "first proposal", rule: "test-rule", target: "dev_1" },
+        { action: "destroy", reason: "more complete", rule: "test-rule", target: "dev_1" },
+      ],
+      name: "test-rule",
+    };
+    const harness = await createHarness([rule]);
+    await seedShutdown(harness);
+    const before = harness.registry.snapshot;
+    const callsBefore = harness.driver.calls.length;
+
+    await expect(harness.reaper.run({ dryRun: true })).resolves.toEqual([
+      { action: "destroy", reason: "more complete", rule: "test-rule", target: "dev_1" },
+    ]);
+    expect(harness.driver.calls).toHaveLength(callsBefore);
+    expect(harness.registry.snapshot).toEqual(before);
+  });
+
+  it("does not propose a shutdown for a targeted device idle past T1, and does for one that is not targeted", async () => {
+    let targeted: ReadonlySet<string> = new Set();
+    const harness = await createHarness(
+      automaticCleanupRules,
+      {},
+      { targetedDevices: async () => targeted },
+    );
+    const kept = await seedReleased(harness, "ready");
+    harness.clock.advance(11_000);
+    targeted = new Set([kept.id]);
+
+    await expect(harness.reaper.run({ dryRun: true })).resolves.toEqual([]);
+
+    targeted = new Set();
+    await expect(harness.reaper.run({ dryRun: true })).resolves.toEqual([
+      expect.objectContaining({ action: "shutdown", rule: "idle-shutdown", target: kept.id }),
+    ]);
+    harness.reaper.dispose();
+  });
+
+  it("runs only the rule --rule names, and no rule at all for a name that is not registered", async () => {
+    const harness = await createHarness(automaticCleanupRules);
+    // One device each rule acts on, both released at the same moment: a ready one idle-shutdown
+    // shuts down once idle past T1, and a shut-down one idle-destroy destroys once idle past T2.
+    const idleReady = await seedReleased(harness, "ready");
+    const idleShutdown = await seedReleased(harness, "shutdown");
+    harness.clock.advance(31_000);
+    const shutdownProposal = {
+      action: "shutdown",
+      reason: "idle 31s > T1=10s",
+      rule: "idle-shutdown",
+      target: idleReady.id,
+    };
+    const destroyProposal = {
+      action: "destroy",
+      reason: "idle 31s > T2=30s",
+      rule: "idle-destroy",
+      target: idleShutdown.id,
+    };
+
+    expect(harness.reaper.rules.map((rule) => rule.name)).toEqual([
+      "idle-shutdown",
+      "idle-destroy",
+    ]);
+    await expect(harness.reaper.run({ dryRun: true })).resolves.toEqual([
+      shutdownProposal,
+      destroyProposal,
+    ]);
+    await expect(harness.reaper.run({ dryRun: true, rule: "idle-shutdown" })).resolves.toEqual([
+      shutdownProposal,
+    ]);
+    await expect(harness.reaper.run({ dryRun: true, rule: "idle-destroy" })).resolves.toEqual([
+      destroyProposal,
+    ]);
+    await expect(harness.reaper.run({ dryRun: true, rule: "unknown-rule" })).resolves.toEqual([]);
+    harness.reaper.dispose();
+  });
+
+  it("emits disk.pressure-detected once per crossing, not once per sustained tick, and again after recovering and re-crossing", async () => {
+    const filesystem = new MutableFreeDiskFilesystem();
+    const harness = await createHarness([], {}, { filesystem, tickMs: 10_000 });
+    const pressureEvents = () =>
+      harness.eventBus.replay().filter((event) => event.event === "disk.pressure-detected");
+
+    // Starts well above threshold: no emission on the first couple of ticks.
+    harness.clock.advance(10_000);
+    await flush();
+    harness.clock.advance(10_000);
+    await flush();
+    expect(pressureEvents()).toHaveLength(0);
+
+    // Crosses under threshold and stays there for several ticks: emits once.
+    filesystem.setFreeDiskBytes(2 * gibibyte);
+    harness.clock.advance(10_000);
+    await flush();
+    harness.clock.advance(10_000);
+    await flush();
+    harness.clock.advance(10_000);
+    await flush();
+    expect(pressureEvents()).toHaveLength(1);
+    expect(pressureEvents()[0]).toMatchObject({
+      payload: { freeBytes: 2 * gibibyte, threshold: 10 * gibibyte },
+    });
+
+    // Recovers above threshold: no new emission.
+    filesystem.setFreeDiskBytes(20 * gibibyte);
+    harness.clock.advance(10_000);
+    await flush();
+    expect(pressureEvents()).toHaveLength(1);
+
+    // Crosses under threshold again: emits a second time.
+    filesystem.setFreeDiskBytes(1 * gibibyte);
+    harness.clock.advance(10_000);
+    await flush();
+    expect(pressureEvents()).toHaveLength(2);
+
+    harness.reaper.dispose();
+  });
+
+  it("stays side-effect free on a dry run under pressure, emitting nothing and running once", async () => {
+    const filesystem = new MutableFreeDiskFilesystem();
+    filesystem.setFreeDiskBytes(2 * gibibyte);
+    const evaluate = vi.fn(() => []);
+    const harness = await createHarness([{ evaluate, name: "test-rule" }], {}, { filesystem });
+
+    await harness.reaper.run({ dryRun: true });
+    await flush();
+
+    // Emitting the fact from a preview would wake this reaper through its own
+    // disk.pressure-detected subscription, so `cleanup --dry-run` would quietly
+    // schedule a real cleanup run -- visible here as a second rule evaluation.
+    expect(
+      harness.eventBus.replay().filter((event) => event.event === "disk.pressure-detected"),
+    ).toHaveLength(0);
+    expect(evaluate).toHaveBeenCalledTimes(1);
+
+    harness.reaper.dispose();
+  });
+
+  it("coalesces five trigger events during a run into one follow-up run", async () => {
+    const evaluate = vi.fn(() => [
+      { action: "shutdown" as const, reason: "test cleanup", rule: "test-rule", target: "dev_1" },
+    ]);
+    const harness = await createHarness([{ evaluate, name: "test-rule" }], { shutdown: 10 });
+    await seedReady(harness);
+
+    harness.eventBus.emit("daemon.started", { configSnapshot: {}, version: "test" }, "test");
+    await flush();
+    for (let count = 0; count < 5; count += 1) {
+      harness.eventBus.emit("disk.pressure-detected", { freeBytes: 0, threshold: 1 }, "test");
+    }
+    harness.clock.advance(10);
+    await flush();
+
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    expect(harness.driver.calls.filter((call) => call.operation === "shutdown")).toHaveLength(1);
+    harness.reaper.dispose();
+  });
+
+  it("A cleanup run that throws logs at error.", async () => {
+    const sink = new MemoryLogSink();
+    const rule: CleanupRule = {
+      evaluate: () => {
+        throw new Error("rule exploded");
+      },
+      name: "exploding-rule",
+    };
+    const harness = await createHarness(
+      [rule],
+      {},
+      { logger: new JsonLinesLogger({ clock: new FakeClock(1_000), sink }), tickMs: 10_000 },
+    );
+    const expected = expect.objectContaining({
+      level: "error",
+      module: "daemon.reaper",
+      fields: { error: "Error: rule exploded", step: "cleanup" },
+    });
+
+    // An event-triggered run nobody awaits...
+    harness.eventBus.emit("daemon.started", { configSnapshot: {}, version: "test" }, "test");
+    await flush();
+    expect(sink.records).toEqual([expected]);
+
+    // ...and a periodic tick's run.
+    harness.clock.advance(10_000);
+    await flush();
+    expect(sink.records).toEqual([expected, expected]);
+    harness.reaper.dispose();
+  });
+
+  it("destroys a released virtual device at the release, and leaves nothing for the periodic ticks to clean", async () => {
+    const harness = await createHarness(automaticCleanupRules, {}, { tickMs: 10_000 });
+    const grant = await harness.engine.request(spec, {
+      ownerId: "agent-1",
+      requesterId: "agent-1",
+    });
+
+    await harness.engine.release(grant.lease.id, "explicit");
+    await flush();
+    expect(harness.registry.snapshot.devices[0]?.state).toBe("deleted");
+    expect(harness.driver.calls.map((call) => call.operation)).toContain("destroy");
+
+    const callsAfterRelease = harness.driver.calls.length;
+    for (let tick = 0; tick < 4; tick += 1) {
+      harness.clock.advance(10_000);
+      await flush();
+    }
+    expect(harness.registry.snapshot.devices[0]?.state).toBe("deleted");
+    expect(harness.driver.calls).toHaveLength(callsAfterRelease);
+    harness.reaper.dispose();
+  });
+
+  it("does not abort its run on a device whose platform has no driver, and still cleans up every device proposed after it", async () => {
+    const harness = await createHarness(automaticCleanupRules);
+    // why: the driverless records are registered first so the proposals that must throw precede
+    // the healthy ones -- that order is what a whole-run abort turns on. Only an ios driver is
+    // registered, so acting on an android record throws NoDriverError, as it does for a platform
+    // discovery refused. The ready one exercises the shutdown path, the shut-down one the
+    // destroy path; a healthy device follows each.
+    const ghostReady = await harness.registry.registerDevice({
+      driverData: { fakeDeviceId: "ghost-ready-android" },
+      driverDeviceId: "ghost-ready-android",
+      provisionDuration: 0,
+      spec: { model: "Pixel 8", osVersion: "35", physical: false, platform: "android" },
+    });
+    await harness.registry.transitionDevice(ghostReady.id, "ready", {
+      event: "device.ready",
+      payload: { bootDuration: 0, deviceId: ghostReady.id },
+    });
+    const ghostReadyLease = await harness.registry.createLease({
+      deviceId: ghostReady.id,
+      ownerId: "agent-1",
+      requesterId: "agent-1",
+      ttlMs: 60_000,
+      ttlDeadline: 2_000,
+    });
+    await harness.registry.beginRelease(ghostReadyLease.id);
+    await harness.registry.transitionDevice(ghostReady.id, "ready", {
+      event: "device.reclaimed",
+      payload: { deviceId: ghostReady.id, duration: 0, strategy: "erase" },
+    });
+    const idleReady = await seedReleased(harness, "ready");
+    const ghostShutdown = await harness.registry.registerDevice({
+      driverData: { fakeDeviceId: "ghost-shutdown-android" },
+      driverDeviceId: "ghost-shutdown-android",
+      provisionDuration: 0,
+      spec: { model: "Pixel 8", osVersion: "35", physical: false, platform: "android" },
+    });
+    await harness.registry.transitionDevice(ghostShutdown.id, "ready", {
+      event: "device.ready",
+      payload: { bootDuration: 0, deviceId: ghostShutdown.id },
+    });
+    await harness.registry.transitionDevice(ghostShutdown.id, "shutdown", {
+      event: "device.shutdown",
+      payload: { deviceId: ghostShutdown.id, initiator: "test" },
+    });
+    const idleShutdown = await seedReleased(harness, "shutdown");
+    // why: one second past T2, so every destroy proposal fires and every shutdown one already has.
+    harness.clock.advance(31_000);
+
+    // why: loose on purpose -- whether the run still reports the driverless devices' proposals is
+    // for the fix to decide; skipping the platform or surviving the failed action both answer it.
+    await expect(harness.reaper.run()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "shutdown",
+          rule: "idle-shutdown",
+          target: idleReady.id,
+        }),
+        expect.objectContaining({
+          action: "destroy",
+          rule: "idle-destroy",
+          target: idleShutdown.id,
+        }),
+      ]),
+    );
+
+    const stateOf = (deviceId: string) =>
+      harness.registry.snapshot.devices.find((device) => device.id === deviceId)?.state;
+    expect([
+      stateOf(ghostReady.id),
+      stateOf(idleReady.id),
+      stateOf(ghostShutdown.id),
+      stateOf(idleShutdown.id),
+    ]).toEqual(["ready", "shutdown", "shutdown", "deleted"]);
+    expect(
+      harness.driver.calls
+        .filter((call) => call.operation === "shutdown" || call.operation === "destroy")
+        .map((call) => `${call.operation} ${(call.arguments[0] as { deviceId: string }).deviceId}`)
+        .sort(),
+    ).toEqual(
+      [`destroy ${idleShutdown.driverDeviceId}`, `shutdown ${idleReady.driverDeviceId}`].sort(),
+    );
+    expect(
+      harness.eventBus
+        .replay()
+        .filter((entry) => entry.event === "cleanup.executed")
+        .map((entry) => (entry.payload as { target: string }).target)
+        .sort(),
+    ).toEqual([idleReady.id, idleShutdown.id].sort());
+
+    harness.reaper.dispose();
+  });
+
+  it("logs a cleanup action that throws at error, naming the action, rule and target, and still resolves the run", async () => {
+    const sink = new MemoryLogSink();
+    const rule: CleanupRule = {
+      evaluate: () => [
+        { action: "shutdown", reason: "test cleanup", rule: "test-rule", target: "dev_1" },
+      ],
+      name: "test-rule",
+    };
+    const harness = await createHarness(
+      [rule],
+      {},
+      { logger: new JsonLinesLogger({ clock: new FakeClock(1_000), sink }), tickMs: 10_000 },
+    );
+    await seedReady(harness);
+    vi.spyOn(harness.executor, "execute").mockRejectedValue(new Error("action exploded"));
+
+    await expect(harness.reaper.run()).resolves.toHaveLength(1);
+    expect(sink.records).toEqual([
+      expect.objectContaining({
+        level: "error",
+        module: "daemon.reaper",
+        fields: {
+          action: "shutdown",
+          error: "Error: action exploded",
+          rule: "test-rule",
+          step: "cleanup",
+          target: "dev_1",
+        },
+      }),
+    ]);
+    harness.reaper.dispose();
+  });
+
+  it("prevents leasing from granting a device while cleanup is shutting it down", async () => {
+    const rule: CleanupRule = {
+      evaluate: () => [
+        { action: "shutdown", reason: "test cleanup", rule: "test-rule", target: "dev_1" },
+      ],
+      name: "test-rule",
+    };
+    const harness = await createHarness([rule], { shutdown: 10 }, { useEngineExecutor: true });
+    await seedReady(harness);
+
+    const cleanup = harness.reaper.run();
+    await flush();
+    const request = harness.engine.request(spec, {
+      ownerId: "agent-2",
+      requesterId: "agent-2",
+    });
+    await flush();
+    expect(harness.registry.snapshot.leases).toEqual([]);
+
+    harness.clock.advance(10);
+    await cleanup;
+    await flush();
+    expect(harness.registry.snapshot.leases).toMatchObject([{ requesterId: "agent-2" }]);
+    await expect(request).resolves.toMatchObject({ lease: { requesterId: "agent-2" } });
+    harness.reaper.dispose();
+  });
+});

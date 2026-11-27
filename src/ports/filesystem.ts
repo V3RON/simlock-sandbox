@@ -1,0 +1,1053 @@
+import { createWriteStream } from "node:fs";
+import {
+  chmod,
+  copyFile,
+  cp,
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  stat,
+  statfs,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+
+import { NodeProcessRunner, type ProcessRunner } from "./process-runner.js";
+
+export interface FileStat {
+  readonly kind: "file" | "directory";
+  readonly size: number;
+  readonly modifiedAtMs: number;
+  readonly mode?: number;
+  readonly identity: string;
+}
+
+export interface WriteFileAtomicOptions {
+  /** why: POSIX permission bits the file is created with (e.g. `0o600` for owner-only). Set at
+   * creation via the temp file's own open flags -- never a separate `chmod` after the fact,
+   * which would leave a window where the file exists world-readable. Omitted keeps Node's
+   * default (governed by the process umask), unchanged from before this option existed. */
+  readonly mode?: number;
+  /** why: Task Scheduler refuses a task file that is not UTF-16. Omitted writes UTF-8. */
+  readonly encoding?: "utf8" | "utf16le";
+}
+
+/** why: Same shape as {@link WriteFileAtomicOptions}: `writeFileExclusive` publishes through a
+ * hard-linked temp file, so the mode rides on that file's create and the link preserves it. */
+export interface WriteFileExclusiveOptions {
+  readonly mode?: number;
+}
+
+export interface MkdirpOptions {
+  /** why: the bits the directory ends with whatever the umask, which can only remove them. */
+  readonly mode?: number;
+}
+
+export interface PathDetails {
+  readonly kind: "file" | "directory" | "symlink" | "other";
+  readonly uid: number;
+  readonly mode: number;
+}
+
+/**
+ * why: a file opened for reading, so what a caller reads is the file it opened even when the path is
+ * replaced afterwards. `read` takes inclusive byte offsets; one of `read` or `close` ends the handle.
+ */
+export interface OpenedFile {
+  readonly size: number;
+  read(range?: { readonly start: number; readonly end: number }): ReadableStream<Uint8Array>;
+  close(): Promise<void>;
+}
+
+export interface Filesystem {
+  /**
+   * why: a body too big for memory goes to a new file piece by piece; the file must not exist.
+   * A body that errors rejects the write and leaves the partial file for the caller to remove.
+   * Answers the bytes written.
+   */
+  writeFileStream(
+    path: string,
+    body: ReadableStream<Uint8Array>,
+    options?: { readonly mode?: number },
+  ): Promise<number>;
+  openFile(path: string): Promise<OpenedFile>;
+  readFile(path: string): Promise<string>;
+  readFileFrom(path: string, offset: number): Promise<string>;
+  writeFileAtomic(path: string, contents: string, options?: WriteFileAtomicOptions): Promise<void>;
+  /**
+   * why: replaces a file's contents in the same file (same identity), then sets its mode, so an
+   * existing 0644 file ends at `mode`. `writeFileAtomic` renames over the path, which Windows
+   * refuses with `EPERM` while another process holds the file open (#1662).
+   */
+  writeFileInPlace(
+    path: string,
+    contents: string,
+    options: { readonly mode: number },
+  ): Promise<void>;
+  /**
+   * why: Writes a file only when nothing is there, failing `EEXIST` otherwise. The kernel
+   * decides who wins, which is the only way two processes racing to write one file both
+   * end up agreeing about what it says. The file appears with its full contents, never
+   * empty, so a loser that reads it straight away reads what the winner wrote.
+   */
+  writeFileExclusive(
+    path: string,
+    contents: string,
+    options?: WriteFileExclusiveOptions,
+  ): Promise<void>;
+  /**
+   * why: a `mode` applies to every directory this call creates, parents included, and to none
+   * that is already there, so a caller can make its own directories owner-only (a gateway's
+   * `<root>/gateway` makes `<root>` too) without tightening one it does not own, or overriding
+   * the mode a user chose for a directory that exists.
+   */
+  mkdirp(path: string, options?: MkdirpOptions): Promise<void>;
+  copyFile(from: string, to: string): Promise<void>;
+  /**
+   * why: `to` must not exist; it becomes a copy of the folder `from` with file modification times kept.
+   * `timeoutMs` bounds the copy where the adapter runs a child process for it.
+   */
+  copyTree(from: string, to: string, options: { readonly timeoutMs: number }): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
+  rm(path: string): Promise<void>;
+  stat(path: string): Promise<FileStat>;
+  lstat(path: string): Promise<PathDetails>;
+  /**
+   * why: Creates exactly one directory and fails when the path already exists (no recursion).
+   * Failing on an existing path is the point: it is what makes "Simlock created this root
+   * itself, empty" provable rather than assumed.
+   */
+  mkdir(path: string, options?: { readonly mode?: number }): Promise<void>;
+  chmod(path: string, mode: number): Promise<void>;
+  realpath(path: string): Promise<string>;
+  readdir(path: string): Promise<string[]>;
+  exists(path: string): Promise<boolean>;
+  diskFree(path: string): Promise<number>;
+  diskSpace(path: string): Promise<{ readonly freeBytes: number; readonly totalBytes: number }>;
+  directorySize(path: string): Promise<number>;
+  /** why: what a symbolic link points at, without following it. */
+  readlink(path: string): Promise<string>;
+  /** why: the link at `path` points at `target` from one step to the next, with no moment when it is missing. */
+  replaceSymlink(path: string, target: string): Promise<void>;
+  /** why: `bytes` written into an existing file at `offset`, with no truncation, keeping its mode and modification time. */
+  writeAt(path: string, offset: number, bytes: Uint8Array): Promise<void>;
+}
+
+// why: only the directories that are absent get the mode, so one that is already there keeps its own.
+async function missingDirectories(path: string): Promise<string[]> {
+  const missing: string[] = [];
+  for (let at = path; ; at = dirname(at)) {
+    try {
+      await stat(at);
+      return missing;
+    } catch (error: unknown) {
+      if (!hasCode(error, "ENOENT") || dirname(at) === at) throw error;
+      missing.unshift(at);
+    }
+  }
+}
+
+// why: false means another process made it first, and its mode is left alone.
+async function createDirectory(directory: string, mode: number): Promise<boolean> {
+  try {
+    await mkdir(directory, { mode });
+    return true;
+  } catch (error: unknown) {
+    if (hasCode(error, "EEXIST") && (await stat(directory)).isDirectory()) return false;
+    throw error;
+  }
+}
+
+export interface NodeFilesystemOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly processRunner?: ProcessRunner;
+}
+
+export class NodeFilesystem implements Filesystem {
+  readonly #platform: NodeJS.Platform;
+  readonly #processRunner: ProcessRunner;
+
+  constructor(options: NodeFilesystemOptions = {}) {
+    this.#platform = options.platform ?? process.platform;
+    this.#processRunner = options.processRunner ?? new NodeProcessRunner();
+  }
+
+  async readFile(path: string): Promise<string> {
+    return readFile(path, "utf8");
+  }
+
+  async copyFile(from: string, to: string): Promise<void> {
+    await copyFile(from, to);
+  }
+
+  async writeFileStream(
+    path: string,
+    body: ReadableStream<Uint8Array>,
+    options: { readonly mode?: number } = {},
+  ): Promise<number> {
+    const out = createWriteStream(path, {
+      flags: "wx",
+      ...(options.mode === undefined ? {} : { mode: options.mode }),
+    });
+    await pipeline(Readable.fromWeb(body as never), out);
+    return out.bytesWritten;
+  }
+
+  async openFile(path: string): Promise<OpenedFile> {
+    const handle = await open(path, "r");
+    try {
+      const { size } = await handle.stat();
+      return {
+        size,
+        read: (range) =>
+          Readable.toWeb(
+            handle.createReadStream(
+              range === undefined ? {} : { start: range.start, end: range.end },
+            ),
+          ) as ReadableStream<Uint8Array>,
+        close: () => handle.close().catch(() => undefined),
+      };
+    } catch (error: unknown) {
+      await handle.close();
+      throw error;
+    }
+  }
+
+  async copyTree(from: string, to: string, options: { readonly timeoutMs: number }): Promise<void> {
+    if (this.#platform === "darwin") return this.#copyWithCp(["-c", "-p", "-R", from, to], options);
+    if (this.#platform === "linux") {
+      return this.#copyWithCp(["-a", "--reflink=auto", from, to], options);
+    }
+    // why: no child process runs here, so `timeoutMs` bounds nothing on this path.
+    await cp(from, to, {
+      errorOnExist: true,
+      force: false,
+      preserveTimestamps: true,
+      recursive: true,
+    });
+  }
+
+  async #copyWithCp(
+    args: readonly string[],
+    options: { readonly timeoutMs: number },
+  ): Promise<void> {
+    const handle = this.#processRunner.spawn("cp", args);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      handle.kill();
+    }, options.timeoutMs);
+    try {
+      const result = await handle.wait();
+      if (timedOut) throw new Error(`timed out after ${options.timeoutMs}ms`);
+      if (result.code !== 0) {
+        throw new Error(result.stderr.trim() || `cp exited with code ${String(result.code)}`);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async readFileFrom(path: string, offset: number): Promise<string> {
+    const handle = await open(path, "r");
+    try {
+      const { size } = await handle.stat();
+      if (size <= offset) return "";
+      const buffer = Buffer.alloc(size - offset);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      return buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async writeFileAtomic(
+    path: string,
+    contents: string,
+    options?: WriteFileAtomicOptions,
+  ): Promise<void> {
+    const directory = dirname(path);
+    const temporaryPath = join(
+      directory,
+      `.${basename(path)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    );
+
+    try {
+      await writeFile(temporaryPath, contents, {
+        encoding: options?.encoding ?? "utf8",
+        flag: "wx",
+        ...(options?.mode === undefined ? {} : { mode: options.mode }),
+      });
+      await rename(temporaryPath, path);
+    } catch (error: unknown) {
+      await rm(temporaryPath, { force: true });
+      throw error;
+    }
+  }
+
+  async writeFileInPlace(
+    path: string,
+    contents: string,
+    options: { readonly mode: number },
+  ): Promise<void> {
+    await writeFile(path, contents, { encoding: "utf8", mode: options.mode });
+    await chmod(path, options.mode);
+  }
+
+  async writeFileExclusive(
+    path: string,
+    contents: string,
+    options?: WriteFileExclusiveOptions,
+  ): Promise<void> {
+    // why: `writeFile` with the `wx` flag creates the file empty and fills it a moment later, so a
+    // racer that loses the create can read it in between and find nothing. Write the contents
+    // aside first and hard-link them into place: `link` fails `EEXIST` like `wx` does, but the
+    // file it creates is already complete.
+    const temporaryPath = join(
+      dirname(path),
+      `.${basename(path)}.${process.pid}.${crypto.randomUUID()}.tmp`,
+    );
+    // why: the mode rides on the temp file's create -- a hard link carries it over, so the
+    // published file is never world-readable even briefly. A `chmod` after the link is the
+    // window this port's own doc rules out.
+    await writeFile(
+      temporaryPath,
+      contents,
+      options?.mode === undefined
+        ? { encoding: "utf8", flag: "wx" }
+        : { encoding: "utf8", flag: "wx", mode: options.mode },
+    );
+    try {
+      await link(temporaryPath, path);
+    } finally {
+      await rm(temporaryPath, { force: true });
+    }
+  }
+
+  async mkdirp(path: string, options: MkdirpOptions = {}): Promise<void> {
+    if (options.mode === undefined) {
+      await mkdir(path, { recursive: true });
+      return;
+    }
+    for (const directory of await missingDirectories(path)) {
+      if (await createDirectory(directory, options.mode)) {
+        // why: the umask can only take bits from `mkdir`'s mode, so a restrictive one would leave the
+        // directory short of what was asked; `chmod` sets exactly those bits, as the device root does.
+        await chmod(directory, options.mode);
+      }
+    }
+  }
+
+  async rename(from: string, to: string): Promise<void> {
+    await rename(from, to);
+  }
+
+  async rm(path: string): Promise<void> {
+    // why: on Windows a killed emulator's qemu child holds its disk files for about a second after the kill, and `rm` fails with EBUSY until it exits (#1765).
+    await rm(path, { force: true, maxRetries: 10, recursive: true, retryDelay: 100 });
+  }
+
+  async stat(path: string): Promise<FileStat> {
+    const details = await stat(path);
+
+    return {
+      kind: details.isDirectory() ? "directory" : "file",
+      size: details.size,
+      modifiedAtMs: details.mtimeMs,
+      mode: details.mode & 0o777,
+      identity: `${details.dev}:${details.ino}`,
+    };
+  }
+
+  async lstat(path: string): Promise<PathDetails> {
+    const details = await lstat(path);
+
+    return {
+      kind: nodeKind(details),
+      uid: details.uid,
+      mode: details.mode & 0o777,
+    };
+  }
+
+  async mkdir(path: string, options: { readonly mode?: number } = {}): Promise<void> {
+    await mkdir(path, {
+      recursive: false,
+      ...(options.mode === undefined ? {} : { mode: options.mode }),
+    });
+  }
+
+  async chmod(path: string, mode: number): Promise<void> {
+    await chmod(path, mode);
+  }
+
+  async realpath(path: string): Promise<string> {
+    return realpath(path);
+  }
+
+  async readdir(path: string): Promise<string[]> {
+    return readdir(path);
+  }
+
+  async exists(path: string): Promise<boolean> {
+    try {
+      await stat(path);
+      return true;
+    } catch (error: unknown) {
+      if (isMissingPathError(error)) {
+        return false;
+      }
+
+      throw error;
+    }
+  }
+
+  async diskFree(path: string): Promise<number> {
+    return (await this.diskSpace(path)).freeBytes;
+  }
+
+  async diskSpace(path: string): Promise<{ freeBytes: number; totalBytes: number }> {
+    const details = await statfs(path);
+    return {
+      freeBytes: details.bavail * details.bsize,
+      totalBytes: details.blocks * details.bsize,
+    };
+  }
+
+  /**
+   * why: a file listed a moment ago may be gone (simctl's atomic `device.plist.sb-*` write), and a
+   * size that fails on it leaves a saved source with no size; a vanished file counts for 0.
+   */
+  async #sizeOfFile(path: string): Promise<number> {
+    try {
+      return (await lstat(path)).size;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+      throw error;
+    }
+  }
+
+  async readlink(path: string): Promise<string> {
+    return readlink(path);
+  }
+
+  async replaceSymlink(path: string, target: string): Promise<void> {
+    const staged = `${path}.simlock-swap-${String(process.pid)}`;
+    await symlink(target, staged);
+    try {
+      await rename(staged, path);
+    } catch (error: unknown) {
+      await rm(staged, { force: true });
+      throw error;
+    }
+  }
+
+  async writeAt(path: string, offset: number, bytes: Uint8Array): Promise<void> {
+    const handle = await open(path, "r+");
+    try {
+      const { atime, mtime } = await handle.stat();
+      await handle.write(bytes, 0, bytes.length, offset);
+      await handle.utimes(atime, mtime);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async directorySize(path: string): Promise<number> {
+    let total = 0;
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) total += await this.directorySize(child);
+      else if (entry.isFile()) total += await this.#sizeOfFile(child);
+    }
+    return total;
+  }
+}
+
+interface MemoryAttributes {
+  readonly identity: number;
+  modifiedAtMs: number;
+  uid: number;
+  mode: number;
+}
+
+type MemoryEntryKind =
+  | { readonly kind: "file"; contents: string; bytes?: Uint8Array; encoding?: "utf8" | "utf16le" }
+  | { readonly kind: "directory" }
+  | { readonly kind: "symlink"; readonly target: string };
+
+type MemoryEntry = MemoryAttributes & MemoryEntryKind;
+
+/**
+ * why: Owner-only, matching the permissions Simlock demands of a device root, so a test that
+ * says nothing about permissions describes a healthy path rather than a rejected one.
+ */
+const DEFAULT_MEMORY_MODE = 0o700;
+
+const MAX_SYMLINK_HOPS = 32;
+
+/** why: Node's default for a plain file, kept as the default both `writeFileAtomic` and
+ * `writeFileExclusive` create with so a caller that says nothing about permissions gets what
+ * it got before `mode` was an option. */
+const DEFAULT_FILE_MODE = 0o644;
+
+export class MemoryFilesystem implements Filesystem {
+  readonly #entries = new Map<string, MemoryEntry>();
+  readonly #failures = new Map<string, string>();
+  #nextIdentity = 1;
+
+  constructor(
+    private readonly freeDiskBytes = Number.MAX_SAFE_INTEGER,
+    private readonly uid = process.getuid?.() ?? 0,
+  ) {
+    this.#entries.set("/", this.#newEntry({ kind: "directory" }));
+  }
+
+  /** why: lets a test read which encoding `writeFileAtomic` was asked to write. */
+  encodingOf(path: string): "utf8" | "utf16le" {
+    const entry = this.#entryAt(memoryPath(path));
+    return entry.kind === "file" ? (entry.encoding ?? "utf8") : "utf8";
+  }
+
+  async readFile(path: string): Promise<string> {
+    path = this.#failIfDefined(path);
+    const entry = this.#entryAt(path);
+
+    if (entry.kind !== "file") {
+      throw new Error(`Cannot read directory: ${path}`);
+    }
+
+    return entry.contents;
+  }
+
+  async copyFile(from: string, to: string): Promise<void> {
+    await this.writeFileAtomic(to, await this.readFile(from));
+  }
+
+  async writeFileStream(
+    path: string,
+    body: ReadableStream<Uint8Array>,
+    options: { readonly mode?: number } = {},
+  ): Promise<number> {
+    path = this.#failIfDefined(path);
+    path = this.#underResolvedParent(path);
+    this.#requireDirectory(parentPath(path));
+    if (this.#entries.has(path)) throw errnoError("EEXIST", `File already exists: ${path}`);
+    const chunks: Uint8Array[] = [];
+    const reader = body.getReader();
+    for (;;) {
+      const piece = await reader.read();
+      if (piece.done) break;
+      chunks.push(piece.value);
+    }
+    const bytes = Buffer.concat(chunks);
+    this.#entries.set(path, {
+      ...this.#newEntry({ kind: "file", contents: bytes.toString("utf8"), bytes }),
+      mode: options.mode ?? DEFAULT_FILE_MODE,
+    });
+    return bytes.byteLength;
+  }
+
+  async openFile(path: string): Promise<OpenedFile> {
+    path = this.#failIfDefined(path);
+    const entry = this.#entryAt(path);
+    if (entry.kind !== "file") throw errnoError("EISDIR", `Is a directory: ${path}`);
+    const bytes = fileBytes(entry);
+    return {
+      size: bytes.byteLength,
+      read: (range) => {
+        const piece = range === undefined ? bytes : bytes.subarray(range.start, range.end + 1);
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(piece);
+            controller.close();
+          },
+        });
+      },
+      close: async () => undefined,
+    };
+  }
+
+  async copyTree(
+    from: string,
+    to: string,
+    _options: { readonly timeoutMs: number },
+  ): Promise<void> {
+    from = this.#failIfDefined(from);
+    to = this.#failIfDefined(to);
+    this.#rawEntryAt(from);
+    if (this.#entries.has(to)) throw errnoError("EEXIST", `File already exists: ${to}`);
+    this.#requireDirectory(parentPath(to));
+    const prefix = `${from}/`;
+    for (const [entryPath, entry] of Array.from(this.#entries)) {
+      if (entryPath !== from && !entryPath.startsWith(prefix)) continue;
+      this.#entries.set(
+        entryPath === from ? to : joinMemoryPath(to, entryPath.slice(prefix.length)),
+        {
+          ...entry,
+          identity: this.#nextIdentity++,
+        },
+      );
+    }
+  }
+
+  async readFileFrom(path: string, offset: number): Promise<string> {
+    return Buffer.from(await this.readFile(path), "utf8")
+      .subarray(offset)
+      .toString("utf8");
+  }
+
+  async writeFileAtomic(
+    path: string,
+    contents: string,
+    options?: WriteFileAtomicOptions,
+  ): Promise<void> {
+    path = this.#failIfDefined(path);
+    path = this.#underResolvedParent(path);
+    this.#requireDirectory(parentPath(path));
+    const encoding = options?.encoding ?? "utf8";
+    this.#entries.set(path, {
+      ...this.#newEntry({
+        kind: "file",
+        contents,
+        ...(encoding === "utf8" ? {} : { bytes: Buffer.from(contents, encoding), encoding }),
+      }),
+      mode: options?.mode ?? DEFAULT_FILE_MODE,
+    });
+  }
+
+  async writeFileInPlace(
+    path: string,
+    contents: string,
+    options: { readonly mode: number },
+  ): Promise<void> {
+    path = this.#failIfDefined(path);
+    path = this.#underResolvedParent(path);
+    const existing = this.#entries.get(path);
+
+    if (existing?.kind === "file") {
+      existing.contents = contents;
+      delete existing.bytes;
+      existing.mode = options.mode & 0o777;
+      return;
+    }
+
+    await this.writeFileAtomic(path, contents, options);
+  }
+
+  async writeFileExclusive(
+    path: string,
+    contents: string,
+    options?: WriteFileExclusiveOptions,
+  ): Promise<void> {
+    path = this.#failIfDefined(path);
+    path = this.#underResolvedParent(path);
+
+    if (this.#entries.has(path)) {
+      throw errnoError("EEXIST", `File already exists: ${path}`);
+    }
+
+    this.#requireDirectory(parentPath(path));
+    this.#entries.set(path, {
+      ...this.#newEntry({ kind: "file", contents }),
+      mode: options?.mode ?? DEFAULT_FILE_MODE,
+    });
+  }
+
+  async mkdirp(path: string, options: MkdirpOptions = {}): Promise<void> {
+    path = this.#failIfDefined(path);
+    let currentPath = "";
+
+    for (const segment of path.split("/")) {
+      if (segment === "") {
+        currentPath = "/";
+        continue;
+      }
+
+      currentPath = joinMemoryPath(currentPath, segment);
+      const entry = this.#entries.get(currentPath);
+
+      if (entry === undefined) {
+        const directory = this.#newEntry({ kind: "directory" });
+        if (options.mode !== undefined) directory.mode = options.mode & 0o777;
+        this.#entries.set(currentPath, directory);
+      } else if (entry.kind !== "directory") {
+        throw new Error(`Cannot create directory over file: ${currentPath}`);
+      }
+    }
+  }
+
+  /**
+   * why: Publishes `from` at `to` the way POSIX does, because the create path in
+   * `ensureOwnedRoot` branches on exactly the failures it reports: an occupied destination
+   * is what tells it another process won the race.
+   */
+  async rename(from: string, to: string): Promise<void> {
+    from = this.#failIfDefined(from);
+    to = this.#failIfDefined(to);
+    const moved = this.#rawEntryAt(from);
+    const occupant = this.#entries.get(to);
+
+    if (occupant !== undefined) {
+      if (occupant.kind !== "directory" || moved.kind !== "directory") {
+        throw errnoError("ENOTDIR", `Not a directory: ${to}`);
+      }
+
+      if ((await this.readdir(to)).length > 0) {
+        throw errnoError("ENOTEMPTY", `Directory not empty: ${to}`);
+      }
+    }
+
+    this.#requireDirectory(parentPath(to));
+    const prefix = `${from}/`;
+    const moving = [...this.#entries.keys()].filter(
+      (entryPath) => entryPath === from || entryPath.startsWith(prefix),
+    );
+
+    for (const entryPath of moving) {
+      const entry = this.#entries.get(entryPath);
+      if (entry === undefined) {
+        continue;
+      }
+
+      this.#entries.delete(entryPath);
+      this.#entries.set(
+        entryPath === from ? to : joinMemoryPath(to, entryPath.slice(prefix.length)),
+        entry,
+      );
+    }
+  }
+
+  async rm(path: string): Promise<void> {
+    path = this.#failIfDefined(path);
+    const prefix = path.endsWith("/") ? path : `${path}/`;
+
+    for (const entryPath of this.#entries.keys()) {
+      if (entryPath === path || entryPath.startsWith(prefix)) {
+        this.#entries.delete(entryPath);
+      }
+    }
+  }
+
+  async stat(path: string): Promise<FileStat> {
+    path = this.#failIfDefined(path);
+    const entry = this.#entryAt(path);
+
+    return {
+      kind: entry.kind === "file" ? "file" : "directory",
+      size: entry.kind === "file" ? fileBytes(entry).byteLength : 0,
+      modifiedAtMs: entry.modifiedAtMs,
+      mode: entry.mode,
+      identity: String(entry.identity),
+    };
+  }
+
+  async lstat(path: string): Promise<PathDetails> {
+    path = this.#failIfDefined(path);
+    const entry = this.#rawEntryAt(path);
+
+    return { kind: entry.kind, uid: entry.uid, mode: entry.mode };
+  }
+
+  async mkdir(path: string, options: { readonly mode?: number } = {}): Promise<void> {
+    path = this.#failIfDefined(path);
+    path = this.#underResolvedParent(path);
+
+    if (this.#entries.has(path)) {
+      throw errnoError("EEXIST", `File already exists: ${path}`);
+    }
+
+    this.#requireDirectory(parentPath(path));
+    const entry = this.#newEntry({ kind: "directory" });
+    entry.mode = (options.mode ?? DEFAULT_MEMORY_MODE) & 0o777;
+    this.#entries.set(path, entry);
+  }
+
+  async chmod(path: string, mode: number): Promise<void> {
+    path = this.#failIfDefined(path);
+    this.#rawEntryAt(path).mode = mode & 0o777;
+  }
+
+  async realpath(path: string): Promise<string> {
+    path = this.#failIfDefined(path);
+    const resolved = this.#resolveLinks(path, 0);
+
+    if (!this.#entries.has(resolved)) {
+      throw errnoError("ENOENT", `No such file or directory: ${path}`);
+    }
+
+    return resolved;
+  }
+
+  async readdir(path: string): Promise<string[]> {
+    path = this.#failIfDefined(path);
+    this.#requireDirectory(path);
+    const prefix = path === "/" ? "/" : `${path}/`;
+    const children = new Set<string>();
+
+    for (const entryPath of this.#entries.keys()) {
+      if (!entryPath.startsWith(prefix) || entryPath === path) {
+        continue;
+      }
+
+      const descendant = entryPath.slice(prefix.length);
+      const child = descendant.split("/")[0];
+      if (child !== undefined && child !== "") {
+        children.add(child);
+      }
+    }
+
+    return [...children].sort();
+  }
+
+  /**
+   * why: Follows symlinks, like the `stat` the Node implementation answers with: a dangling
+   * link is absent, and a path whose parent is a file is a failure rather than a "no".
+   * A double that answered from its raw key set would let code that only works against
+   * the double pass for correct.
+   */
+  async exists(path: string): Promise<boolean> {
+    path = this.#failIfDefined(path);
+
+    try {
+      this.#entryAt(path);
+      return true;
+    } catch (error: unknown) {
+      if (isMissingPathError(error)) {
+        return false;
+      }
+
+      throw error;
+    }
+  }
+
+  async diskFree(_path: string): Promise<number> {
+    return this.freeDiskBytes;
+  }
+
+  async diskSpace(
+    _path: string,
+  ): Promise<{ readonly freeBytes: number; readonly totalBytes: number }> {
+    return { freeBytes: this.freeDiskBytes, totalBytes: this.freeDiskBytes };
+  }
+
+  async directorySize(path: string): Promise<number> {
+    path = memoryPath(path);
+    let total = 0;
+    for (const name of await this.readdir(path)) {
+      const child = this.#failIfDefined(joinMemoryPath(path, name));
+      const entry = this.#rawEntryAt(child);
+      if (entry.kind === "directory") total += await this.directorySize(child);
+      else if (entry.kind === "file") total += fileBytes(entry).byteLength;
+    }
+    return total;
+  }
+
+  async readlink(path: string): Promise<string> {
+    path = this.#failIfDefined(path);
+    const entry = this.#rawEntryAt(this.#underResolvedParent(path));
+    if (entry.kind !== "symlink") throw errnoError("EINVAL", `Not a symbolic link: ${path}`);
+    return entry.target;
+  }
+
+  async replaceSymlink(path: string, given: string): Promise<void> {
+    path = this.#failIfDefined(path);
+    const target = memoryPath(given);
+    const at = this.#underResolvedParent(path);
+    const entry = this.#rawEntryAt(at);
+    if (entry.kind !== "symlink") throw errnoError("EINVAL", `Not a symbolic link: ${path}`);
+    this.#entries.set(at, { ...this.#newEntry({ kind: "symlink", target }), uid: entry.uid });
+  }
+
+  async writeAt(path: string, offset: number, bytes: Uint8Array): Promise<void> {
+    path = this.#failIfDefined(path);
+    const entry = this.#entryAt(path);
+    if (entry.kind !== "file") throw errnoError("EISDIR", `Is a directory: ${path}`);
+    const old = fileBytes(entry);
+    const next = new Uint8Array(Math.max(old.byteLength, offset + bytes.byteLength));
+    next.set(old);
+    next.set(bytes, offset);
+    entry.bytes = next;
+    entry.contents = Buffer.from(next).toString("utf8");
+  }
+
+  /**
+   * why: Test-only: makes every operation on `path` fail with `code`, which is the only way to
+   * reach the branches that turn an unexpected filesystem failure into a typed rejection.
+   */
+  defineFailure(path: string, code: string): void {
+    this.#failures.set(memoryPath(path), code);
+  }
+
+  defineSymlink(path: string, target: string): void {
+    this.#entries.set(
+      memoryPath(path),
+      this.#newEntry({ kind: "symlink", target: memoryPath(target) }),
+    );
+  }
+
+  defineAttributes(
+    path: string,
+    attributes: { readonly uid?: number; readonly mode?: number; readonly modifiedAtMs?: number },
+  ): void {
+    const entry = this.#rawEntryAt(memoryPath(path));
+
+    if (attributes.uid !== undefined) {
+      entry.uid = attributes.uid;
+    }
+
+    if (attributes.mode !== undefined) {
+      entry.mode = attributes.mode & 0o777;
+    }
+
+    if (attributes.modifiedAtMs !== undefined) {
+      entry.modifiedAtMs = attributes.modifiedAtMs;
+    }
+  }
+
+  /** why: every method that takes a path and can fail enters here, so the one place that fails an injected path is also the one that reads a path in either style. */
+  #failIfDefined(given: string): string {
+    const path = memoryPath(given);
+    const code = this.#failures.get(path);
+    if (code !== undefined) {
+      throw errnoError(code, `Injected ${code} failure: ${given}`);
+    }
+    return path;
+  }
+
+  #newEntry(kind: MemoryEntryKind): MemoryEntry {
+    return {
+      ...kind,
+      identity: this.#nextIdentity++,
+      modifiedAtMs: 0,
+      mode: DEFAULT_MEMORY_MODE,
+      uid: this.uid,
+    };
+  }
+
+  #entryAt(path: string): MemoryEntry {
+    return this.#rawEntryAt(this.#resolveLinks(path, 0));
+  }
+
+  #rawEntryAt(path: string): MemoryEntry {
+    const entry = this.#entries.get(path);
+    if (entry === undefined) {
+      // why: Carries `code: "ENOENT"` like Node's real fs errors, so callers that branch on
+      // `isMissingPathError` (rather than swallowing every read failure) behave the same
+      // against this fake as they do against `NodeFilesystem`.
+      throw enoent(path);
+    }
+
+    return entry;
+  }
+
+  /**
+   * why: Resolves symlinks in every component, not just the last one, because that is what
+   * makes the "an ancestor symlink is normal, and not grounds for rejection" case
+   * expressible in a test at all.
+   */
+  #resolveLinks(path: string, hops: number): string {
+    if (path === "/") {
+      return "/";
+    }
+
+    if (hops > MAX_SYMLINK_HOPS) {
+      throw errnoError("ELOOP", `Too many levels of symbolic links: ${path}`);
+    }
+
+    const parent = this.#resolveLinks(parentPath(path), hops);
+    // why: A component that exists but is not a directory cannot be walked through. Node says
+    // ENOTDIR here, and callers tell that apart from ENOENT -- "the path you configured
+    // runs through a file" is a different problem from "it is not there yet".
+    if (this.#entries.get(parent)?.kind === "file") {
+      throw errnoError("ENOTDIR", `Not a directory: ${parent}`);
+    }
+
+    const resolved = joinMemoryPath(parent, path.slice(path.lastIndexOf("/") + 1));
+    const entry = this.#entries.get(resolved);
+
+    return entry?.kind === "symlink" ? this.#resolveLinks(entry.target, hops + 1) : resolved;
+  }
+
+  #underResolvedParent(path: string): string {
+    return joinMemoryPath(
+      this.#resolveLinks(parentPath(path), 0),
+      path.slice(path.lastIndexOf("/") + 1),
+    );
+  }
+
+  #requireDirectory(path: string): void {
+    const entry = this.#entryAt(path);
+    if (entry.kind !== "directory") {
+      throw errnoError("ENOTDIR", `Not a directory: ${path}`);
+    }
+  }
+}
+
+function fileBytes(entry: { readonly contents: string; readonly bytes?: Uint8Array }): Uint8Array {
+  return entry.bytes ?? Buffer.from(entry.contents, "utf8");
+}
+
+/**
+ * why: the fake reads `D:\a\b`, `\a\b` and `/a/b` as one entry, so a test written for the host's
+ * path style passes on every host; production code keeps `node:path`.
+ */
+function memoryPath(path: string): string {
+  const absolute = path.replace(/^[A-Za-z]:(?=[\\/]|$)/, "");
+  return /^[\\/]/.test(absolute) ? absolute.replaceAll("\\", "/") : path;
+}
+
+function joinMemoryPath(parent: string, child: string): string {
+  return parent === "/" || parent === "" ? `/${child}` : `${parent}/${child}`;
+}
+
+function parentPath(path: string): string {
+  const lastSeparator = path.lastIndexOf("/");
+  return lastSeparator <= 0 ? "/" : path.slice(0, lastSeparator);
+}
+
+function nodeKind(details: {
+  isDirectory(): boolean;
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+}): PathDetails["kind"] {
+  if (details.isSymbolicLink()) return "symlink";
+  if (details.isDirectory()) return "directory";
+  return details.isFile() ? "file" : "other";
+}
+
+/**
+ * why: Callers branch on `code` -- an existing root is only "somebody won the race" when the
+ * failure is `EEXIST`, and a path is only absent when the failure is `ENOENT` -- so the
+ * in-memory double has to speak Node's errno vocabulary, not just fail.
+ */
+function errnoError(code: string, message: string): NodeJS.ErrnoException {
+  const error: NodeJS.ErrnoException = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function hasCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+export function isMissingPathError(error: unknown): error is NodeJS.ErrnoException {
+  return hasCode(error, "ENOENT");
+}
+
+function enoent(path: string): NodeJS.ErrnoException {
+  const error = new Error(
+    `ENOENT: no such file or directory, open '${path}'`,
+  ) as NodeJS.ErrnoException;
+  error.code = "ENOENT";
+  return error;
+}

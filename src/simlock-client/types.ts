@@ -1,0 +1,185 @@
+/**
+ * why: every type here is `z.infer`red from a contract schema rather than hand-declared, so a
+ * schema change is a compile-time change here, never a silent drift.
+ */
+import type { z } from "zod";
+
+import type { OPERATIONS, OperationName, PUSH_SCHEMAS } from "../contract/index.js";
+import type { leaseProgressSchema } from "../contract/schemas.js";
+
+type OpInput<Name extends OperationName> = z.infer<(typeof OPERATIONS)[Name]["input"]>;
+type OpOutput<Name extends OperationName> = z.infer<(typeof OPERATIONS)[Name]["output"]>;
+
+export type CatalogGetInput = OpInput<"catalog.get">;
+export type CatalogGetOutput = OpOutput<"catalog.get">;
+export type StatusGetOutput = OpOutput<"status.get">;
+export type LeaseRequestInput = OpInput<"lease.request">;
+/** `lease.request`'s output -- deliberately not named `LeaseRequestOutput` since it is the
+ * thing every frontend actually calls a "grant" (device + lease + timing estimates). */
+export type LeaseGrant = OpOutput<"lease.request">;
+export type LeaseCancelInput = OpInput<"lease.cancel">;
+export type LeaseCancelOutput = OpOutput<"lease.cancel">;
+export type LeaseRenewInput = OpInput<"lease.renew">;
+/** Also `lease.renew`'s output, and the element type of `lease.list`'s array -- one shape,
+ * reused wherever the contract reuses `leaseRecordSchema`. */
+export type LeaseRecord = OpOutput<"lease.renew">;
+export type LeaseReleaseInput = OpInput<"lease.release">;
+export type LeaseReleaseOutput = OpOutput<"lease.release">;
+export type LeaseReleaseRunInput = OpInput<"lease.release-run">;
+export type LeaseReleaseRunOutput = OpOutput<"lease.release-run">;
+export type LeaseListOutput = OpOutput<"lease.list">;
+export type DoctorRunInput = OpInput<"doctor.run">;
+export type DoctorReport = OpOutput<"doctor.run">;
+export type DriverPassthroughInput = OpInput<"driver.passthrough">;
+/** The scoped command `simlock simctl` / `simlock adb` runs; see `passthroughCommandSchema`. */
+export type PassthroughCommand = OpOutput<"driver.passthrough">;
+export type ExecInput = OpInput<"device.exec">;
+export type RotateInput = OpInput<"device.rotate">;
+/** `{ leaseId, orientation }`: what the lease's simulator was turned to. */
+export type RotateOutput = OpOutput<"device.rotate">;
+/** `{ exitCode }` -- the output itself arrived as `onOutput` chunks while the command ran
+ * (ADR 0005 §19a). */
+export type ExecOutput = OpOutput<"device.exec">;
+
+export type LeaseReleaseAllOutput = OpOutput<"lease.release-all">;
+export type ListGetInput = OpInput<"list.get">;
+export type ListGetOutput = OpOutput<"list.get">;
+export type CleanupRunInput = OpInput<"cleanup.run">;
+export type CleanupRunOutput = OpOutput<"cleanup.run">;
+export type NukeRunInput = OpInput<"nuke.run">;
+export type NukeReport = OpOutput<"nuke.run">;
+export type ConfigGetInput = OpInput<"config.get">;
+export type WarmForgetInput = OpInput<"warm.forget">;
+export type WarmForgetOutput = OpOutput<"warm.forget">;
+export type SimlockConfig = OpOutput<"config.get">;
+export type DaemonStopOutput = OpOutput<"daemon.stop">;
+export type DaemonUpdateInput = OpInput<"daemon.update">;
+export type DaemonUpdateOutput = OpOutput<"daemon.update">;
+export type EventsReplayInput = OpInput<"events.replay">;
+export type EventsReplayOutput = OpOutput<"events.replay">;
+export type UsageGetInput = OpInput<"usage.get">;
+export type UsageGetOutput = OpOutput<"usage.get">;
+export type EventsSubscribeOutput = OpOutput<"events.subscribe">;
+export type EventsUnsubscribeOutput = OpOutput<"events.unsubscribe">;
+export type IdentityOutput = OpOutput<"identity.get">;
+export type TokenCreateInput = OpInput<"token.create">;
+export type TokenCreateOutput = OpOutput<"token.create">;
+export type TokenListOutput = OpOutput<"token.list">;
+export type TokenRevokeInput = OpInput<"token.revoke">;
+export type TokenRevokeOutput = OpOutput<"token.revoke">;
+
+// why: Declared on the admin client like every other admin row. A *worker* answers them as a fleet
+// of one (ADR 0012): `worker.list` returns the worker itself, and drain, undrain and remove
+// answer `UNSUPPORTED_IN_WORKER_MODE`. They are not gated client-side: the daemon says what it
+// is, rather than the client guessing from a mode it was never told.
+
+export type WorkerListOutput = OpOutput<"worker.list">;
+/** One worker as the gateway currently sees it, or a single host as it sees itself -- the shape
+ * `simlock worker list` renders. */
+export type WorkerView = WorkerListOutput["workers"][number];
+export type WorkerDrainInput = OpInput<"worker.drain">;
+export type WorkerDrainOutput = OpOutput<"worker.drain">;
+export type WorkerUndrainOutput = OpOutput<"worker.undrain">;
+export type WorkerRemoveOutput = OpOutput<"worker.remove">;
+export type WorkerUpdateInput = OpInput<"worker.update">;
+export type WorkerUpdateOutput = OpOutput<"worker.update">;
+
+export type AlertsTestInput = OpInput<"alerts.test">;
+export type AlertsTestOutput = OpOutput<"alerts.test">;
+
+export type SeedMakeInput = OpInput<"seed.make">;
+export type SeedMakeOutput = OpOutput<"seed.make">;
+export type ComponentInstallInput = OpInput<"component.install">;
+export type ComponentInstallOutput = OpOutput<"component.install">;
+export type ComponentListInput = OpInput<"component.list">;
+export type ComponentListOutput = OpOutput<"component.list">;
+export type WorkerInstallComponentInput = OpInput<"worker.install-component">;
+export type WorkerInstallComponentOutput = OpOutput<"worker.install-component">;
+export type ComponentRemoveInput = OpInput<"component.remove">;
+export type ComponentRemoveOutput = OpOutput<"component.remove">;
+export type BaselineSaveInput = OpInput<"baseline.save">;
+export type BaselineSaveOutput = OpOutput<"baseline.save">;
+export type BaselineListOutput = OpOutput<"baseline.list">;
+export type BaselineRemoveInput = OpInput<"baseline.remove">;
+export type BaselineRemoveOutput = OpOutput<"baseline.remove">;
+export type DeviceAddInput = OpInput<"device.add">;
+export type DeviceAddOutput = OpOutput<"device.add">;
+export type DeviceRemoveInput = OpInput<"device.remove">;
+export type DeviceRemoveOutput = OpOutput<"device.remove">;
+
+export type LeaseProgress = z.infer<typeof leaseProgressSchema>;
+export type EventPush = z.infer<(typeof PUSH_SCHEMAS)["event"]>;
+export type ComponentInstallProgress = z.infer<
+  (typeof PUSH_SCHEMAS)["component-progress"]
+>["progress"];
+
+/** One `seed-progress` push a running `makeSeed` call heard: the seed it is about and its stage. */
+export type SeedProgressUpdate = Omit<z.infer<(typeof PUSH_SCHEMAS)["seed-progress"]>, "requestId">;
+
+/**
+ * One chunk of a running `device.exec` command's output. The `requestId` the push carries on
+ * the wire is deliberately absent here: it is the wire's own correlation key, already consumed
+ * by the time a chunk reaches the `onOutput` of the call it belongs to.
+ */
+export interface DeviceOutputChunk {
+  readonly stream: "stdout" | "stderr";
+  readonly chunk: string;
+}
+
+export interface LeaseLostPush {
+  readonly leaseId: string;
+  readonly deviceId: string;
+  /**
+   * why: Why the daemon ended this lease: `"expired"`, `"explicit"`, `"killed"`, or
+   * `"device-lost"`. Always server-reported -- ADR 0004 §3 removed the client-synthesized
+   * `"daemon-connection-lost"`, because a dead connection ends no lease, and `"closed"` left
+   * the daemon's own vocabulary with it. Not a closed enum on the wire, so kept as `string`
+   * here rather than invented.
+   */
+  readonly reason: string;
+}
+
+export interface DeviceUnhealthyPush {
+  readonly leaseId: string;
+  readonly deviceId: string;
+}
+
+export interface DeviceRecoveredPush {
+  readonly leaseId: string;
+  readonly deviceId: string;
+  readonly attempts: number;
+}
+
+/** ADR 0005 §19a: `onOutput` is to `exec` what `onProgress` is to `requestLease` -- the live
+ * half of one call, delivered while it is still in flight. A caller that omits it still gets
+ * the exit code; the output is simply not observed. */
+export interface ExecOptions {
+  readonly onOutput?: (chunk: DeviceOutputChunk) => void;
+  /** why: ADR 0005 §19a: the command's process now exists on the machine that owns the device --
+   * fired once, after every failure that can happen before a process exists and before any
+   * output. A transport chooses its response shape on this, which is why a gateway forwarding
+   * the command relays it rather than inferring one. */
+  readonly onStarted?: () => void;
+}
+
+export interface MakeSeedOptions {
+  readonly onProgress?: (update: SeedProgressUpdate) => void;
+}
+
+export interface InstallComponentOptions {
+  readonly onProgress?: (progress: ComponentInstallProgress) => void;
+}
+
+/** One progress update a gateway relayed from one of its workers (ADR 0010 §7). */
+export type WorkerComponentProgress = ComponentInstallProgress & { readonly workerId: string };
+
+export interface InstallComponentOnWorkersOptions {
+  readonly onProgress?: (progress: WorkerComponentProgress) => void;
+}
+
+export interface RequestLeaseOptions {
+  /** why: aborting sends `lease.cancel` rather than just dropping the wait, so a queued request is
+   * withdrawn on the daemon instead of being granted later; an abort after the grant is ignored. */
+  readonly signal?: AbortSignal;
+  readonly onProgress?: (progress: LeaseProgress) => void;
+}

@@ -1,0 +1,318 @@
+import { execFile } from "node:child_process";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import { describe, expect, it } from "vitest";
+
+import { IOS, withDaemon } from "./helpers/index.js";
+import {
+  iosDeviceSet,
+  setDevices,
+  sweepStaleDeviceSets,
+  type SimctlDevice,
+} from "./helpers/ios-device-set.js";
+import type { TestEnv } from "./helpers/env.js";
+import { waitFor } from "./helpers/wait.js";
+
+const execFileAsync = promisify(execFile);
+
+async function defaultSetDevices(): Promise<SimctlDevice[]> {
+  const { stdout } = await execFileAsync("xcrun", ["simctl", "list", "devices", "-j"]);
+  const parsed = JSON.parse(stdout) as { devices: Record<string, SimctlDevice[]> };
+  return Object.values(parsed.devices).flat();
+}
+
+/** why: Runtimes are global: a custom set lists the same ones the default set does. */
+async function simctlRuntimes(): Promise<string[]> {
+  const { stdout } = await execFileAsync("xcrun", ["simctl", "list", "runtimes", "-j"]);
+  const parsed = JSON.parse(stdout) as {
+    runtimes: { name: string; version: string; isAvailable: boolean }[];
+  };
+  return parsed.runtimes.filter((runtime) => runtime.isAvailable).map((runtime) => runtime.version);
+}
+
+function expectRuntimesAgree(reported: readonly string[] | undefined, available: string[]): void {
+  for (const runtime of reported ?? []) {
+    expect(available, "simlock catalog's runtimes must agree with real simctl").toContain(runtime);
+  }
+}
+
+async function iosPhoneDefault(env: TestEnv): Promise<string | undefined> {
+  const reported = await env.cli(["catalog", "--json", "--platform", "ios"]);
+  expect(reported.code, `catalog failed: ${reported.stderr}`).toBe(0);
+  const platforms = (
+    reported.json as { platforms: { platform: string; classDefaults: Record<string, string> }[] }
+  ).platforms;
+  return platforms.find((platform) => platform.platform === "ios")?.classDefaults["phone"];
+}
+
+async function expectConfiguredPhoneDefaults(
+  env: TestEnv,
+  models: readonly string[] | undefined,
+): Promise<void> {
+  expect(models ?? [], "this lane needs the host's simctl to list iPhone 15").toContain(
+    "iPhone 15",
+  );
+  await env.withConfig({ ios: { defaultModels: { phone: ["iPhone 15"] } } }, async () => {
+    expect(await iosPhoneDefault(env)).toBe("iPhone 15");
+  });
+  await env.withConfig(
+    { ios: { defaultModels: { phone: ["Simlock Unlisted Phone"] } } },
+    async () => {
+      expect(await iosPhoneDefault(env)).toBe("iPhone 17");
+    },
+  );
+}
+
+// why: This lane needs the real simctl toolchain, hence darwin-only and gated on an
+// installed runtime -- it never installs one itself (no --allow-download).
+/**
+ * `simlock simctl` against a real simctl, which is the only way to know the wrapper
+ * resolves a UDID a bare simctl cannot see -- and that the lifecycle verbs it must not
+ * proxy come back as a usage error instead of destroying the leased device.
+ */
+async function expectSimctlPassthrough(env: TestEnv, udid: string): Promise<void> {
+  const wrapped = await env.cli(["simctl", "list", "devices", "-j"]);
+  expect(wrapped.code, `simlock simctl failed: ${wrapped.stderr}`).toBe(0);
+  expect(wrapped.stdout).toContain(udid);
+
+  const refused = await env.cli(["simctl", "delete", udid]);
+  expect(refused.code, "simlock simctl delete must be refused, not run").toBe(2);
+  expect(refused.error).toMatchObject({ code: "USAGE" });
+}
+
+describe.skipIf(process.platform !== "darwin")(
+  "iOS smoke (real simctl)",
+  { tags: ["slow", "ios"] },
+  () => {
+    it(
+      "catalog agrees with simctl, a cold lease boots a real Booted simulator inside Simlock's own device set with matching provenance, release deletes it from the set, and nuke empties the set",
+      { timeout: 300_000 },
+      async () => {
+        await sweepStaleDeviceSets();
+        const availableRuntimes = await simctlRuntimes();
+        if (availableRuntimes.length === 0) {
+          throw new Error("No installed, available iOS runtime -- cannot run the iOS smoke lane");
+        }
+
+        const env = await withDaemon({ driver: "real" });
+        const deviceSet = iosDeviceSet(env.home);
+        const catalog = await env.cli(["catalog", "--json", "--platform", "ios"]);
+        expect(catalog.code).toBe(0);
+        const platforms = (
+          catalog.json as {
+            platforms: {
+              platform: string;
+              models: string[];
+              runtimes: string[];
+              modelClasses: Record<string, string>;
+              classDefaults: Record<string, string>;
+            }[];
+          }
+        ).platforms;
+        const iosCatalog = platforms.find((platform) => platform.platform === "ios");
+        expect(iosCatalog, "simlock catalog reported no iOS platform").toBeDefined();
+        expect(
+          iosCatalog?.models.length ?? 0,
+          "simlock catalog reported no iOS models",
+        ).toBeGreaterThan(0);
+        expect(iosCatalog?.modelClasses["iPhone 17"]).toBe("phone");
+        expect(iosCatalog?.modelClasses["Apple Watch Series 11 (46mm)"]).toBe("watch");
+        expect(iosCatalog?.classDefaults["phone"]).toBe("iPhone 17");
+        await expectConfiguredPhoneDefaults(env, iosCatalog?.models);
+        expectRuntimesAgree(iosCatalog?.runtimes, availableRuntimes);
+        const model = iosCatalog?.models[0] as string;
+
+        const lease = await env.cli(
+          ["lease", "--platform", "ios", "--device", model, "--agent-id", "ios-smoke", "--detach"],
+          { timeout: 120_000 },
+        );
+        expect(lease.code, `lease failed: ${lease.stderr}`).toBe(0);
+        const grant = lease.json as {
+          device: { driverDeviceId: string };
+          environment: Record<string, string>;
+          lease: { id: string };
+        };
+        // why: On iOS the driver's device id is the simulator's UDID.
+        const udid = grant.device.driverDeviceId;
+
+        // why: The grant has to say how to reach the device, because nothing else does: the
+        // UDID below resolves to nothing without this path (ADR 0001, decision 7).
+        expect(grant.environment).toEqual({ SIMLOCK_IOS_DEVICE_SET: deviceSet });
+
+        await expectSimctlPassthrough(env, udid);
+
+        const booted = await setDevices(deviceSet);
+        const bootedDevice = booted.find((device) => device.udid === udid);
+        expect(
+          bootedDevice,
+          `simctl --set ${deviceSet} does not know about udid ${udid}`,
+        ).toBeDefined();
+        expect(bootedDevice?.state).toBe("Booted");
+        // why: The naming is a label with no authority behind it (safety rule 8) -- what
+        // proves ownership is the set the device was just found in -- but it is still
+        // what a human reads in the simulator window title, so it stays checked.
+        expect(
+          bootedDevice?.name.startsWith("simlock-"),
+          "device name must carry the simlock- prefix",
+        ).toBe(true);
+        expect(
+          (await defaultSetDevices()).some((device) => device.udid === udid),
+          "a Simlock simulator must be invisible in the machine's default device set",
+        ).toBe(false);
+
+        // why: a copy of the seed keeps no LaunchServices database naming the seed's folder, so a system app's data lives under the lease's own UDID.
+        const safariData = await env.cli([
+          "simctl",
+          "get_app_container",
+          udid,
+          "com.apple.mobilesafari",
+          "data",
+        ]);
+        expect(safariData.code, `get_app_container failed: ${safariData.stderr}`).toBe(0);
+        expect(safariData.stdout.trim()).toContain(`/${udid}/`);
+
+        const doctorReport = await env.cli(["doctor"]);
+        expect(doctorReport.code).toBe(0);
+        const findings = (doctorReport.json as { findings: { kind: string; deviceId?: string }[] })
+          .findings;
+        const devices = (await env.cli(["list", "--devices"])).json as {
+          id: string;
+          driverDeviceId: string;
+        }[];
+        const registryId = devices.find((device) => device.driverDeviceId === udid)?.id;
+        expect(
+          findings.some(
+            (finding) =>
+              finding.kind === "foreign-provenance-change" && finding.deviceId === registryId,
+          ),
+          "expected no provenance drift for a device simlock just created",
+        ).toBe(false);
+        expect(
+          findings.some((finding) => finding.kind === "driver-unavailable"),
+          "the iOS driver must have started, with a root it owns",
+        ).toBe(false);
+
+        const release = await env.cli(["release", grant.lease.id]);
+        expect(release.code, `release failed: ${release.stderr}`).toBe(0);
+
+        // why: a released simulator is deleted, never wiped and kept; the pool may boot another of the kind, never this one.
+        await waitFor(
+          async () => {
+            const rows = (await env.cli(["list", "--devices"])).json as {
+              driverDeviceId: string;
+              state: string;
+            }[];
+            return rows.some((row) => row.driverDeviceId === udid && row.state === "deleted");
+          },
+          { timeout: 60_000, label: "device is deleted after release" },
+        );
+        expect((await setDevices(deviceSet)).some((device) => device.udid === udid)).toBe(false);
+
+        const nuke = await env.cli(["nuke", "--delete-devices", "--yes"], { timeout: 60_000 });
+        expect(nuke.code).toBe(0);
+
+        await waitFor(async () => (await setDevices(deviceSet)).length === 0, {
+          timeout: 60_000,
+          label: "no simulator remains in Simlock's device set after nuke --delete-devices",
+        });
+      },
+    );
+
+    it(
+      "a platform-only lease grants the first listed phone model and accepts an immediate install, including on the new simulator after a release",
+      { timeout: 300_000 },
+      async () => {
+        await sweepStaleDeviceSets();
+        const env = await withDaemon({
+          driver: "real",
+          // why: the pool would refill the released kind, so the device set would hold more than the copy.
+          configOverrides: { warmPool: { enabled: false } },
+        });
+        const deviceSet = iosDeviceSet(env.home);
+        const phone = await iosPhoneDefault(env);
+        expect(phone, "the catalog lists no default phone for iOS").toBeDefined();
+        const request = ["lease", "--platform", "ios", "--agent-id", "ios-class", "--detach"];
+        type Grant = {
+          device: { id: string; driverDeviceId: string; spec: { model: string } };
+          lease: { id: string };
+        };
+
+        const first = await env.cli(request, { timeout: 120_000 });
+        expect(first.code, `lease failed: ${first.stderr}`).toBe(0);
+        const firstGrant = first.json as Grant;
+        const udid = firstGrant.device.driverDeviceId;
+        const firstInstall = await env.cli(["simctl", "install", udid, IOS.app]);
+        expect(firstInstall.code, `first install failed: ${firstInstall.stderr}`).toBe(0);
+        expect(firstGrant.device.spec.model).toBe(phone);
+        const bootedDevice = (await setDevices(deviceSet)).find((device) => device.udid === udid);
+        expect(bootedDevice?.state).toBe("Booted");
+
+        const release = await env.cli(["release", firstGrant.lease.id]);
+        expect(release.code, `release failed: ${release.stderr}`).toBe(0);
+        await waitFor(
+          async () => {
+            const rows = (await env.cli(["list", "--devices"])).json as {
+              driverDeviceId: string;
+              state: string;
+            }[];
+            return rows.some((row) => row.driverDeviceId === udid && row.state === "deleted");
+          },
+          { timeout: 60_000, label: "device is deleted after release" },
+        );
+
+        const second = await env.cli(request, { timeout: 120_000 });
+        expect(second.code, `second lease failed: ${second.stderr}`).toBe(0);
+        const secondGrant = second.json as Grant;
+        const secondInstall = await env.cli([
+          "simctl",
+          "install",
+          secondGrant.device.driverDeviceId,
+          IOS.app,
+        ]);
+        expect(
+          secondInstall.code,
+          `install on the new simulator failed: ${secondInstall.stderr}`,
+        ).toBe(0);
+        expect(
+          secondGrant.device.driverDeviceId,
+          "a released simulator is never granted again",
+        ).not.toBe(udid);
+        const copies = await setDevices(deviceSet);
+        expect(copies.some((device) => device.udid === udid)).toBe(false);
+        expect(
+          copies.map((device) => device.udid),
+          "the device set holds the copy only",
+        ).toEqual([secondGrant.device.driverDeviceId]);
+        const seeds = await setDevices(join(deviceSet, "sources"));
+        expect(
+          seeds.map((seed) => seed.state),
+          "the sources set holds the seed shut down",
+        ).toEqual(["Shutdown"]);
+
+        const doctorReport = await env.cli(["doctor"]);
+        expect(doctorReport.code, doctorReport.stderr).toBe(0);
+        const iosSeeds = (
+          doctorReport.json as {
+            sources: { platform: string; kind: string; sizeBytes?: number }[];
+          }
+        ).sources.filter((source) => source.platform === "ios" && source.kind === "seed");
+        expect(iosSeeds, "doctor lists one iOS seed").toHaveLength(1);
+        expect(iosSeeds[0]?.sizeBytes ?? 0).toBeGreaterThan(0);
+
+        const ready = (await env.events()).find(
+          (entry) =>
+            entry.event === "device.ready" &&
+            (entry.payload as { deviceId?: string }).deviceId === secondGrant.device.id,
+        );
+        expect(
+          (ready?.payload as { bootDuration?: number } | undefined)?.bootDuration,
+          "the second device is a copy of the seed, booted in under 30 s",
+        ).toBeLessThan(30_000);
+
+        await env.cli(["release", secondGrant.lease.id]);
+        const nuke = await env.cli(["nuke", "--delete-devices", "--yes"], { timeout: 60_000 });
+        expect(nuke.code).toBe(0);
+      },
+    );
+  },
+);

@@ -1,0 +1,478 @@
+import { z } from "@hono/zod-openapi";
+
+import {
+  deviceClassSchema,
+  deviceRecordSchema,
+  baselineNameSchema,
+  imageTagSchema,
+  exceptCategoriesSchema,
+  EXEC_STDIN_MAX_LENGTH,
+  LEASE_FILE_NAME_PATTERN,
+  INPUT_ORIENTATIONS,
+  leaseIdSchema,
+  leaseRequestFields,
+  OPERATIONS,
+  refuseBadLabel,
+  refuseBadRunId,
+  refuseModelWithClass,
+  requesterIdSchema,
+  waitingRequestSchema,
+  WARM_POOL_NAME_MAX,
+} from "../contract/index.js";
+import { declareRoute, firstValue, sseMessage } from "./routes.js";
+
+const leaseParamsSchema = z.object({ id: z.string() });
+
+const leasePayloadSchema = z.object({
+  address: z.string().optional(),
+  createdAt: z.string(),
+  dataPlane: z.null(),
+  device: z.string(),
+  deviceId: z.string(),
+  expiresAt: z.string(),
+  id: z.string(),
+  baseline: z.object({ name: z.string(), version: z.number().int() }).optional(),
+  imageTag: z.string().optional(),
+  mode: z.enum(["slim", "full"]).optional(),
+  except: exceptCategoriesSchema.optional(),
+  os: z.string(),
+  platform: z.string(),
+  requestId: z.string().optional(),
+  runId: z.string().max(128).optional(),
+  label: z.string().max(64).optional(),
+  ttlMs: z.number(),
+  udid: z.string(),
+  worker: z.object({ id: z.string(), label: z.string().optional() }).optional(),
+  workerId: z.string().optional(),
+});
+
+const requestErrorSchema = z.object({ code: z.string(), message: z.string() });
+
+const requestBaseShape = { createdAt: z.string(), id: z.string() };
+
+export const leaseRequestViewSchema = z.discriminatedUnion("state", [
+  z.object({ ...requestBaseShape, queuePosition: z.number(), state: z.literal("queued") }),
+  z.object({
+    ...requestBaseShape,
+    component: z.string(),
+    percent: z.number().optional(),
+    state: z.literal("downloading"),
+    waiting: z.boolean(),
+  }),
+  z.object({
+    ...requestBaseShape,
+    etaSeconds: z.number(),
+    state: z.enum(["reclaiming", "provisioning", "booting"]),
+  }),
+  z.object({ ...requestBaseShape, lease: leasePayloadSchema, state: z.literal("granted") }),
+  z.object({ ...requestBaseShape, error: requestErrorSchema, state: z.literal("failed") }),
+  z.object({ ...requestBaseShape, state: z.literal("cancelled") }),
+]);
+
+const leaseRequestReplySchema = z.object({ request: leaseRequestViewSchema });
+
+const waitQuerySchema = z
+  .object({
+    wait: firstValue(z.string())
+      .optional()
+      .openapi({ description: "Seconds to wait for the request to change; at most 60." }),
+  })
+  .superRefine((query, context) => {
+    if (query.wait === undefined) return;
+    const seconds = Number(query.wait);
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      context.addIssue({
+        code: "custom",
+        message: "wait must be a non-negative number of seconds",
+        path: [],
+      });
+    }
+  });
+
+const deviceUnhealthySchema = z.object({ event: z.literal("device_unhealthy") });
+const deviceRecoveredSchema = z.object({
+  attempts: z.number(),
+  event: z.literal("device_recovered"),
+});
+const leaseLostSchema = z.object({ event: z.literal("lease_lost"), reason: z.string() });
+
+const leaseNoticeSchema = z.discriminatedUnion("event", [
+  deviceUnhealthySchema,
+  deviceRecoveredSchema,
+  leaseLostSchema,
+]);
+
+// why: `ttlMs` is read as unknown so that each way it can be wrong keeps its own whole-body message.
+const renewBodySchema = z
+  .object(
+    {
+      ttlMs: z
+        .unknown()
+        .optional()
+        .openapi({ description: "The new width of the lease, in ms.", type: "number" }),
+    },
+    { error: "Body must be a JSON object" },
+  )
+  .superRefine((body, context) => {
+    if (body.ttlMs === undefined) return;
+    if (typeof body.ttlMs !== "number") {
+      context.addIssue({ code: "custom", message: "ttlMs must be a number", path: [] });
+    } else if (!Number.isFinite(body.ttlMs) || body.ttlMs <= 0) {
+      context.addIssue({ code: "custom", message: "ttlMs must be a positive number", path: [] });
+    }
+  })
+  .transform((body) => (typeof body.ttlMs === "number" ? { ttlMs: body.ttlMs } : {}));
+
+export const leaseRenewRoute = declareRoute({
+  method: "post",
+  path: "/v1/leases/{id}/renew",
+  tag: "Leases",
+  summary: "Renew a lease",
+  role: "agent",
+  notes: "The body is optional; without a ttlMs the lease keeps its own width.",
+  request: { params: leaseParamsSchema, optionalJson: renewBodySchema },
+  reply: z.object({
+    expiresAt: z.string(),
+    leaseId: z.string(),
+    notices: z.array(leaseNoticeSchema),
+  }),
+  errors: { 404: ["UNKNOWN_LEASE"] },
+});
+
+// why: `stdin` and `requesterId` also accept `null` and normalize it to omitted: the documented example sends them as `null`.
+const execBodySchema = z
+  .object({
+    tool: z.string().min(1),
+    args: z.array(z.string()),
+    stdin: z
+      .string()
+      .max(EXEC_STDIN_MAX_LENGTH)
+      .nullish()
+      .transform((value) => value ?? undefined),
+    stdinFile: z
+      .string()
+      .regex(LEASE_FILE_NAME_PATTERN)
+      .nullish()
+      .transform((value) => value ?? undefined),
+    requesterId: requesterIdSchema.nullish().transform((value) => value ?? undefined),
+  })
+  .strict();
+
+const execMessageSchema = sseMessage({
+  error: z.object({ error: z.object({ code: z.string(), message: z.string() }) }),
+  exit: z.object({ exitCode: z.number() }),
+  output: z.object({ chunk: z.string(), stream: z.enum(["stdout", "stderr"]) }),
+});
+
+export const leaseExecRoute = declareRoute({
+  method: "post",
+  path: "/v1/leases/{id}/exec",
+  tag: "Leases",
+  summary: "Run a tool against the lease's device",
+  role: "agent",
+  notes:
+    "Answers a stream of messages: output, then exit or error. A failure before the command starts is a plain JSON error.",
+  request: { params: leaseParamsSchema, json: execBodySchema },
+  stream: execMessageSchema,
+  errors: {
+    404: ["UNKNOWN_LEASE", "UNKNOWN_FILE"],
+    501: ["UNSUPPORTED_IN_GATEWAY_MODE"],
+    504: ["EXEC_TIMEOUT"],
+  },
+});
+
+const rotateBodySchema = z.object({ orientation: z.enum(INPUT_ORIENTATIONS) }).strict();
+
+export const leaseRotateRoute = declareRoute({
+  method: "post",
+  path: "/v1/leases/{id}/rotate",
+  tag: "Leases",
+  summary: "Rotate the lease's iOS simulator",
+  role: "agent",
+  notes:
+    "Turns an iPhone or iPad simulator (not a foldable iPhone Duo), whether or not the input module is on. Answers once the event is written to the simulator's input helper. Any other device answers 422.",
+  request: { params: leaseParamsSchema, json: rotateBodySchema },
+  reply: OPERATIONS["device.rotate"].output,
+  errors: {
+    404: ["UNKNOWN_LEASE"],
+    422: ["ROTATION_UNSUPPORTED"],
+    503: ["INPUT_UNAVAILABLE", "WORKER_UNREACHABLE"],
+    504: ["EXEC_TIMEOUT"],
+  },
+});
+
+export const leaseRequestGetRoute = declareRoute({
+  method: "get",
+  path: "/v1/lease-requests/{id}",
+  tag: "Lease requests",
+  summary: "Read a lease request, optionally waiting for it to change",
+  role: "agent",
+  notes: "Its owner or an operator.",
+  request: { params: leaseParamsSchema, query: waitQuerySchema },
+  reply: leaseRequestReplySchema,
+  errors: { 404: ["UNKNOWN_LEASE_REQUEST"] },
+});
+
+export const leaseRequestBodySchema = z
+  .object({
+    allowDownload: z.boolean().optional(),
+    baseline: baselineNameSchema.optional(),
+    class: deviceClassSchema.optional(),
+    device: z.string().min(1).max(WARM_POOL_NAME_MAX).optional(),
+    imageTag: imageTagSchema.optional(),
+    leaseId: leaseIdSchema.optional(),
+    mode: z.enum(["slim", "full"]).optional(),
+    // why: a plain record of plain strings; `lease.request`'s own check bounds it and words the refusal (keys, characters), as for the CLI.
+    metadata: z.record(z.string(), z.string()).optional(),
+    // why: a coarse bound only; `lease.request`'s own check words the refusal (count, characters, repeats), as for the CLI and MCP.
+    except: z.array(z.string().max(64)).max(64).optional(),
+    noWait: z.boolean().optional(),
+    // why: forwarded, not dropped: the dispatcher's `lease.request` handler alone decides whether this token may set it.
+    owner: z.string().min(1).optional(),
+    os: z.string().min(1).optional(),
+    physical: z.boolean().optional(),
+    platform: z.enum(["ios", "android"]),
+    // why: A plain string, bounded by `refuseBadRunId` below as the one check, like `lease.request`'s: the same words on every transport.
+    runId: z.string().optional(),
+    // why: A plain string, bounded by `refuseBadLabel` below as the one check, like `lease.request`'s: the same words on every transport.
+    label: z.string().optional(),
+    // why: the operation's own field, so the names, the bound of 8 and the repeat check are worded as on every transport.
+    requires: leaseRequestFields.shape.requires,
+    timeoutMs: z.number().int().positive().optional(),
+    ttlMs: z.number().int().positive().optional(),
+  })
+  .strict()
+  .superRefine((body, context) =>
+    refuseModelWithClass("device")({ model: body.device, class: body.class }, context),
+  )
+  .superRefine(refuseBadRunId())
+  .superRefine(refuseBadLabel());
+
+export const leaseRequestCreateRoute = declareRoute({
+  method: "post",
+  path: "/v1/lease-requests",
+  tag: "Lease requests",
+  summary: "Ask for a lease",
+  role: "agent",
+  notes: "Answers 201 with the request once the daemon has stored it; read it back by its id.",
+  request: {
+    headers: z.object({
+      "Idempotency-Key": z
+        .string()
+        .optional()
+        .openapi({ description: "A repeat of the same key answers the stored request." }),
+    }),
+    json: leaseRequestBodySchema,
+  },
+  reply: leaseRequestReplySchema,
+  replyHeaders: z.object({ Location: z.string().openapi({ description: "The request's URL." }) }),
+  status: 201,
+  errors: {
+    409: ["LEASE_ID_TAKEN", "LEASE_ENDED", "REQUESTER_ALREADY_LEASED"],
+    403: ["ADMISSION_DENIED"],
+    404: ["UNKNOWN_BASELINE"],
+    422: ["UNKNOWN_MODEL", "MODE_UNAVAILABLE", "BASELINE_MISMATCH", "BASELINE_STALE"],
+    503: ["NO_CAPACITY", "ADMISSION_FAILED"],
+  },
+  errorExtras: {
+    409: { fields: { existingLeaseId: z.string().optional() } },
+    503: {
+      fields: {
+        capacityReason: z
+          .enum([
+            "device-limit",
+            "ram-budget",
+            "memory-pressure",
+            "global-running-limit",
+            "platform-running-limit",
+          ])
+          .optional(),
+      },
+      headers: {
+        "Retry-After": z
+          .string()
+          .optional()
+          .openapi({ description: "Seconds to wait before asking again; sent with NO_CAPACITY." }),
+      },
+    },
+  },
+});
+
+export const requestsReplySchema = z.object({ requests: z.array(waitingRequestSchema) });
+
+export const leaseRequestListRoute = declareRoute({
+  method: "get",
+  path: "/v1/lease-requests",
+  tag: "Lease requests",
+  summary: "Every request waiting for a device",
+  role: "admin",
+  reply: requestsReplySchema,
+});
+
+export const leaseRequestEventsRoute = declareRoute({
+  method: "get",
+  path: "/v1/lease-requests/{id}/events",
+  tag: "Lease requests",
+  summary: "Stream a lease request's stages",
+  role: "agent",
+  notes:
+    "Its owner or an operator. A stream of messages, one per stage, each carrying the request; it ends at granted, failed or cancelled.",
+  request: { params: leaseParamsSchema },
+  stream: sseMessage({
+    queued: leaseRequestViewSchema,
+    downloading: leaseRequestViewSchema,
+    reclaiming: leaseRequestViewSchema,
+    provisioning: leaseRequestViewSchema,
+    booting: leaseRequestViewSchema,
+    granted: leaseRequestViewSchema,
+    failed: leaseRequestViewSchema,
+    cancelled: leaseRequestViewSchema,
+  }),
+  errors: { 404: ["UNKNOWN_LEASE_REQUEST"] },
+});
+
+export const leaseRequestCancelRoute = declareRoute({
+  method: "delete",
+  path: "/v1/lease-requests/{id}",
+  tag: "Lease requests",
+  summary: "Cancel a lease request",
+  role: "agent",
+  notes: "Its owner or an operator. Answers 204.",
+  request: { params: leaseParamsSchema },
+  status: 204,
+  errors: { 404: ["UNKNOWN_LEASE_REQUEST"], 409: ["REQUEST_NOT_CANCELLABLE"] },
+  errorExtras: { 409: { fields: { leaseId: z.string().optional() } } },
+});
+
+export const leaseListRoute = declareRoute({
+  method: "get",
+  path: "/v1/leases",
+  tag: "Leases",
+  summary: "The caller's leases; an operator sees every lease",
+  role: "agent",
+  reply: OPERATIONS["lease.list"].output,
+});
+
+export const leaseGetRoute = declareRoute({
+  method: "get",
+  path: "/v1/leases/{id}",
+  tag: "Leases",
+  summary: "Read one lease",
+  role: "agent",
+  notes: "A lease the caller does not own answers 404, as an unknown one does.",
+  request: { params: leaseParamsSchema },
+  reply: z.object({ lease: leasePayloadSchema }),
+  errors: { 404: ["UNKNOWN_LEASE"] },
+});
+
+export const leaseEventsRoute = declareRoute({
+  method: "get",
+  path: "/v1/leases/{id}/events",
+  tag: "Leases",
+  summary: "Stream a lease's health notices",
+  role: "agent",
+  notes:
+    "A lease the caller does not own answers 404. A stream of messages; it ends on lease_lost.",
+  request: { params: leaseParamsSchema },
+  stream: sseMessage({
+    device_unhealthy: deviceUnhealthySchema,
+    device_recovered: deviceRecoveredSchema,
+    lease_lost: leaseLostSchema,
+  }),
+  errors: { 404: ["UNKNOWN_LEASE"] },
+});
+
+export const leaseReleaseRoute = declareRoute({
+  method: "delete",
+  path: "/v1/leases/{id}",
+  tag: "Leases",
+  summary: "Release a lease",
+  role: "agent",
+  request: { params: leaseParamsSchema },
+  reply: z.object({
+    device: z.object({ id: z.string(), state: deviceRecordSchema.shape.state }),
+    released: z.literal(true),
+  }),
+  status: 202,
+  errors: { 404: ["UNKNOWN_LEASE"] },
+});
+
+const leaseFileParamsSchema = z.object({ id: z.string(), name: z.string() });
+
+const leaseFileSchema = z.object({ name: z.string(), size: z.number().int() });
+
+export const leaseFilePutRoute = declareRoute({
+  method: "put",
+  path: "/v1/leases/{id}/files/{name}",
+  tag: "Leases",
+  summary: "Upload a file to the lease's folder",
+  role: "agent",
+  notes:
+    "The body is the file's raw bytes: up to 2 GiB a file and 4 GiB a lease, streamed to disk. The same name again replaces the file; names match ignoring case. An upload is cut only after 330 s with no byte.",
+  request: { params: leaseFileParamsSchema, octetBody: true },
+  reply: leaseFileSchema,
+  status: 201,
+  errors: {
+    404: ["UNKNOWN_LEASE"],
+    408: ["UPLOAD_STALLED"],
+    409: ["FILE_BUSY"],
+    413: ["FILE_TOO_LARGE", "LEASE_FILES_FULL"],
+    422: ["INSUFFICIENT_DISK_SPACE"],
+    503: ["WORKER_UNREACHABLE"],
+  },
+});
+
+export const leaseFileGetRoute = declareRoute({
+  method: "get",
+  path: "/v1/leases/{id}/files/{name}",
+  tag: "Leases",
+  summary: "Download a file from the lease's folder",
+  role: "agent",
+  notes:
+    "Answers the whole file, or one byte range of it (`Range: bytes=a-b`, `a-` or `-n`) as 206. A start past the end answers 416 with `Content-Range: bytes */<size>`.",
+  request: { params: leaseFileParamsSchema },
+  binaryReply: true,
+  alsoStatus: 206,
+  errors: { 404: ["UNKNOWN_LEASE", "UNKNOWN_FILE"], 503: ["WORKER_UNREACHABLE"] },
+});
+
+export const leaseFileDeleteRoute = declareRoute({
+  method: "delete",
+  path: "/v1/leases/{id}/files/{name}",
+  tag: "Leases",
+  summary: "Delete a file from the lease's folder",
+  role: "agent",
+  request: { params: leaseFileParamsSchema },
+  status: 204,
+  errors: { 404: ["UNKNOWN_LEASE", "UNKNOWN_FILE"], 503: ["WORKER_UNREACHABLE"] },
+});
+
+export const leaseFileListRoute = declareRoute({
+  method: "get",
+  path: "/v1/leases/{id}/files",
+  tag: "Leases",
+  summary: "List the files in the lease's folder",
+  role: "agent",
+  request: { params: leaseParamsSchema },
+  reply: z.object({ files: z.array(leaseFileSchema) }),
+  errors: { 404: ["UNKNOWN_LEASE"], 503: ["WORKER_UNREACHABLE"] },
+});
+
+export const LEASE_ROUTES = [
+  leaseRequestCreateRoute,
+  leaseRequestListRoute,
+  leaseRequestGetRoute,
+  leaseRequestEventsRoute,
+  leaseRequestCancelRoute,
+  leaseListRoute,
+  leaseGetRoute,
+  leaseRenewRoute,
+  leaseExecRoute,
+  leaseRotateRoute,
+  leaseFilePutRoute,
+  leaseFileGetRoute,
+  leaseFileDeleteRoute,
+  leaseFileListRoute,
+  leaseEventsRoute,
+  leaseReleaseRoute,
+] as const;

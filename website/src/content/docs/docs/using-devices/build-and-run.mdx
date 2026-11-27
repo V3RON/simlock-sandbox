@@ -1,0 +1,126 @@
+---
+title: Build, install and launch your app
+description: Build your app for a leased simulator or emulator, install it and launch it, for each iOS device-set setting and on Android.
+sidebar:
+  order: 6
+  label: "Build and run your app"
+---
+
+import { Steps, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+**Result:** your app is built for the device you leased, installed on it and running.
+
+Where Simlock keeps iOS simulators, and why plain Xcode tools may not see them: [iOS device sets](/simlock/docs/concepts/ios-device-sets).
+
+## Before you start
+
+- You hold a lease on a simulator or emulator. For a real phone, see [Lease a real iPhone or Android phone](/simlock/docs/using-devices/lease-a-phone).
+- From the grant, take your device's id:
+
+  | Platform | Grant field | Example |
+  | --- | --- | --- |
+  | iOS | `device.driverDeviceId` (the simulator's UDID) | `6F1D2A8C-3B4E-4F7A-9C2D-8E5B1A7F3C90` |
+  | Android | `device.address` (the emulator's serial) | `emulator-5556` |
+
+- On iOS, check the grant's `environment`. If it holds `SIMLOCK_IOS_DEVICE_SET`, the worker uses the `simlock` device set (the default). If not, it uses `default`.
+
+<Aside type="caution">
+Always name your device by its UDID or serial. Other agents' devices run beside yours, so `booted` or an `adb` command without `-s` can reach a device that is not yours.
+</Aside>
+
+## Install and launch a build you already have
+
+<Tabs syncKey="platform">
+  <TabItem label="iOS">
+
+```sh
+UDID=6F1D2A8C-3B4E-4F7A-9C2D-8E5B1A7F3C90
+simlock simctl install "$UDID" ./build/Debug-iphonesimulator/MyApp.app
+simlock simctl launch "$UDID" com.example.myapp
+```
+
+  </TabItem>
+  <TabItem label="Android">
+
+```sh
+SERIAL=emulator-5556
+simlock adb -s "$SERIAL" install app/build/outputs/apk/debug/app-debug.apk
+simlock adb -s "$SERIAL" shell am start -n com.example.myapp/.MainActivity
+```
+
+  </TabItem>
+</Tabs>
+
+**Check:** `simlock simctl io "$UDID" screenshot home.png` (iOS) or `simlock adb -s "$SERIAL" exec-out screencap -p > home.png` (Android) shows your app.
+
+`simlock simctl` and `simlock adb` take the same arguments as the real tools. Why they exist and what they refuse: [Run simctl or adb on a device](/simlock/docs/using-devices/run-commands).
+
+## Build for the device
+
+<Tabs>
+  <TabItem label="iOS, simlock set">
+
+On Xcode 27 or later, tell `xcodebuild` where Simlock's simulators are:
+
+```sh
+xcodebuild build \
+  -destination "platform=iOS Simulator,id=$UDID" \
+  -DVTSimulatorSetLocation="$SIMLOCK_IOS_DEVICE_SET"
+```
+
+On an older Xcode, or with a tool that does not let you add `xcodebuild` arguments, build for any simulator and install the result through Simlock:
+
+```sh
+xcodebuild build -destination 'generic/platform=iOS Simulator'
+simlock simctl install "$UDID" ./build/Debug-iphonesimulator/MyApp.app
+```
+
+`agent-device install` does the same install through [agent-device](/simlock/docs/using-devices/agent-device).
+
+  </TabItem>
+  <TabItem label="iOS, default set">
+
+Xcode sees Simlock's simulators, so the usual tools find yours by its UDID:
+
+```sh
+xcodebuild build -destination "platform=iOS Simulator,id=$UDID"
+```
+
+The React Native CLI, Detox and agent-device's test runner work the same way. Name your UDID every time: Xcode also lists your own simulators and other agents'.
+
+<Aside type="caution">
+With the `default` set, `xcrun simctl shutdown all` stops every leased simulator. Simlock starts each one again under its lease, but its holder loses the apps it had running. A simulator erased while stopped ends its lease.
+</Aside>
+
+  </TabItem>
+  <TabItem label="Android">
+
+Take `ANDROID_ADB_SERVER_PORT` from the grant's `environment`, and name the emulator with `-s`:
+
+```sh
+./gradlew assembleDebug
+export ANDROID_ADB_SERVER_PORT=5038
+adb -s emulator-5556 install ./app/build/outputs/apk/debug/app-debug.apk
+```
+
+Setting `ANDROID_SERIAL` works in place of `-s`.
+
+  </TabItem>
+</Tabs>
+
+**Check:** the launch command from the first section starts the build you made.
+
+To give a build tool or test runner the whole environment at once, see [Let other tools reach the device](/simlock/docs/using-devices/run-commands#let-other-tools-reach-the-device).
+
+## Build on one machine, run on another
+
+When the device is on a worker you reach through a gateway or a farm URL, paths in `simlock simctl install` and `simlock adb install` are paths on the worker. Upload the build first: [Copy files to and from a device](/simlock/docs/using-devices/copy-files).
+
+## When it fails
+
+| What you see | Cause | Fix |
+| --- | --- | --- |
+| `xcodebuild` cannot find a destination with your UDID | The worker uses the `simlock` set, and Xcode looks only in its own. | Add `-DVTSimulatorSetLocation` (Xcode 27 or later), or build for `generic/platform=iOS Simulator` and install with `simlock simctl install`. |
+| Plain `adb` lists no device | `ANDROID_ADB_SERVER_PORT` is not set. | Export it from the grant's `environment`, or use `simlock adb`. |
+| `simlock simctl install` fails with a missing path through a gateway | The path is on your machine, not the worker. | Upload it with `simlock files put`. |
+| The app vanished after you released the lease | Every lease starts on a new device. | Install it again on the next lease, or use a [prepared device](/simlock/docs/using-devices/lease-a-prepared-device). |

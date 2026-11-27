@@ -1,0 +1,369 @@
+import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { describe, expect, it } from "vitest";
+
+import {
+  holdLoopbackPort,
+  REPO_ROOT,
+  startOnFreePort,
+  type TestEnv,
+  waitFor,
+  withDaemon,
+} from "./helpers/index.js";
+
+async function waitForReadyDevice(env: TestEnv, model: string): Promise<string> {
+  let driverDeviceId = "";
+  await waitFor(
+    async () => {
+      const listed = await env.cli(["list", "--devices"]);
+      const rows = listed.json as {
+        driverDeviceId: string;
+        spec: { model: string };
+        state: string;
+      }[];
+      driverDeviceId =
+        rows.find((row) => row.state === "ready" && row.spec.model === model)?.driverDeviceId ?? "";
+      return driverDeviceId !== "";
+    },
+    { label: `the warm pool makes a ready ${model}` },
+  );
+  return driverDeviceId;
+}
+
+// why: `admin.token` is written before startup finishes, and a SIGTERM before then takes the
+// exit-at-once path, which never logs `Daemon stopping`. A daemon is up once it logged
+// `Daemon started` and, with HTTP on, its gateway is listening: `startDaemon` resolves on both.
+async function startupFinished(directory: string): Promise<boolean> {
+  const log = await readFile(join(directory, "daemon.log"), "utf8").catch(() => "");
+  const records = log
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map(
+      (line) =>
+        JSON.parse(line) as {
+          message?: string;
+          fields?: { config?: { http?: { enabled?: boolean } } };
+        },
+    );
+  const started = records.find((record) => record.message === "Daemon started");
+  if (started === undefined) return false;
+  return (
+    started.fields?.config?.http?.enabled !== true ||
+    records.some((record) => record.message === "HTTP gateway listening")
+  );
+}
+
+function runDaemonEntry(env: TestEnv, args: readonly string[]): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [join(REPO_ROOT, "dist/daemon/main.js"), ...args], {
+      env: env.env,
+      stdio: "ignore",
+    });
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code));
+  });
+}
+
+describe("daemon lifecycle & recovery", () => {
+  it.each([
+    { role: "worker", args: [], folder: "" },
+    { role: "gateway", args: ["--gateway"], folder: "gateway" },
+  ])(
+    "a service manager sends SIGTERM to a running $role daemon: it stops cleanly, emits daemon.stopping reason signal, removes admin.token, exits 0",
+    async ({ args, folder }) => {
+      const env = await withDaemon({ mode: "auto" });
+      const directory = join(env.home, folder);
+      const readLog = () => readFile(join(directory, "daemon.log"), "utf8").catch(() => "");
+      // why: `freeLoopbackPort` releases its port, so another process can take it before the
+      // gateway binds it; a daemon whose log gains EADDRINUSE while it starts is run again on a new port.
+      const { started } = await startOnFreePort(async (port) => {
+        if (args.length > 0) {
+          const set = await env.cli(["--gateway", "config", "set", "http.port", String(port)]);
+          expect(set.code, set.stderr).toBe(0);
+        }
+        const logged = (await readLog()).length;
+        const spawned = spawn(process.execPath, [join(REPO_ROOT, "dist/daemon/main.js"), ...args], {
+          env: env.env,
+          stdio: "ignore",
+        });
+        const closed = new Promise<number | null>((resolve, reject) => {
+          spawned.once("error", reject);
+          spawned.once("close", (code) => resolve(code));
+        });
+        const portTaken = async () => (await readLog()).slice(logged).includes("EADDRINUSE");
+        try {
+          await waitFor(async () => (await startupFinished(directory)) || (await portTaken()), {
+            label: "the daemon's startup finished",
+          });
+          if (await portTaken()) {
+            throw Object.assign(new Error(`the daemon lost port ${String(port)}`), {
+              code: "EADDRINUSE",
+            });
+          }
+        } catch (error) {
+          spawned.kill("SIGKILL");
+          await closed;
+          throw error;
+        }
+        return { child: spawned, exited: closed };
+      });
+      const { child, exited } = started;
+      try {
+        expect(existsSync(join(directory, "admin.token"))).toBe(true);
+
+        child.kill("SIGTERM");
+        const code = await exited;
+
+        expect(code).toBe(0);
+        expect(existsSync(join(directory, "admin.token"))).toBe(false);
+        expect(await readFile(join(directory, "daemon.log"), "utf8")).toContain(
+          '"message":"Daemon stopping"',
+        );
+        expect(await readFile(join(directory, "daemon.log"), "utf8")).toContain(
+          '"reason":"signal"',
+        );
+      } finally {
+        child.kill("SIGKILL");
+      }
+    },
+    60_000,
+  );
+
+  it("SIGTERM before startup finishes exits 0 at once instead of waiting for the start, and removes the admin.token it wrote", async () => {
+    const env = await withDaemon({ mode: "auto" });
+    await env.driverScript.set({
+      ios: {
+        availableOsVersions: ["26.0"],
+        knownModels: ["iPhone 16"],
+        latencyMs: { listManaged: 20_000 },
+      },
+    });
+    const child = spawn(process.execPath, [join(REPO_ROOT, "dist/daemon/main.js")], {
+      env: env.env,
+      stdio: "ignore",
+    });
+    const exited = new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code) => resolve(code));
+    });
+    try {
+      await waitFor(() => existsSync(join(env.home, "admin.token")), {
+        label: "the daemon's admin.token written, startup still held",
+      });
+
+      const sentAt = Date.now();
+      child.kill("SIGTERM");
+      const code = await exited;
+
+      expect(code).toBe(0);
+      expect(Date.now() - sentAt).toBeLessThan(10_000);
+      expect(existsSync(join(env.home, "admin.token"))).toBe(false);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }, 60_000);
+
+  it("a daemon that stops for a failure exits 1; one that finds another daemon answering exits 0", async () => {
+    const env = await withDaemon({ mode: "auto" });
+
+    await env.startDaemon();
+    const beside = await runDaemonEntry(env, []);
+    expect(beside).toBe(0);
+    expect(await readFile(env.logPath, "utf8")).toContain('"message":"Daemon already running"');
+    const status = await env.cli(["daemon", "status", "--json"]);
+    expect(status.json).toMatchObject({ daemon: { health: "running", mode: "worker" } });
+
+    await env.cli(["daemon", "stop"]);
+    await waitFor(() => !existsSync(env.socketPath), { label: "the worker stopped" });
+    const history = new DatabaseSync(join(env.home, "history.db"));
+    try {
+      history.exec("UPDATE projection_versions SET version = 99 WHERE name = 'usage'");
+    } finally {
+      history.close();
+    }
+    expect(await runDaemonEntry(env, [])).toBe(1);
+
+    const held = await holdLoopbackPort();
+    try {
+      const set = await env.cli(["--gateway", "config", "set", "http.port", String(held.port)]);
+      expect(set.code, set.stderr).toBe(0);
+      expect(await runDaemonEntry(env, ["--gateway"])).toBe(1);
+    } finally {
+      await held.release();
+    }
+  }, 60_000);
+
+  it("auto-starts on the first CLI call, reports status, and does not double-spawn", async () => {
+    const env = await withDaemon({ mode: "auto" });
+
+    expect(existsSync(env.socketPath)).toBe(false);
+
+    const catalog = await env.cli(["catalog", "--json"]);
+    expect(catalog.code).toBe(0);
+    await waitFor(() => existsSync(env.socketPath), { label: "daemon.sock created by auto-start" });
+
+    const statusJson = await env.cli(["daemon", "status", "--json"]);
+    expect(statusJson.code).toBe(0);
+    expect(statusJson.json).toMatchObject({ daemon: { health: "running", mode: "worker" } });
+
+    // why: "daemon start" while already running must not spawn a second daemon: the
+    // request-scoped connection each `daemon start` opens transiently would make a
+    // pid comparison via lsof racy, so compare content of daemon.log instead --
+    // a second daemon process would append its own "Daemon started" record.
+    const before = await readFile(env.logPath, "utf8");
+    const startedCountBefore = countOccurrences(before, "Daemon started");
+    const secondStart = await env.cli(["daemon", "start"]);
+    expect(secondStart.code).toBe(0);
+    const after = await readFile(env.logPath, "utf8");
+    expect(countOccurrences(after, "Daemon started")).toBe(startedCountBefore);
+    expect(existsSync(join(env.home, "gateway"))).toBe(false);
+  });
+
+  it("recovers from a kill -9 that leaves a stale socket behind", async () => {
+    const env = await withDaemon({ mode: "running" });
+    expect(existsSync(env.socketPath)).toBe(true);
+
+    await env.killDaemon("SIGKILL");
+    // why: kill -9 does not unlink the unix socket file -- it should still exist, stale.
+    expect(existsSync(env.socketPath)).toBe(true);
+
+    // why: `daemon status` deliberately never auto-starts (checking status shouldn't have
+    // the side effect of spawning a daemon) -- any other command does, and is how a
+    // real agent would recover from a stale socket left by a crash.
+    const catalog = await env.cli(["catalog", "--json"]);
+    expect(catalog.code).toBe(0);
+
+    const status = await env.cli(["daemon", "status", "--json"]);
+    expect(status.code).toBe(0);
+    expect(status.json).toMatchObject({ daemon: { health: "running" } });
+  });
+
+  it("daemon status prints a human-oriented view by default", async () => {
+    const env = await withDaemon({ mode: "running" });
+
+    const statusHuman = await env.cli(["daemon", "status"]);
+    expect(statusHuman.code).toBe(0);
+    expect(statusHuman.stdout.split("\n")[0]).toBe("Daemon: running (worker)");
+  });
+
+  it("stops while a detached lease is still outstanding", async () => {
+    const env = await withDaemon();
+    await env.driverScript.set({
+      ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] },
+    });
+    const lease = await env.cli([
+      "lease",
+      "--platform",
+      "ios",
+      "--device",
+      "iPhone 16",
+      "--agent-id",
+      "outliving-agent",
+      "--detach",
+    ]);
+    expect(lease.code).toBe(0);
+
+    // why: A detached lease is deliberately left alone by shutdown -- its liveness is the TTL,
+    // not a connection -- and its armed TTL timer used to keep the process alive for the
+    // full fifteen minutes after `daemon stop` returned. Teardown's stray-process check is
+    // the assertion: it fails the test if the daemon that was told to stop is still there.
+    const stop = await env.cli(["daemon", "stop"]);
+    expect(stop.code).toBe(0);
+    await waitFor(() => !existsSync(env.socketPath), {
+      timeout: 10_000,
+      label: "daemon socket removed",
+    });
+  });
+
+  // why: #1056. The expectation is the maintainer's decision on that issue, not today's behaviour.
+  it("daemon stop shuts down every idle device it booted and leaves the leased one running", async () => {
+    const env = await withDaemon({
+      configOverrides: {
+        warmPool: {
+          targets: [
+            { count: 1, model: "iPhone 16", osVersion: "18.4", platform: "ios" },
+            { count: 1, model: "iPhone 15", osVersion: "18.4", platform: "ios" },
+          ],
+        },
+      },
+      driverScript: {
+        ios: {
+          knownModels: ["iPhone 15", "iPhone 16", "iPhone 17"],
+          availableOsVersions: ["18.4"],
+        },
+      },
+    });
+    const targeted = [
+      await waitForReadyDevice(env, "iPhone 16"),
+      await waitForReadyDevice(env, "iPhone 15"),
+    ];
+    const result = await env.cli([
+      "lease",
+      "--platform",
+      "ios",
+      "--device",
+      "iPhone 17",
+      "--agent-id",
+      "stop-held",
+      "--detach",
+    ]);
+    expect(result.code, result.stderr).toBe(0);
+    const held = result.json as { device: { driverDeviceId: string } };
+    // why: a leased learned kind keeps a spare ready copy (ADR 0069); stop shuts that one down too.
+    const idle = [...targeted, await waitForReadyDevice(env, "iPhone 17")];
+    await env.driverLog.clear();
+
+    expect((await env.cli(["daemon", "stop"])).code).toBe(0);
+    await waitFor(() => !existsSync(env.socketPath), { label: "daemon socket removed" });
+
+    const shutdowns = (await env.driverLog.calls())
+      .filter((call) => call.operation === "shutdown")
+      .map((call) => (call.arguments[0] as { deviceId: string }).deviceId);
+    expect([...shutdowns].sort()).toEqual([...idle].sort());
+    expect(shutdowns).not.toContain(held.device.driverDeviceId);
+  });
+
+  it("daemon stop still completes when an idle device fails to shut down, and logs the failure", async () => {
+    const env = await withDaemon({
+      configOverrides: {
+        warmPool: {
+          targets: [{ count: 1, model: "iPhone 16", osVersion: "18.4", platform: "ios" }],
+        },
+      },
+      driverScript: { ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] } },
+    });
+    await waitForReadyDevice(env, "iPhone 16");
+    await env.driverScript.merge({
+      ios: {
+        failures: { shutdown: { type: "generic", message: "scripted shutdown failure 9c1e" } },
+      },
+    });
+
+    expect((await env.cli(["daemon", "stop"])).code).toBe(0);
+    await waitFor(() => !existsSync(env.socketPath), { label: "daemon socket removed" });
+
+    const lines = (await readFile(env.logPath, "utf8"))
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map(
+        (line) =>
+          JSON.parse(line) as { level: string; message: string; fields?: Record<string, unknown> },
+      );
+    expect(lines).toContainEqual(
+      expect.objectContaining({
+        level: "error",
+        message: "shutdown of an idle device at daemon stop failed",
+        fields: expect.objectContaining({
+          error: expect.stringContaining("scripted shutdown failure 9c1e"),
+        }),
+      }),
+    );
+  });
+});
+
+function countOccurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}

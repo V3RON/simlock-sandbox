@@ -1,0 +1,23 @@
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+/**
+ * why: The web console's build (ADR 0011 §1, §2, §7). Run with `ui` as Vite's root (`vite build ui`),
+ * so every path below is relative to this directory.
+ */
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    // why: `dist/ui`, beside the daemon's own build: the package already publishes `dist`.
+    outDir: "../dist/ui",
+    emptyOutDir: true,
+    // why: No font or image becomes a `data:` URI: the CSP allows fonts and images from `'self'` only.
+    assetsInlineLimit: 0,
+    // why: Nothing to polyfill in the browsers the console supports, and nothing inline either.
+    modulePreload: { polyfill: false },
+  },
+  server: {
+    // why: development only; a local worker with `http.enabled` answers `/v1` on its default port, 4701.
+    proxy: { "/v1": "http://127.0.0.1:4701" },
+  },
+});

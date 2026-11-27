@@ -1,0 +1,143 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  waitForDeviceState,
+  waitForLeaseCount,
+  withDaemon,
+  type TestEnv,
+} from "./helpers/index.js";
+
+function runningAfterRestart(env: TestEnv, driverDeviceId: string): Promise<void> {
+  return env.driverScript.merge({
+    ios: { managedReality: { devices: [{ deviceId: driverDeviceId, runState: "running" }] } },
+  });
+}
+
+/**
+ * why: Lease liveness end to end under ADR 0004: a lease is TTL-bound, a client-initiated
+ * `lease.renew` is the only thing that keeps it alive, and nothing about a connection --
+ * its close or its daemon's death -- ends one. A restart ends a lease only when its device is
+ * not running (ADR 0019, `startup-reconcile.test.ts`); the tests below restart with the device
+ * running.
+ */
+describe("lease liveness & restart", () => {
+  it("keeps a lease across an ungraceful daemon restart, with its TTL timer restored", async () => {
+    // why: The TTL is the floor on this test's wall clock -- the last step waits it out -- so it is
+    // sized against what has to fit inside it, not padded further: a kill-and-restart (and a
+    // wait for the old process to be gone) has to land before the "still there right after the
+    // restart" check, or the lease expires first and a real regression reads as a flake. That
+    // window measures about half a second; 10s leaves it a ~20x margin. The same check is what
+    // tells the restored *timer* apart from restore's startup sweep, which expires a lease whose
+    // deadline already passed: a lease still listed after the restart cannot have taken that path.
+    const env = await withDaemon({ configOverrides: { lease: { defaultTtlMs: 10_000 } } });
+    await env.driverScript.set({
+      ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] },
+    });
+
+    const holder = env.cliBackground([
+      "lease",
+      "--platform",
+      "ios",
+      "--device",
+      "iPhone 16",
+      "--os",
+      "18.4",
+      "--agent-id",
+      "flow5-restart",
+    ]);
+    const grant = JSON.parse(await holder.firstStdoutLine()) as {
+      lease: { id: string };
+      device: { driverDeviceId: string };
+    };
+    await waitForLeaseCount(env, 1);
+
+    // why: The restarted daemon keeps a lease only while its device is running. The fake driver forgets
+    // its devices with the process, so it is told this one still is.
+    await runningAfterRestart(env, grant.device.driverDeviceId);
+    // why: Kill the daemon out from under the holder (not a graceful `daemon stop`), leaving the
+    // lease persisted with no live connection. Pre-ADR-0004 this is exactly what
+    // `StartupConverger`'s orphan sweep released; it no longer exists, because a restart
+    // proves nothing about whether a holder is alive.
+    await env.killDaemon("SIGKILL");
+    await env.startDaemon();
+
+    const afterRestart = (await env.cli(["list", "--leases"])).json as {
+      id: string;
+      ttlDeadline: number;
+    }[];
+    expect(afterRestart.map((lease) => lease.id)).toContain(grant.lease.id);
+    // why: Read here, not from the grant: the holder renews every third of the TTL until the kill,
+    // so the grant's deadline can be stale. Nothing renews it after this -- the holder never
+    // reconnects -- so this is the deadline the restored timer has to honour.
+    const persistedDeadline =
+      afterRestart.find((lease) => lease.id === grant.lease.id)?.ttlDeadline ?? Number.NaN;
+
+    // why: The holder itself does not survive the restart -- the CLI never reconnects (ADR 0003
+    // §10) -- so it writes one DAEMON_CONNECTION_LOST line naming the still-standing lease
+    // and exits 1, releasing nothing.
+    const exit = await holder.waitForExit(15_000);
+    expect(exit.code).toBe(1);
+    expect(exit.error?.code).toBe("DAEMON_CONNECTION_LOST");
+    expect(exit.error?.message).toContain(grant.lease.id);
+    expect(exit.error?.message).toContain("ttlDeadline");
+
+    await waitForLeaseCount(env, 0, { timeout: 25_000 });
+    await waitForDeviceState(env, grant.device.driverDeviceId, "deleted");
+    const recorded = await env.expectEvents(["lease.expired", "device.deleted"]);
+    // why: On that deadline, not merely eventually: the wait above has slack for a slow machine, so
+    // without this a restored timer that fires seconds late would still pass. The upper bound is
+    // scheduling slack. It cannot tell the persisted deadline from a fresh TTL armed at restart,
+    // because the restart lands well inside that slack.
+    const expired = recorded.find(
+      (entry) =>
+        entry.event === "lease.expired" &&
+        (entry.payload as { leaseId?: string }).leaseId === grant.lease.id,
+    );
+    expect(expired?.timestamp).toBeGreaterThanOrEqual(persistedDeadline);
+    expect(expired?.timestamp).toBeLessThan(persistedDeadline + 3_000);
+  });
+
+  it("survives a graceful daemon stop and can be renewed from a later invocation", async () => {
+    const env = await withDaemon({ configOverrides: { lease: { defaultTtlMs: 120_000 } } });
+    await env.driverScript.set({
+      ios: { knownModels: ["iPhone 16"], availableOsVersions: ["18.4"] },
+    });
+
+    const lease = await env.cli([
+      "lease",
+      "--platform",
+      "ios",
+      "--device",
+      "iPhone 16",
+      "--os",
+      "18.4",
+      "--agent-id",
+      "flow5-detached",
+      "--detach",
+    ]);
+    expect(lease.code).toBe(0);
+    const grant = lease.json as { lease: { id: string; ttlDeadline: number } };
+
+    // why: the event ring is memory only and starts empty after a restart, so "granted" is
+    // checked before the restart wipes it.
+    await env.expectEvents(["lease.requested", "lease.granted"]);
+
+    await runningAfterRestart(
+      env,
+      (lease.json as { device: { driverDeviceId: string } }).device.driverDeviceId,
+    );
+    await env.restartDaemon();
+
+    const leasesAfterRestart = (await env.cli(["list", "--leases"])).json as { id: string }[];
+    expect(leasesAfterRestart.map((row) => row.id)).toContain(grant.lease.id);
+
+    const renewed = await env.cli(["lease", "renew", grant.lease.id]);
+    expect(renewed.code).toBe(0);
+    expect((renewed.json as { ttlDeadline: number }).ttlDeadline).toBeGreaterThan(
+      grant.lease.ttlDeadline,
+    );
+
+    await env.cli(["release", grant.lease.id]);
+    await waitForLeaseCount(env, 0);
+  });
+});

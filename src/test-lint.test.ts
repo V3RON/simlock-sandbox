@@ -1,0 +1,412 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
+const SCRIPT = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  ".agents",
+  "scripts",
+  "test-lint.mjs",
+);
+
+function write(dir: string, files: Record<string, string>): void {
+  for (const [path, text] of Object.entries(files)) {
+    mkdirSync(dirname(join(dir, path)), { recursive: true });
+    writeFileSync(join(dir, path), text);
+  }
+}
+
+function repo(before: Record<string, string>, after: Record<string, string>): string {
+  const dir = mkdtempSync(join(tmpdir(), "test-lint-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: dir });
+  git("init", "-q", "-b", "base");
+  write(dir, { "README.md": "# Base\n", ...before });
+  git("add", "-A");
+  git("commit", "-q", "-m", "base");
+  git("switch", "-q", "-c", "work");
+  write(dir, after);
+  git("add", "-A");
+  git("commit", "-q", "--allow-empty", "-m", "head");
+  return dir;
+}
+
+function lint(dir: string, ...args: string[]) {
+  return run(dir, "--base", "base", "--head", "HEAD", ...args);
+}
+
+function run(dir: string, ...args: string[]) {
+  try {
+    const stdout = execFileSync("node", [SCRIPT, ...args], {
+      cwd: dir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { status: 0, lines: stdout.split("\n").filter((l) => l !== "") };
+  } catch (error) {
+    const failed = error as { status: number; stdout: string };
+    return { status: failed.status, lines: failed.stdout.split("\n").filter((l) => l !== "") };
+  }
+}
+
+const file = (...lines: string[]) => `${lines.join("\n")}\n`;
+
+const TIME =
+  "a bound on real time goes in a *.timing.test.ts file or the slow lane; here drive a fake clock and assert the exact value (testing 5)";
+const SKIP =
+  "never skip, focus or defer a test to get to green; fix it or delete it, and gate a live-device test on a SIMLOCK_ variable (testing 5)";
+const VACUOUS =
+  "this assertion also passes on a failure; assert the exact value, or the named error and its code (testing 10)";
+const INTERNAL =
+  'a test of an internal file says which reason holds in a "why:" comment above its first describe (pure logic with many cases, an ordering the surface cannot force, or a part of a decomposed module), or tests through index.ts (testing 6)';
+const BOUND =
+  'bound this wire input with .max(), .length() or .regex(), or say why it needs none in a "why:" comment right above (always-in-scope 8)';
+
+const LEASING_INDEX = { "src/leasing/index.ts": "export const leasing = 1;\n" };
+
+describe("test-lint.mjs", () => {
+  it.each([
+    {
+      rule: "testing 5, a real-time bound",
+      before: {},
+      failing: {
+        "src/a/health.test.ts": file(
+          "it('answers in time', () => {",
+          "  const started = Date.now();",
+          "  expect(Date.now() - started).toBeLessThan(2_000);",
+          "});",
+          "it('answers fast', () => {",
+          "  const elapsed = performance.now();",
+          "  expect(elapsed).toBeGreaterThan(0);",
+          "});",
+        ),
+      },
+      expected: [`src/a/health.test.ts:3: ${TIME}`, `src/a/health.test.ts:7: ${TIME}`],
+      passing: {
+        "src/a/health.timing.test.ts": file(
+          "const started = Date.now();",
+          "expect(Date.now() - started).toBeLessThan(2_000);",
+        ),
+        "e2e/slow-ios.test.ts": file("expect(Date.now() - started).toBeLessThan(60_000);"),
+        "src/a/clock.test.ts": file(
+          "const at = Date.now();",
+          "clock.advance(2_000);",
+          "expect(clock.now()).toBe(3_000);",
+          "expect(connection.serverNow() - Date.now()).toBe(90_000);",
+        ),
+      },
+    },
+    {
+      rule: "testing 5, a skipped or focused test",
+      before: {},
+      failing: {
+        "src/a/grant.test.ts": file(
+          "it.skip('grants a lease', () => {});",
+          "describe.only('the queue', () => {});",
+          "it.skipIf(slow)('reclaims', () => {});",
+          "it.todo('releases');",
+        ),
+      },
+      expected: [1, 2, 3, 4].map((n) => `src/a/grant.test.ts:${n}: ${SKIP}`),
+      passing: {
+        "src/a/live.test.ts": file(
+          "const live = process.env.SIMLOCK_LIVE_ANDROID === '1' ? it : it.skip;",
+          "it.skipIf(process.platform !== 'darwin')('builds on a Mac', () => {});",
+        ),
+        "e2e/slow-android.test.ts": file(
+          "describe.skipIf(!hasAndroidSdk)('on an emulator', () => {});",
+        ),
+        "src/a/grant.pin.test.ts": file('it.skip("records a grant", () => {});'),
+      },
+    },
+    {
+      rule: "testing 10, an assertion a failure satisfies",
+      before: {},
+      failing: {
+        "src/a/fail.test.ts": file(
+          "expect(failure).toBeInstanceOf(Error);",
+          "expect(state).not.toBe('pending');",
+          "expect(recorded[0]?.()).toBe(1);",
+        ),
+      },
+      expected: [1, 2, 3].map((n) => `src/a/fail.test.ts:${n}: ${VACUOUS}`),
+      passing: {
+        "src/a/fail.test.ts": file(
+          "expect(failure).toMatchObject({ code: 'PROVISION_FAILED' });",
+          "const answer = handlers.get('x')?.(1);",
+          "expect(answer).toBe(2);",
+          "await expect(",
+          "  run({ onOutput: (chunk) => sink?.(chunk) }),",
+          ").resolves.toBe(0);",
+        ),
+      },
+    },
+    {
+      rule: "testing 6, a test of an internal file",
+      before: LEASING_INDEX,
+      failing: {
+        "src/leasing/wait-queue.test.ts": file(
+          "import { describe, it } from 'vitest';",
+          "",
+          "import { plan } from './wait-queue.js';",
+          "",
+          "describe('the wait queue', () => {",
+          "  it('plans', () => plan());",
+          "});",
+        ),
+      },
+      expected: [`src/leasing/wait-queue.test.ts:3: ${INTERNAL}`],
+      passing: {
+        "src/leasing/planner.test.ts": file(
+          "import { plan } from './planner.js';",
+          "",
+          "// why: pure planner, fourteen cases",
+          "describe('the planner', () => {});",
+        ),
+        "src/leasing/index.test.ts": file(
+          "import { leasing } from './index.js';",
+          "import { fakeQueue } from './testing.js';",
+          "import { definition } from './definition.js';",
+          "import type { Queue } from './queue.js';",
+          "describe('leasing', () => {});",
+        ),
+      },
+    },
+    {
+      rule: "always-in-scope 8, unbounded wire input",
+      before: {},
+      failing: {
+        "src/contract/x.ts": file(
+          "export const a = z.object({",
+          "  name: z.string().min(1),",
+          "  tags: z.array(z.string().max(10)),",
+          "  env: z.record(z.string().max(5), z.string().max(5)),",
+          "});",
+        ),
+      },
+      expected: [2, 3, 4].map((n) => `src/contract/x.ts:${n}: ${BOUND}`),
+      passing: {
+        "src/contract/x.ts": file(
+          "export const a = z.object({",
+          "  id: z.string().regex(/^[a-z]+$/),",
+          "  name: z",
+          "    .string()",
+          "    .max(NAME_MAX)",
+          "    .optional(),",
+          "  tags: z.array(z.string().length(4)).max(10),",
+          "  // why: the keys are the environment's own names, each value bounded",
+          "  env: z.record(z.string().max(5), z.string().max(5)),",
+          "});",
+        ),
+        "src/contract/x.test.ts": file("const loose = z.string();"),
+      },
+    },
+  ])(
+    "$rule: names the rule and what to do on each added line that breaks it, and passes the forms it allows",
+    ({ before, failing, expected, passing }) => {
+      expect(lint(repo(before, failing))).toEqual({ status: 1, lines: expected });
+      expect(lint(repo(before, passing))).toEqual({ status: 0, lines: [] });
+    },
+  );
+
+  it("always-in-scope 8: passes a declaration the diff moves verbatim from another contract file, and flags a new one", () => {
+    const before = {
+      "src/contract/a.ts": file(
+        "// Old comment.",
+        "export const a = z.object({ name: z.string(), tags: z.array(z.string()) });",
+        "export const keep = 1;",
+      ),
+    };
+    const after = {
+      "src/contract/a.ts": file("export const keep = 1;"),
+      "src/contract/b.ts": file(
+        "export const a = z.object({",
+        "  name: z.string(),",
+        "  tags: z.array(z.string()),",
+        "});",
+        "export const b = z.object({",
+        "  label: z.string(),",
+        "});",
+      ),
+    };
+    expect(lint(repo(before, after))).toEqual({
+      status: 1,
+      lines: [`src/contract/b.ts:6: ${BOUND}`],
+    });
+  });
+
+  it("always-in-scope 8: passes declarations moved out of a source file the split deletes, which git would pair as a rename", () => {
+    const declaration = (name: string) =>
+      `export const ${name} = z.object({ name: z.string(), tags: z.array(z.string()) });`;
+    const dir = repo(
+      { "src/contract/schemas.ts": file(declaration("a"), declaration("b"), declaration("c")) },
+      { "src/contract/a-schemas.ts": file(declaration("a"), declaration("b")) },
+    );
+    execFileSync("git", ["rm", "-q", "src/contract/schemas.ts"], { cwd: dir });
+    execFileSync(
+      "git",
+      ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--amend", "--no-edit"],
+      {
+        cwd: dir,
+      },
+    );
+
+    expect(lint(dir)).toEqual({ status: 0, lines: [] });
+  });
+
+  it.each([
+    {
+      case: "a moved schema that loses a bound on a later line of its chain",
+      before: {
+        "src/contract/a.ts": file(
+          "export const a = z.object({",
+          "  name: z",
+          "    .string()",
+          "    .max(64),",
+          "});",
+        ),
+      },
+      after: {
+        "src/contract/a.ts": file(""),
+        "src/contract/b.ts": file(
+          "export const a = z.object({",
+          "  name: z",
+          "    .string()",
+          "    .min(1),",
+          "});",
+        ),
+      },
+      line: "src/contract/b.ts:3",
+    },
+    {
+      case: "a new copy in one file of a line bounded in place in another",
+      before: {
+        "src/contract/a.ts": file("export const a = z.object({", "  name: z.string(),", "});"),
+      },
+      after: {
+        "src/contract/a.ts": file(
+          "export const a = z.object({",
+          "  name: z.string().max(64),",
+          "});",
+        ),
+        "src/contract/b.ts": file("export const b = z.object({", "  name: z.string(),", "});"),
+      },
+      line: "src/contract/b.ts:2",
+    },
+    {
+      case: "a second copy of one moved schema",
+      before: {
+        "src/contract/a.ts": file("export const a = z.object({ name: z.string() });"),
+      },
+      after: {
+        "src/contract/a.ts": file(""),
+        "src/contract/b.ts": file("export const a = z.object({ name: z.string() });"),
+        "src/contract/c.ts": file("export const a = z.object({ name: z.string() });"),
+      },
+      line: "src/contract/c.ts:1",
+    },
+  ])("always-in-scope 8: flags $case", ({ before, after, line }) => {
+    expect(lint(repo(before, after))).toEqual({ status: 1, lines: [`${line}: ${BOUND}`] });
+  });
+
+  it("testing 5, 6 and 10: passes a split that moves tests unchanged into a new file, and flags a line or an internal import the split adds", () => {
+    const dir = repo(
+      {
+        ...LEASING_INDEX,
+        "src/leasing/queue.test.ts": file(
+          'import { admit } from "./queue.js";',
+          "it('admits', () => {});",
+          "it('rejects', () => { expect(admit()).rejects.toBeInstanceOf(Error); });",
+        ),
+      },
+      {
+        "src/leasing/queue.test.ts": file(
+          'import { admit } from "./queue.js";',
+          "it('admits', () => {});",
+        ),
+        "src/leasing/queue-rejects.test.ts": file(
+          'import { admit } from "./queue.js";',
+          'import { plan } from "./planner.js";',
+          "it('rejects', () => { expect(admit()).rejects.toBeInstanceOf(Error); });",
+          "it.skip('plans', () => {});",
+        ),
+      },
+    );
+
+    const result = lint(dir);
+
+    expect(result.status).toBe(1);
+    expect(result.lines).toEqual([
+      `src/leasing/queue-rejects.test.ts:4: ${SKIP}`,
+      `src/leasing/queue-rejects.test.ts:2: ${INTERNAL}`,
+    ]);
+  });
+
+  it("judges only the lines the diff adds in the files given, and never a pattern inside a string or comment", () => {
+    const dir = repo(
+      { "src/a/old.test.ts": file("it.skip('old', () => {});") },
+      {
+        "src/a/old.test.ts": file(
+          "it.skip('old', () => {});",
+          "const fixture = \"it.only('x', () => {}); expect(e).toBeInstanceOf(Error);\";",
+          "// it.only('commented out')",
+          "const template = `${name} it.skip(`;",
+        ),
+        "src/a/other.test.ts": file("it.only('focused', () => {});"),
+      },
+    );
+
+    expect(lint(dir, "src/a/old.test.ts")).toEqual({ status: 0, lines: [] });
+    expect(lint(dir)).toEqual({ status: 1, lines: [`src/a/other.test.ts:1: ${SKIP}`] });
+  });
+
+  it("in a merge the commit hook judges only the lines the merge adds, not those the merged branch brings or the branch already committed", () => {
+    const dir = repo(
+      {
+        "src/contract/a.ts": file("export const a = 1;"),
+        "src/a/old.test.ts": file("it('old', () => {});"),
+      },
+      { "src/a/mine.test.ts": file("it('mine', () => {});") },
+    );
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], {
+        cwd: dir,
+        stdio: "pipe",
+      });
+    write(dir, {
+      "src/a/mine.test.ts": file(
+        "it('mine', () => {});",
+        "it.skip('committed on the branch', () => {});",
+      ),
+    });
+    git("commit", "-q", "-am", "branch commits its own line");
+    git("switch", "-q", "base");
+    write(dir, {
+      "src/contract/a.ts": file(
+        "export const a = 1;",
+        "export const b = z.object({ name: z.string() });",
+      ),
+      "src/a/old.test.ts": file("it('old', () => {});", "it.skip('theirs', () => {});"),
+    });
+    git("commit", "-q", "-am", "base moves on");
+    git("switch", "-q", "work");
+    git("merge", "-q", "--no-commit", "--no-ff", "base");
+    write(dir, {
+      "src/a/mine.test.ts": file(
+        "it('mine', () => {});",
+        "it.skip('committed on the branch', () => {});",
+        "it.only('merged', () => {});",
+      ),
+    });
+    git("add", "-A");
+
+    expect(
+      run(dir, "--base", "HEAD", "src/a/mine.test.ts", "src/a/old.test.ts", "src/contract/a.ts"),
+    ).toEqual({ status: 1, lines: [`src/a/mine.test.ts:3: ${SKIP}`] });
+  });
+});

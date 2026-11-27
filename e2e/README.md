@@ -1,0 +1,91 @@
+# End-to-end suite
+
+Deterministic end-to-end tests that run the **real** processes — a spawned
+daemon, the CLI as a subprocess, the MCP server driven by a real
+`@modelcontextprotocol/sdk` client — over a real unix socket.
+
+Unit tests (`src/**/*.test.ts`) already cover the core's logic in-process. These
+flows only assert what crosses a process boundary: exit codes, the structured
+stderr contract, MCP framing and notifications, daemon restarts, `kill -9`
+recovery. Anything provable in-process belongs in a unit test instead.
+
+## Lanes
+
+| Lane | Command                  | What it uses                      | Where it runs       |
+| ---- | ------------------------ | --------------------------------- | ------------------- |
+| fast | `pnpm run test:e2e`      | scriptable fake driver, no SDKs   | `pnpm run test`, CI |
+| slow | `pnpm run test:e2e:slow` | real `simctl` / `adb` / emulators | manual, pre-release |
+
+The slow lane runs with vitest's `default` reporter: under an agent vitest's minimal reporter drops
+the console output of a passing test, and a slow flow's step and `device.ready` lines are what its log is
+read for.
+
+The slow flows are tagged `slow` plus `ios`/`android`, so the fast lane excludes
+them with `--tags-filter='!slow'`. Each also gates itself at runtime on platform and SDK
+availability: with `describe.skipIf`, or, in `slow-warm-pool.test.ts`, with
+`context.skip(reason)` inside each test. Filter further with, for
+example, `pnpm exec vitest run --project e2e --tags-filter='ios && !android'`.
+
+The fast lane runs four files at once: each flow has its own `SIMLOCK_HOME`, so
+nothing on disk or on a socket is shared. The slow lane runs one file at a time
+(`--no-file-parallelism`), because its flows share the machine's real simulators
+and emulators.
+
+## How isolation works
+
+Each `withDaemon()` allocates a temp `SIMLOCK_HOME` (so config, state, socket and
+log are per-test) and, in the fast lane, points `SIMLOCK_DRIVERS_MODULE` at
+`e2e/fake-driver` — the daemon then talks to a scripted driver instead of real
+hardware without knowing the difference. Both variables are documented in
+the [CLI reference](../website/src/content/docs/docs/reference/cli.mdx).
+
+A slow flow started with `keepSeeds` shares one home with the other such
+flows, one at a time: `$TMPDIR/simlock-lane-home`. When a flow ends, everything
+in it is deleted but its instance id and the drivers' ready seeds, so config,
+state, socket and log are still per-test.
+
+The fake driver reads a JSON script file, re-read on every call so a test can
+change behaviour mid-flight, and appends every call it receives to a log file.
+Assertions like "`doctor --fix` never destroyed a device" or "a missing runtime
+never triggered a download" read that log.
+
+## Writing a flow
+
+- Build on the helpers in `helpers/`; no flow should reimplement process
+  spawning, polling, or output parsing.
+- `waitFor` is the only timing primitive. **Never sleep for a fixed duration.**
+- Prefer one fat flow that exercises several features over many small tests —
+  the point is confidence in a release, not branch coverage.
+- Never weaken an assertion to get green. If a flow trips a real bug, mark that
+  assertion (`it.fails`) with a comment naming the suspected cause.
+- In the slow lane a new daemon home makes its seeds again: the first lease of
+  each platform takes 40 to 60 s, a later one 5 to 20 s. A real-driver flow
+  passes `keepSeeds: true` to `withDaemon` or `withSharedDaemon`: its home is
+  then the lane's one reused home, which each flow finds as a home no flow has
+  used, but for the ready seeds earlier flows made. A flow that proves the
+  making of a seed (the smoke files, the pool-off flow of
+  `slow-warm-pool.test.ts`), or runs under `drivers.ios.deviceSet: "default"`,
+  leaves it out. A new case joins a flow whose daemon already has the device
+  it needs, before it starts a daemon of its own.
+- A slow case that proves how Simlock leases, queues or ends a lease, and not
+  what a device does, runs on one platform: `leasingCase` in
+  `slow-agent-device.test.ts` runs it on Android, or on iOS where no Android
+  SDK is installed.
+- A wait in a slow flow carries its own bound, a few times its slowest pass,
+  so a hang fails with the wait's name and not with the test's timeout.
+
+Hooks must be registered at module scope. Vitest resolves `beforeEach`/`afterEach`
+from the call stack active during _collection_, so a hook registered from inside a
+running test body silently never fires — see the comment in `helpers/env.ts`.
+
+## Known gaps
+
+- **The slow lane does not pass reliably as a whole run.** A daemon
+  occasionally outlives `daemon stop` and trips teardown's stray-process
+  assertion; not yet root-caused.
+  The slim lane also fails while a 50-label disable batch can outrun its fixed
+  60s limit on a cold boot ([#206](https://github.com/V3RON/simlock-sandbox/issues/206)). Treat the slow lane as a manual,
+  one-flow-at-a-time tool until both are fixed.
+- Android is exercised through the fake driver in the fast lane; only
+  `slow-android-smoke.test.ts`, `slow-android-stream.test.ts`, `slow-warm-pool.test.ts`,
+  `slow-agent-device.test.ts` and `slow-agent-device-gateway.test.ts` touch a real emulator.

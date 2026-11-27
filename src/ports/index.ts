@@ -1,0 +1,222 @@
+export {
+  type Filesystem,
+  isMissingPathError,
+  MemoryFilesystem,
+  NodeFilesystem,
+} from "./filesystem.js";
+export type { PathDetails } from "./filesystem.js";
+export { readPackageVersion } from "./package-version.js";
+export {
+  DATA_DIRECTORY_MODE,
+  daemonDataDirectory,
+  type DaemonRole,
+  type DaemonFlag,
+  type DaemonHome,
+  isPipeEndpoint,
+  resolveDaemonHome,
+  resolveDaemonSocketPath,
+  resolveSimlockHome,
+  SocketPathTooLongError,
+} from "./paths.js";
+export {
+  DAEMON_STARTUP_TIMEOUT_MS,
+  type DaemonExit,
+  type DaemonLauncher,
+  FakeDaemonLauncher,
+  type LaunchedDaemon,
+  NodeDaemonLauncher,
+  startErrorFrom,
+  startTimeoutMessage,
+} from "./daemon-launcher.js";
+export {
+  type IpcConnection,
+  type IpcConnector,
+  IpcError,
+  type IpcListenerFactory,
+  isEndpointAbsent,
+  MemoryIpcTransport,
+  NodeIpcTransport,
+} from "./ipc.js";
+// fallow-ignore-next-line unused-type -- public port contract for consumers that need normalized error codes.
+export type { IpcErrorCode } from "./ipc.js";
+// fallow-ignore-next-line unused-type -- public listener lifecycle contract.
+export type { IpcListener } from "./ipc.js";
+export { launcherFor } from "./service-launcher.js";
+export {
+  FakeServiceManager,
+  LaunchdServiceManager,
+  productionServiceManager,
+  ServiceFailedError,
+  type ServiceDefinition,
+  type ServiceManager,
+  serviceDefinition,
+  type ServiceManagerName,
+  type ServiceState,
+  TaskSchedulerServiceManager,
+} from "./service-manager.js";
+export { type LeaseSocket, type LeaseSocketAccept, MemoryLeaseSocket } from "./lease-socket.js";
+export type { SessionConnection, SessionOutcome } from "./session-socket.js";
+export { type Clock, FakeClock, SystemClock, type TimerHandle } from "./clock.js";
+/**
+ * why: ADR 0005 §33's uplink port and its in-memory adapter. The WebSocket adapters are
+ * deliberately *not* re-exported here: they live in `./uplink-websocket.js`, which imports `ws`
+ * statically, and only the daemon entrypoint needs them. `websocket-client.ts` (re-exported)
+ * loads `ws` with `import()` on its first `connect`, so only `simlock tunnel` loads it in the
+ * CLI; the MCP server never does.
+ */
+export {
+  createConnectionPair,
+  MemoryUplinkTransport,
+  uplinkOutcome,
+  UplinkError,
+  type AcceptedUplink,
+  type UplinkAuthOutcome,
+  type UplinkAuthResult,
+  type UplinkConnector,
+  type UplinkDialOptions,
+  type UplinkListener,
+  type MemoryTransportConnection,
+  type UplinkListenerFactory,
+  type UplinkTransportConnection,
+} from "./uplink.js";
+// fallow-ignore-next-line unused-type -- public port contract for consumers that branch on why a dial failed.
+export type { UplinkErrorCode } from "./uplink.js";
+export {
+  JsonLinesLogger,
+  type LogLevel,
+  type Logger,
+  MemoryLogSink,
+  NodeFileLogSink,
+  NoopLogger,
+} from "./logger.js";
+// fallow-ignore-next-line unused-type -- public shape of a parsed log line, for consumers of MemoryLogSink.records.
+export type { LogRecord } from "./logger.js";
+export {
+  FakeKeySetFetcher,
+  KEY_SET_MAX_BYTES,
+  type KeySetFetcher,
+  NodeKeySetFetcher,
+} from "./key-set-fetcher.js";
+export { CryptoIdGenerator, type IdGenerator } from "./id-generator.js";
+export { CryptoTokenSecrets, type TokenSecrets } from "./token-secrets.js";
+export { FakeSystemStats, NodeSystemStats, type SystemStats } from "./system-stats.js";
+export { FakeHostInfo, type HostInfo, type HostSystem, NodeHostInfo } from "./host-info.js";
+export { FakeParentWatch, NodeParentWatch, type ParentWatch } from "./parent-watch.js";
+export type { ParentWatchHandle } from "./parent-watch.js";
+export { FakeProcessSupervisor, NodeProcessSupervisor } from "./process-supervisor.js";
+export type { ProcessSupervisor } from "./process-supervisor.js";
+// fallow-ignore-next-line unused-type -- public shape of FakeProcessSupervisor.signals.
+export type { SignalRecord } from "./process-supervisor.js";
+export { FakeTcpProbe, NodeTcpProbe } from "./tcp-probe.js";
+export {
+  FakeTcpListenerFactory,
+  NodeTcpListenerFactory,
+  type TcpListener,
+  type TcpListenerFactory,
+} from "./tcp-listener.js";
+export {
+  FakeTcpPeer,
+  FakeTcpStreamConnector,
+  NodeTcpStreamConnector,
+  type LoopbackHost,
+  type TcpStream,
+  type TcpStreamConnector,
+} from "./tcp-stream.js";
+export {
+  type BytePipeExit,
+  type BytePipeLauncher,
+  type BytePipeProcess,
+  FakeBytePipeLauncher,
+  NodeBytePipeLauncher,
+} from "./byte-pipe.js";
+// fallow-ignore-next-line unused-type -- public shape of FakeTcpProbe.sends.
+export type { FakeSend } from "./tcp-probe.js";
+export type { TcpProbe } from "./tcp-probe.js";
+export { LoggingProcessRunner } from "./logging-process-runner.js";
+export {
+  exitCodeOf,
+  ExecOutputDeliveryStalledError,
+  InputStreamFailedError,
+  type BoundedRunOptions,
+  NodeProcessRunner,
+  type ProcessHandle,
+  ProcessSpawnError,
+  type ProcessResult,
+  type ProcessRunner,
+  type ProcessRunOptions,
+  type ProcessStreamOptions,
+  ScriptedProcessRunner,
+  type ScriptedProcessExpectation,
+  type StreamingProcessHandle,
+  type StreamingProcessResult,
+} from "./process-runner.js";
+export {
+  type AccessEntry,
+  type DirectoryAccessReader,
+  FakeDirectoryAccessReader,
+  PowerShellDirectoryAccessReader,
+} from "./directory-access.js";
+export {
+  FakeProcessTable,
+  NodeProcessTable,
+  type ProcessEntry,
+  type ProcessTable,
+} from "./process-table.js";
+export {
+  type CpuCounters,
+  type CpuTimes,
+  DarwinHostLoadProbe,
+  type DiskCounters,
+  FakeHostLoadProbe,
+  type HostLoadCounters,
+  type HostLoadProbe,
+  LinuxHostLoadProbe,
+  type MemoryCounters,
+  productionHostLoadProbe,
+  WindowsHostLoadProbe,
+} from "./host-load.js";
+export {
+  FakeSqliteOpener,
+  filterSqliteExperimentalWarning,
+  inTransaction,
+  isLockError,
+  NodeSqliteOpener,
+  passesQuickCheck,
+  SqliteUnavailableError,
+} from "./sqlite.js";
+export type {
+  SqliteDatabase,
+  SqliteOpener,
+  SqliteSchemaOwner,
+  SqliteStatement,
+  SqliteValue,
+} from "./sqlite.js";
+export { FetchWebhookPoster, type WebhookPoster } from "./webhook-poster.js";
+export { FakeNpmCli, NodeNpmCli, type NpmCli, type NpmOutcome } from "./npm-cli.js";
+export {
+  FakeUpdaterLauncher,
+  type LaunchedUpdater,
+  NodeUpdaterLauncher,
+  type UpdaterLauncher,
+} from "./updater-launcher.js";
+export {
+  FakeWebSocketClientConnector,
+  NodeWebSocketClientConnector,
+  WebSocketRefusedError,
+  type WebSocketClient,
+  type WebSocketClientConnector,
+} from "./websocket-client.js";
+export { FakeHttpJsonClient, FetchHttpJsonClient, type HttpJsonClient } from "./http-json.js";
+export {
+  FakeHttpStreamClient,
+  NodeHttpStreamClient,
+  type HttpStreamAnswer,
+  type HttpStreamClient,
+  type HttpStreamRequest,
+} from "./http-stream.js";
+export {
+  defaultWorkerLockPath,
+  NodeWorkerLock,
+  type WorkerLockHandle,
+  type WorkerLockOwner,
+} from "./worker-lock.js";

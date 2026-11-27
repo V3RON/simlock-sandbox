@@ -1,0 +1,55 @@
+# Mode `fix`: apply verified findings
+
+Each finding has a stable ID, defect class and impacts from
+`docs/internal/REVIEW.md`: behavior, test-logic, acceptance, claims or
+mechanical. Inputs include immutable `base`, `merge-base`, `previous` and
+`head`, plus the resolution ledger. Group instances of the same defect.
+
+1. **Find every instance.** The line is one instance of its class. Search
+   the whole diff for others, and for a stale claim search the repo directly
+   or use bounded Haiku discovery under `docs/internal/EXPLORATION.md`. For an order, interleaving or conflict
+   between two components, list every path through the same code (each caller, flag,
+   mode and order, including both at once) and check each.
+2. **Fix every instance:**
+   - behaviour: make a test fail first, then fix. Open
+     `docs/internal/agent-rules/testing.md` rules 2, 7, 9 and 10 before
+     writing it. Extend the test that
+     proves the behaviour next to it; write a new one only when none does,
+     and list it under `fixes` with the test you could not extend and why
+     (testing rule 9);
+   - a broken rule (`[architecture N]`, `[safety N]`, ...): change the code
+     so it keeps the rule, never the doc that states the rule;
+   - stale doc: fix it. Stale comment: delete it, or fix it if the comment
+     rule allows it (it starts with `why:`). Each fact in the new text (who
+     does it, which cases, which values) names the `path:line` that shows it
+     before you commit; a fact you cannot point to stays out. Told to edit
+     tests, comments and docs only: a finding that needs any other change
+     goes under `open` instead;
+   - a line ending in `(record as Assumption: ...)`: also add that
+     assumption to the PR body;
+   - a slow-lane Evidence line is a failing test: fix the code, not the
+     test;
+   - a `ci:` line: the named test failed in CI; a line asking to merge the
+     base branch: merge it and resolve the conflicts.
+   - an `adr: <nnnn> to <status>` line: the feature is merging (delivery
+     rule 10); set that ADR's `**Status:**` line and its row in
+     `docs/internal/adr/README.md` to the status named, and change nothing
+     else.
+   - a `stack:` line naming a parent branch: in your worktree, `git merge
+     origin/<parent>` into the branch, resolve the conflicts, run the tests
+     of the files the resolution touched, commit the merge and push. Never
+     rebase, never force-push, never touch another branch: the orchestrator
+     carries the merge up the stack with `stack-sync.sh`.
+     Every test command runs in the foreground, and nothing is left running:
+     no `run_in_background`, no
+     trailing `&`, no loop that sleeps, no bare `cat > file`. The tool guard
+     refuses each; a background job would hold your report until it ends or
+     hits its 30-minute cap, which stalls the whole delivery.
+3. Run only the commands under "Tests agents run" in `implementer.md`. Never
+   run a check listed under "Checks agents never run", nor a tool behind it,
+   from any path: the commit and push hooks run them, and their errors show
+   in the hook's output.
+4. One commit per finding or closely related group. Then the incremental audit
+   (`implement-audit.md`, `previous..new-head`, with the affected sweep) and the test check on every test
+   the fix touched or added. Recheck affected assumptions and record actual impacts, fix commit and
+   evidence against each stable ID. Never label assertion edits mechanical.

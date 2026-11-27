@@ -1,0 +1,499 @@
+import { describe, expect, it } from "vitest";
+
+import type { Logger } from "../ports/index.js";
+import { FleetLeaseIndex, type WorkerReportedLease } from "./lease-index.js";
+
+const PREFIX = "gw:instance-1:";
+
+class RecordingLogger implements Logger {
+  readonly warnings: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+
+  debug(): void {}
+  info(): void {}
+  warn(message: string, fields?: Record<string, unknown>): void {
+    this.warnings.push(fields === undefined ? { message } : { fields, message });
+  }
+  error(): void {}
+  child(): Logger {
+    return this;
+  }
+}
+
+function reported(id: string, overrides: Partial<WorkerReportedLease> = {}): WorkerReportedLease {
+  return {
+    grantedAt: 1,
+    id,
+    ownerId: "alice-principal",
+    requesterId: `${PREFIX}alice`,
+    ...overrides,
+  };
+}
+
+function entry(overrides: Partial<Parameters<FleetLeaseIndex["add"]>[0]> = {}) {
+  return {
+    gatewayLeaseId: "wrk_1.lse_1",
+    grantedAt: 1,
+    ownerId: "alice-principal",
+    requesterId: "alice",
+    workerId: "wrk_1",
+    workerLeaseId: "lse_1",
+    ...overrides,
+  };
+}
+
+describe("FleetLeaseIndex", () => {
+  describe("onRemoved", () => {
+    it("tells the listener each entry the index drops, by release, by a worker's relayed fact and by forgetting the worker", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      const dropped: string[] = [];
+      index.onRemoved((gone) => dropped.push(gone.gatewayLeaseId));
+      index.add(entry({ gatewayLeaseId: "a", workerLeaseId: "la" }));
+      index.add(entry({ gatewayLeaseId: "b", workerLeaseId: "lb" }));
+      index.add(entry({ gatewayLeaseId: "c", workerLeaseId: "lc", workerId: "wrk_2" }));
+
+      index.remove("a");
+      index.removeByWorkerLease("wrk_1", "lb");
+      index.forgetWorker("wrk_2");
+
+      expect(dropped).toEqual(["a", "b", "c"]);
+    });
+
+    it("tells the listener nothing for a lease the index never held", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      const dropped: string[] = [];
+      index.onRemoved((gone) => dropped.push(gone.gatewayLeaseId));
+
+      index.remove("missing");
+
+      expect(dropped).toEqual([]);
+    });
+  });
+
+  describe("onEnded", () => {
+    it("tells the listener each lease that ended -- by release, by a worker's relayed fact, by missing two snapshots -- and nothing for a worker it forgets", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      const ended: string[] = [];
+      index.onEnded((gone) => ended.push(gone.gatewayLeaseId));
+      index.add(entry({ gatewayLeaseId: "a", workerLeaseId: "la" }));
+      index.add(entry({ gatewayLeaseId: "b", workerLeaseId: "lb" }));
+      index.add(entry({ gatewayLeaseId: "c", workerLeaseId: "lc", workerId: "wrk_3" }));
+      index.add(entry({ gatewayLeaseId: "d", workerLeaseId: "ld", workerId: "wrk_2" }));
+
+      index.remove("a");
+      index.removeByWorkerLease("wrk_1", "lb");
+      index.rebuildFromWorker("wrk_3", []);
+      index.rebuildFromWorker("wrk_3", []);
+      index.forgetWorker("wrk_2");
+
+      expect(ended).toEqual(["a", "b", "c"]);
+    });
+  });
+
+  describe("add / resolve / lookups", () => {
+    it("resolves an entry by gateway id, by (workerId, workerLeaseId), by ownerId and by requesterId", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+
+      expect(index.resolve("wrk_1.lse_1")).toEqual(entry());
+      expect(index.findByWorkerLease("wrk_1", "lse_1")).toEqual(entry());
+      expect(index.findByWorkerLease("wrk_1", "lse_other")).toBeUndefined();
+      expect(index.ownerId("wrk_1.lse_1")).toBe("alice-principal");
+      expect(index.leaseRequesterId("wrk_1.lse_1")).toBe("alice");
+      expect(index.existingLeaseId("alice")).toBe("wrk_1.lse_1");
+      expect(index.all()).toEqual([entry()]);
+    });
+
+    it("replaces rather than duplicates when the same gateway id is added twice", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+      index.add(entry({ ownerId: "someone-else" }));
+
+      expect(index.all()).toHaveLength(1);
+      expect(index.ownerId("wrk_1.lse_1")).toBe("someone-else");
+    });
+  });
+
+  describe("one requester with several leases", () => {
+    it("adding a second lease for a requester keeps the first, and forgetting one keeps the other", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      const first = entry({ gatewayLeaseId: "wrk_1.lse_1", grantedAt: 10, workerLeaseId: "lse_1" });
+      const second = entry({
+        gatewayLeaseId: "wrk_1.lse_2",
+        grantedAt: 20,
+        workerLeaseId: "lse_2",
+      });
+      index.add(first);
+      index.add(second);
+
+      expect(index.all()).toEqual([first, second]);
+      expect(index.existingLeaseId("alice")).toBe("wrk_1.lse_1");
+
+      index.remove("wrk_1.lse_1");
+
+      expect(index.all()).toEqual([second]);
+      expect(index.existingLeaseId("alice")).toBe("wrk_1.lse_2");
+      expect(index.remove("wrk_1.lse_2")).toEqual(second);
+      expect(index.existingLeaseId("alice")).toBeUndefined();
+    });
+
+    it("answers the earliest-granted lease of a requester, whatever order they were added in", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry({ gatewayLeaseId: "wrk_1.lse_2", grantedAt: 20, workerLeaseId: "lse_2" }));
+      index.add(entry({ gatewayLeaseId: "wrk_1.lse_1", grantedAt: 10, workerLeaseId: "lse_1" }));
+      index.add(entry({ gatewayLeaseId: "wrk_1.lse_3", grantedAt: 30, workerLeaseId: "lse_3" }));
+
+      expect(index.existingLeaseId("alice")).toBe("wrk_1.lse_1");
+    });
+
+    it("rebuildFromWorker restores two leases of one requester", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+
+      index.rebuildFromWorker("wrk_1", [
+        reported("lse_1", { grantedAt: 10 }),
+        reported("lse_2", { grantedAt: 20 }),
+      ]);
+
+      expect(index.all().map((lease) => lease.gatewayLeaseId)).toEqual([
+        "wrk_1.lse_1",
+        "wrk_1.lse_2",
+      ]);
+      expect(index.existingLeaseId("alice")).toBe("wrk_1.lse_1");
+    });
+  });
+
+  describe("remove / removeByWorkerLease", () => {
+    it("remove forgets an entry by gateway id and is a no-op for an unknown one", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+
+      expect(index.remove("wrk_1.lse_1")).toEqual(entry());
+      expect(index.resolve("wrk_1.lse_1")).toBeUndefined();
+      expect(index.existingLeaseId("alice")).toBeUndefined();
+      expect(index.remove("wrk_1.lse_1")).toBeUndefined();
+    });
+
+    it("removeByWorkerLease finds and forgets atomically, returning the entry it removed", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+
+      const removed = index.removeByWorkerLease("wrk_1", "lse_1");
+      expect(removed).toEqual(entry());
+      expect(index.resolve("wrk_1.lse_1")).toBeUndefined();
+      expect(index.removeByWorkerLease("wrk_1", "lse_1")).toBeUndefined();
+    });
+
+    it("does not let removing one requester's entry evict a different entry that raced it onto the same requester slot", () => {
+      // why: `#byRequester` is keyed by requesterId, one entry deep -- removing an id only clears the
+      // requester slot when it still points at *that* gateway id, which is what protects a
+      // requester who released and immediately re-leased from having the new lease's admission
+      // slot wiped by the old one's removal landing late.
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry({ gatewayLeaseId: "wrk_1.lse_1", workerLeaseId: "lse_1" }));
+      index.remove("wrk_1.lse_1");
+      index.add(entry({ gatewayLeaseId: "wrk_1.lse_2", workerLeaseId: "lse_2" }));
+
+      index.remove("wrk_1.lse_1");
+      expect(index.existingLeaseId("alice")).toBe("wrk_1.lse_2");
+    });
+  });
+
+  describe("rebuildFromWorker: additions", () => {
+    it("adds every gateway-issued lease a snapshot reports that the index does not already know", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.rebuildFromWorker("wrk_1", [
+        reported("lse_1"),
+        reported("lse_2", { requesterId: `${PREFIX}bob`, ownerId: "bob-principal" }),
+      ]);
+
+      expect(index.resolve("wrk_1.lse_1")).toMatchObject({
+        ownerId: "alice-principal",
+        requesterId: "alice",
+      });
+      expect(index.resolve("wrk_1.lse_2")).toMatchObject({
+        ownerId: "bob-principal",
+        requesterId: "bob",
+      });
+    });
+
+    it("skips a worker's own local lease -- one whose requesterId does not carry this gateway's prefix", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.rebuildFromWorker("wrk_1", [reported("lse_local", { requesterId: "local-agent" })]);
+
+      expect(index.resolve("wrk_1.lse_local")).toBeUndefined();
+      expect(index.all()).toEqual([]);
+    });
+
+    it("does not overwrite an entry it already has with the same snapshot's own copy", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry({ ownerId: "granted-owner" }));
+
+      // why: A worker's own view reports the same lease with a *different* ownerId -- if this ever
+      // happened it would be the worker disagreeing with what the gateway itself granted, not
+      // new information the rebuild should trust over the grant.
+      index.rebuildFromWorker("wrk_1", [reported("lse_1", { ownerId: "different-owner" })]);
+
+      expect(index.ownerId("wrk_1.lse_1")).toBe("granted-owner");
+    });
+  });
+
+  describe("rebuildFromWorker: reconciliation (C3, round 2 review)", () => {
+    it("removes an entry missing for two consecutive snapshots -- the worker restarted or expired the lease while the uplink was down", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+
+      // why: First snapshot after reconnect: the worker no longer reports this lease at all. Without
+      // C3's fix this is where the old upsert-only index would stop -- the entry survives
+      // forever, and `agent-1`'s next request is refused REQUESTER_ALREADY_LEASED against a
+      // lease that exists nowhere.
+      index.rebuildFromWorker("wrk_1", []);
+      expect(index.resolve("wrk_1.lse_1")).toBeDefined();
+      expect(index.existingLeaseId("alice")).toBe("wrk_1.lse_1");
+
+      index.rebuildFromWorker("wrk_1", []);
+      expect(index.resolve("wrk_1.lse_1")).toBeUndefined();
+      expect(index.existingLeaseId("alice")).toBeUndefined();
+    });
+
+    it("does not evict an entry that reappears in the very next snapshot -- the one-generation grace window a grant racing a refresh needs", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+
+      // why: A single missed snapshot -- the exact shape of a refresh that started before this
+      // gateway's own grant landed on the worker (the race `rebuildFromWorker`'s own doc comment
+      // describes) -- must not be enough to evict on its own.
+      index.rebuildFromWorker("wrk_1", []);
+      expect(index.resolve("wrk_1.lse_1")).toBeDefined();
+
+      index.rebuildFromWorker("wrk_1", [reported("lse_1")]);
+      expect(index.resolve("wrk_1.lse_1")).toBeDefined();
+
+      index.rebuildFromWorker("wrk_1", []);
+      expect(index.resolve("wrk_1.lse_1")).toBeDefined();
+      index.rebuildFromWorker("wrk_1", []);
+      expect(index.resolve("wrk_1.lse_1")).toBeUndefined();
+    });
+
+    it("never removes an entry attributed to a different worker", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(
+        entry({ gatewayLeaseId: "wrk_1.lse_1", workerId: "wrk_1", workerLeaseId: "lse_1" }),
+      );
+      index.add(
+        entry({ gatewayLeaseId: "wrk_2.lse_1", workerId: "wrk_2", workerLeaseId: "lse_1" }),
+      );
+
+      index.rebuildFromWorker("wrk_1", []);
+      index.rebuildFromWorker("wrk_1", []);
+
+      expect(index.resolve("wrk_1.lse_1")).toBeUndefined();
+      expect(index.resolve("wrk_2.lse_1")).toBeDefined();
+    });
+  });
+
+  describe("removeByWorkerLease resurrection (C1, round 2 review)", () => {
+    it("logs when a snapshot re-reports a lease removeByWorkerLease just forgot, instead of silently resurrecting it unremarked", () => {
+      const logger = new RecordingLogger();
+      const index = new FleetLeaseIndex(PREFIX, logger);
+      index.add(entry());
+
+      index.removeByWorkerLease("wrk_1", "lse_1");
+      expect(index.resolve("wrk_1.lse_1")).toBeUndefined();
+
+      // why: ...but a snapshot that started gathering data before that fact landed completes after
+      // it and still reports the same worker lease id. The worker is the source of truth, so
+      // the entry is still re-added (a caller must not lose a lease the worker still holds)...
+      index.rebuildFromWorker("wrk_1", [reported("lse_1")]);
+      expect(index.resolve("wrk_1.lse_1")).toBeDefined();
+
+      expect(
+        logger.warnings.some(
+          (warning) =>
+            warning.fields?.gatewayLeaseId === "wrk_1.lse_1" && warning.fields.workerId === "wrk_1",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  describe("forgetWorker", () => {
+    it("drops every entry attributed to the forgotten worker, and no other", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(
+        entry({ gatewayLeaseId: "wrk_1.lse_1", workerId: "wrk_1", workerLeaseId: "lse_1" }),
+      );
+      index.add(
+        entry({
+          gatewayLeaseId: "wrk_2.lse_1",
+          workerId: "wrk_2",
+          workerLeaseId: "lse_1",
+          requesterId: "bob",
+        }),
+      );
+
+      index.forgetWorker("wrk_1");
+
+      expect(index.resolve("wrk_1.lse_1")).toBeUndefined();
+      expect(index.existingLeaseId("alice")).toBeUndefined();
+      expect(index.resolve("wrk_2.lse_1")).toBeDefined();
+    });
+
+    it("starts reconciliation over for a worker id that reconnects after being forgotten, rather than inheriting a stale generation", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+      index.rebuildFromWorker("wrk_1", []); // one miss recorded, entry still protected
+      index.forgetWorker("wrk_1"); // the worker's view disappeared entirely (retention)
+
+      // why: The same worker id reconnects and immediately reports the lease again (a worker that
+      // never actually lost it -- only the gateway's view of it lapsed). A stale one-miss
+      // generation surviving `forgetWorker` would have no way to hurt this case since the entry
+      // itself is gone too, but the fresh add below must not be evicted by leftover bookkeeping.
+      index.rebuildFromWorker("wrk_1", [reported("lse_1")]);
+      index.rebuildFromWorker("wrk_1", [reported("lse_1")]);
+      expect(index.resolve("wrk_1.lse_1")).toBeDefined();
+    });
+  });
+
+  describe("project", () => {
+    it("rewrites a recognized lease's id/requesterId and attaches worker, passing through an unrecognized one with only workerId added", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+
+      const projected = index.project(
+        { id: "lse_1", requesterId: `${PREFIX}alice` },
+        "wrk_1",
+        "Alice's Mac",
+      );
+      expect(projected).toEqual({
+        id: "wrk_1.lse_1",
+        requesterId: "alice",
+        workerId: "wrk_1",
+        worker: { id: "wrk_1", label: "Alice's Mac" },
+      });
+
+      const passthrough = index.project(
+        { id: "lse_local", requesterId: "local-agent" },
+        "wrk_1",
+        undefined,
+      );
+      expect(passthrough).toEqual({
+        id: "lse_local",
+        requesterId: "local-agent",
+        workerId: "wrk_1",
+      });
+    });
+  });
+
+  describe("caller-chosen lease IDs", () => {
+    function chosen(id: string, overrides: Partial<WorkerReportedLease> = {}): WorkerReportedLease {
+      return { ...reported(id, overrides), idChosenByRequester: true } as WorkerReportedLease;
+    }
+
+    it("after a gateway restart, a caller-chosen lease is rebuilt under its bare ID", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+
+      index.rebuildFromWorker("wrk_1", [chosen("ad-7f3a"), reported("lse_9")]);
+
+      expect(index.resolve("ad-7f3a")).toEqual({
+        gatewayLeaseId: "ad-7f3a",
+        grantedAt: 1,
+        idChosenByRequester: true,
+        ownerId: "alice-principal",
+        requesterId: "alice",
+        workerId: "wrk_1",
+        workerLeaseId: "ad-7f3a",
+      });
+      expect(index.resolve("wrk_1.lse_9")).toMatchObject({ workerLeaseId: "lse_9" });
+      expect(index.resolve("wrk_1.ad-7f3a")).toBeUndefined();
+    });
+
+    it("a stale snapshot does not re-add a lease whose relayed release event arrived before the worker's answer (#898)", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.add(entry());
+      index.removeByWorkerLease("wrk_1", "lse_1");
+      index.remove("wrk_1.lse_1");
+
+      index.rebuildFromWorker("wrk_1", [reported("lse_1")]);
+
+      expect(index.leaseCount("alice")).toBe(0);
+    });
+
+    it("a caller-chosen ID released and granted again is rebuilt from a later snapshot (#898)", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      const bare = entry({ gatewayLeaseId: "ad-7f3a", workerLeaseId: "ad-7f3a" });
+      index.add(bare);
+      index.remove("ad-7f3a");
+      index.add(bare);
+      index.forgetWorker("wrk_1");
+
+      index.rebuildFromWorker("wrk_1", [chosen("ad-7f3a")]);
+
+      expect(index.resolve("ad-7f3a")).toMatchObject({ workerId: "wrk_1" });
+    });
+
+    it("a rebuilt lease flagged idChosenByRequester whose ID does not match the leaseId pattern is prefixed and logged", () => {
+      const logger = new RecordingLogger();
+      const index = new FleetLeaseIndex(PREFIX, logger);
+
+      index.rebuildFromWorker("wrk_1", [chosen("not.a-valid id")]);
+
+      expect(index.resolve("wrk_1.not.a-valid id")).toMatchObject({ workerId: "wrk_1" });
+      expect(index.resolve("not.a-valid id")).toBeUndefined();
+      expect(logger.warnings).toEqual([
+        expect.objectContaining({ fields: expect.objectContaining({ workerId: "wrk_1" }) }),
+      ]);
+    });
+
+    it("keeps one entry for a flagged lease with an invalid ID repeated across snapshots", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+
+      index.rebuildFromWorker("wrk_1", [chosen("not.a-valid id")]);
+      index.rebuildFromWorker("wrk_1", [chosen("not.a-valid id")]);
+      index.rebuildFromWorker("wrk_1", [chosen("not.a-valid id")]);
+
+      expect(index.all()).toHaveLength(1);
+    });
+
+    it("when two workers report the same caller-chosen ID on rebuild, the first stays routed and a warning names both workers", () => {
+      const logger = new RecordingLogger();
+      const index = new FleetLeaseIndex(PREFIX, logger);
+
+      index.rebuildFromWorker("wrk_1", [chosen("myid")]);
+      index.rebuildFromWorker("wrk_2", [chosen("myid", { ownerId: "bob-principal" })]);
+
+      expect(index.resolve("myid")).toMatchObject({
+        ownerId: "alice-principal",
+        workerId: "wrk_1",
+      });
+      expect(index.findByWorkerLease("wrk_2", "myid")).toBeUndefined();
+      expect(index.all()).toHaveLength(1);
+      expect(logger.warnings).toHaveLength(1);
+      expect(JSON.stringify(logger.warnings[0]?.fields)).toContain("wrk_1");
+      expect(JSON.stringify(logger.warnings[0]?.fields)).toContain("wrk_2");
+    });
+
+    it("add never overwrites a bare entry that belongs to another worker, and says it did not add", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      const first = entry({ gatewayLeaseId: "myid", workerId: "wrk_1", workerLeaseId: "myid" });
+      expect(index.add(first)).toBe(true);
+
+      const added = index.add(
+        entry({ gatewayLeaseId: "myid", workerId: "wrk_2", workerLeaseId: "myid" }),
+      );
+
+      expect(added).toBe(false);
+      expect(index.resolve("myid")).toEqual(first);
+      expect(index.findByWorkerLease("wrk_2", "myid")).toBeUndefined();
+    });
+
+    it("a second worker reporting the same bare ID does not reset the first entry's missing count", () => {
+      const index = new FleetLeaseIndex(PREFIX);
+      index.rebuildFromWorker("wrk_1", [chosen("myid")]);
+      index.rebuildFromWorker("wrk_1", []);
+      expect(index.resolve("myid")).toBeDefined();
+
+      index.rebuildFromWorker("wrk_2", [chosen("myid")]);
+      index.rebuildFromWorker("wrk_1", []);
+
+      expect(index.resolve("myid")).toBeUndefined();
+    });
+  });
+});

@@ -1,0 +1,333 @@
+# Agent rules: toolchain
+
+This project's commands and project-only checks. Agents and skills name no
+command of their own: they take every command from here. `implementer.md`
+copies "Tests agents run"; change both together (a repo test compares them).
+
+## Tests agents run
+
+| What                                           | Command                                      |
+| ---------------------------------------------- | -------------------------------------------- |
+| Unit tests that import what the branch changed | `pnpm test:changed`                          |
+| One unit test file                             | `pnpm exec vitest run --project unit <file>` |
+| Types across the project, before a commit      | `pnpm typecheck`                             |
+| One console DOM test file (`*.dom.test.tsx`)   | `pnpm exec vitest run --project ui-dom <file>` |
+| One timing file (`*.timing.test.ts`)           | `pnpm exec vitest run --project timing <file>` |
+| Fast e2e files (builds first)                  | `pnpm test:e2e <files>`                      |
+| Console specs the diff touched, Chromium only (1) | `pnpm test:console --project=chromium <spec files>` |
+| Console screenshots, when a page's look changes (3) | `pnpm console:screenshots`              |
+| Website build and its HTTP API check (2)       | `pnpm --dir website install && pnpm --dir website build && node website/scripts/check-openapi.mjs` |
+
+(1) Only when the diff touches `ui/`, `e2e/console/`, `src/http/` or
+`src/contract/`, and only the spec files it changed or whose page it
+changes; CI runs the whole lane. A page's behaviour is a DOM test, which
+`pnpm test:changed` runs; this lane holds what needs a real daemon or
+browser engine. Always with a spec file, in the foreground; the tool guard
+sets `timeout: 600000` on a sub-agent's test run.
+
+(2) Only when the diff touches `website/`, `src/http/`, `src/contract/`,
+`src/modules/` or a module's `definition.ts`.
+
+(3) Writes `docs/internal/console-redesign/current/*.png` from the fixture
+pages; it compares nothing. Open the pictures the change touched.
+
+## Code search
+
+ast-grep is a dev dependency, not on `PATH`: run it as `pnpm exec
+ast-grep`. Claude Code also loads ast-grep's two skills, from the plugin
+`.claude/settings.json` pins to one commit.
+
+| What                                      | Command                                                        |
+| ----------------------------------------- | -------------------------------------------------------------- |
+| Find a code shape                         | `pnpm exec ast-grep run --lang ts -p '<pattern>' src`, again with `--lang tsx` for `ui/src` |
+| Find a shape a pattern cannot say         | `pnpm exec ast-grep scan --inline-rules '<YAML rule>' <paths>` |
+| What a module exports, before a new helper | `pnpm exec ast-grep outline <dir> --items exports`            |
+| A file's structure, before reading it     | `pnpm exec ast-grep outline <file>`                            |
+| How ast-grep read a pattern               | add `--debug-query=pattern`, or `=ast` for the code's tree     |
+
+A zero result proves nothing until the same pattern or rule matches a
+sample file that holds the shape, and a count is trusted only after a
+broader search (the bare call, or grep) shows what it left out. Traps,
+each measured on this repo:
+
+- A pattern matches whole nodes. `new Promise($$$)` skips `new
+  Promise<void>(…)`; match on `kind` with `has`, or write each spelling.
+- `async` and `await` are not kinds; match them with `regex`.
+- `try { $$$ } catch ($E) {}` misses `catch {}` and matches a catch that
+  holds only a comment.
+- `has` with `field: attribute` checks only an element's first JSX
+  attribute; drop `field` for a list of children.
+- `has` also sees punctuation, so `not: { has: { regex: "." } }` matches
+  no block.
+- `.ts` files parse as `ts` and `.tsx` as `tsx`; a JSX kind in a `ts` rule
+  is an error.
+
+## Checks agents never run
+
+Hooks and CI run these. Never run them by hand, and never the tools behind
+them (from `node_modules/.bin` or any other path): `pnpm check`, `pnpm test`,
+`pnpm test:timing`, `pnpm typecheck:e2e`, `pnpm typecheck:e2e:types`, `pnpm lint`, `pnpm lint:comments`, `pnpm lint:tests`,
+`pnpm format`, `pnpm format:check`,
+`pnpm fallow`, `pnpm mutate` (outside the `harden-tests` routine and a
+refactor's `--touched-by` run, below), the whole
+e2e suite, the console lane in every browser (`pnpm test:console`), `tsc`,
+`oxlint`, `depcruise`, `oxfmt`, `fallow`, `stryker`, `.agents/scripts/comment-lint.mjs`
+(outside the `garden-comments` routine), `.agents/scripts/test-lint.mjs`. A PreToolUse hook
+(`.agents/scripts/tool-guard.mjs`) refuses them in every sub-agent, but runs `tsc --noEmit`
+on a project `pnpm typecheck` compiles as `pnpm typecheck`; keep its list and this one the same.
+
+- **Commit hook:** formats the staged files and stages the result, then
+  lint, the comment lint (architecture rule 17), the test lint (testing
+  rules 5, 6 and 10 and always-in-scope 8, on the lines the commit adds) and
+  typecheck. Errors show in its output. Its commit-msg step
+  (`.agents/scripts/commit-msg-check.mjs`) refuses a subject on
+  `<kind>/<n>` that is not `<type>(<scope>): <what> (#<n>)`, and on
+  `bug/<n>-repro` one that is not `test: reproduce #<n> — <claim>`.
+- **Push hook:** CI's Fallow command on the whole tree, the
+  `*.repo.test.ts` files, the protocol and docs-surface checks, then the
+  e2e typecheck. A test that reads the repository's files instead of
+  importing code is named `*.repo.test.ts` and runs in about a second:
+  `pnpm test:changed` selects it only when the branch edits the test
+  itself, so the hook runs every one, except on `bug/<n>-repro` and
+  `wip/<n>-repro`, where a triage's reproduction fails by design; CI runs
+  them all.
+- **CI:** what `pnpm check` runs, and Fallow, on every push. CI's Fallow
+  (`fallow --ci`) checks the whole tree and fails on any dead-code finding
+  or clone group, `warn` rules included; complexity fails above the
+  `.fallowrc.json` limits, and refactoring targets never fail. Its findings
+  show as annotations on the PR. A `fallow-ignore` comment names its reason
+  after ` -- `, and one that no longer hides a finding fails. The `pnpm
+  check` steps run as parallel jobs (static checks, unit tests, the unit
+  tests on Windows in three shards, the timing tests, the e2e lane in three
+  shards); the Quality check passes only when all of them do. The Windows
+  shards run on every push to `main`, and on a pull request whose change
+  can give another result on Windows (list in `ci.yml`). A contributor on Windows
+  runs the tests from Git Bash with Python 3 and jq installed, never PowerShell. A
+  failure only a `Unit tests (Windows) (n/3)` job shows is reproduced by
+  rerunning that job on the base commit's CI run (`gh run rerun <run> --job
+  <job>`), not locally. The console DOM tests run with the unit tests. The console lane runs
+  in Chromium in two shards (the required Console check passes only when
+  they all do) on every push to `main`, and on a pull request when it
+  changes a source, UI, console spec or build file.
+
+## Mutation testing
+
+Part of delivery for a refactor only (delivery rule 18). On the branch's
+pin commit, `pnpm mutate --touched-by <head>` mutates the source lines that
+commit has and `<head>` moves or changes, and runs them against the pins
+and the existing tests; it exits 0 only when every mutant died. The
+implementer runs it before the refactor, and the gate again through
+`refactor-check.mjs`; the results cache in the clone's git directory, so a
+second run on unchanged lines is quick.
+
+`node .agents/scripts/refactor-check.mjs --pr <m>` is the gate's
+refactor check (delivery rule 18): it fetches the PR, prepares detached
+worktrees of the merge base or pin commit and of the head, and compares
+test titles, the module surfaces, the pins and the mutants. `--base <sha>
+--head <sha>` checks two commits of this clone with no PR.
+
+Otherwise not part of delivery. The weekly `harden-tests` routine runs `pnpm mutate
+<base> --max-lines 1500` on `main` for the source lines changed since
+`<base>`, newest files first up to that many lines, kills the survivors that
+change behaviour a caller or user can see, and opens one tests-only PR. The
+script first runs only the test files that import a changed file, or reach
+it through their own module's `index.ts`, or that the branch changed; a
+mutant those leave alive gets a second run with every related test file.
+
+## Routines
+
+Claude Code routines run these skills on a schedule. All but the three
+named below the table open one PR that goes through the reviews its diff's
+kind gets and the merge gate:
+
+| Routine            | Skill               | When   |
+| ------------------ | ------------------- | ------ |
+| Test hardening     | `harden-tests`      | weekly |
+| Test audit         | `audit-tests`       | weekly |
+| Comment gardening  | `garden-comments`   | weekly |
+| Recurring findings | `recurring-findings` | weekly |
+| Refactor           | `refactor`          | weekly |
+| Upstream check     | `check-upstream`    | weekly |
+
+`recurring-findings` opens draft task issues instead of a PR, and skips
+the ending below. `check-upstream` only comments on `upstream` issues, and
+skips it too. `refactor` opens one `refactor:new` issue from a
+measured target and, when delivery rule 18's three conditions hold, sets
+it ready and runs `deliver` on it, whose gate ends it instead. Every other routine ends the same way; its skill adds
+only what it changes:
+
+1. `reviewer` with the PR number, round 1, started as the `review` skill
+   starts it. Fix each Fix line yourself, within the routine's kind of
+   edit, then the check its `Rerun` names: `reviewer` with that round,
+   `previous <Commit>` and the complete resolution ledger. `Rerun: none`
+   with findings open: leave the PR in draft and report them.
+2. Add the `## Review` section as the `deliver` skill's step 4 shapes it,
+   `skipped` for each review the diff's kind left out, a fix-check passed
+   to `review-ledger.mjs` as `--round fix-check:review:<Commit>`.
+3. `gh pr ready <M>`, then `.agents/scripts/merge-pr.sh <M>`. Anything but
+   a merge: leave the PR open and report.
+
+In a cloud session, edit a PR body with
+`gh api -X PATCH repos/<owner>/<repo>/pulls/<M> -F body=@<file>`
+(`gh pr edit` is GraphQL, which the cloud refuses), and when `gh pr ready`
+fails with a 403 naming the proxy's ready-for-review route, call that route.
+
+## The real-proxy lane
+
+`pnpm test:real-proxy` runs Simlock behind oauth2-proxy and Dex (both in
+Docker, host networking) and signs a person in through them in Chromium. Linux
+with Docker only; agents never run it, CI does (the "Real proxy" workflow, on a
+pull request that changes source, and weekly). One run per machine: ports 4180,
+5556 and 4700 are fixed, and the setup fails naming one that is busy.
+
+## The screen capture programs
+
+`pnpm build` runs `scripts/build-capture.mjs`: it copies the vendored scrcpy
+server into `dist/vendor/scrcpy/` after checking its pinned SHA-256, and on a
+Mac with Xcode selected it builds `vendor/screen-capture/` (Swift) into
+`dist/bin/simlock-screen-capture` and `dist/bin/simlock-device-capture`, one
+product per `swift build`, each whether or not the other built. Elsewhere the
+Swift build is skipped and iOS streams report unavailable. Neither build checks
+a CoreDevice version: the device program is the one place that enforces that
+pin.
+
+The repository is a pnpm workspace (ADR 0077): `simlock` at the root and
+`@simlock/e2e` under `packages/e2e`. The build steps run through Turborepo
+(`turbo.json`): `pnpm build`, `pnpm build:e2e` and the test scripts that build
+first run the root package's `//#build:*:run` tasks (and `pnpm build` also
+`@simlock/e2e#build`, `tsc` to `packages/e2e/dist/`) and skip each one whose
+inputs (listed per step in `turbo.json`) did not change, restoring its
+`dist/` files from `.turbo/cache` in this worktree. A new `turbo run` call
+names the `//#` ids. Any `package.json` change reruns every step. A capture
+build that skipped Swift (no Xcode selected) is cached too: once Xcode is
+selected, run `pnpm build:capture --force`.
+
+Neither runs in the unit, e2e or console lanes: both read a booted device's
+screen, which means real devices and the slow lane. The lanes cover what this
+repo writes -- the stream module, the drivers' capture code against fakes, the
+envelope -- and the console lane runs a stand-in program that writes the same
+envelope from stills (`e2e/console/screen-capture.ts`), named by the fake
+driver's `screenCaptureCommand`. On a Mac with Xcode, `swift test
+--package-path vendor/screen-capture` runs the Swift tests (the envelope's
+size changes, the log-line parser, the panel follower and its watchdog, a
+dead daemon, the registration record); CI's `Swift tests` job runs it too. A
+change to the Swift program that reads a real screen is checked by
+hand on a machine with a simulator, where
+`node vendor/screen-capture/scripts/unframe.mjs <capture> out.264` turns the
+bytes it wrote into Annex-B and counts each tag, and `ffprobe out.264` says
+whether they decode.
+
+## Slow lane
+
+Tests that start real simulators or emulators. Run them only through
+`scripts/slow-e2e.sh <test files>`:
+
+- It holds a machine-wide lock, runs detached, prints its log path at once,
+  and writes `<log>.exit` when the run ends.
+- Each test's `daemon.log*` files are copied, pass or fail, to
+  `<log without .log>-daemons/<home name>/` next to the log before its home
+  is deleted (`SIMLOCK_E2E_LOG_DIR`); a flow in the lane's reused home
+  (`keepSeeds`, see `e2e/README.md`) gets `simlock-lane-home-<6 hex digits>/`.
+- Exit 75: another run holds the lock; the script prints the holder.
+- Exit 69: the machine is unfit (low disk, another tool at the
+  wrong version or not built); the script prints why.
+- Vitest arguments pass through: `-t "<title>"` runs one test, `--bail=1`
+  ends the run at the first failure.
+- It first stops what earlier runs left behind. By hand: `scripts/slow-e2e.sh
+  clean` (refused while a run holds the lock). Never stop a simulator,
+  emulator or daemon any other way.
+- `scripts/slow-e2e.sh check`: the checks a run starts with, without a
+  run. Exit 69 with why when the machine is unfit. While a lane runs it
+  stops nothing and checks only free disk and the other tools.
+- `scripts/slow-e2e.sh status`: the running test, the counts so far, how
+  long the log has been quiet, and each failure. `scripts/slow-e2e.sh stop`
+  ends the running lane and what it started.
+- This machine's settings live in `.slow-lane.env` at the main checkout's
+  root (untracked): `SIMLOCK_E2E_AGENT_DEVICE=<path>` and any other
+  variable below. The script reads it; nobody passes them by hand.
+
+The machine can run a line only if:
+
+| Line needs | Check                                                      |
+| ---------- | ---------------------------------------------------------- |
+| iOS        | `uname -s` is `Darwin`; `xcrun simctl list runtimes` lists one |
+| Android    | `command -v emulator adb` finds both                       |
+| iOS window | the iOS check; `mdfind "kMDItemCFBundleIdentifier == 'com.apple.dt.Devices'"` prints a path; `stat -f %Su /dev/console` is not `root` (someone is logged in); `pgrep -x DeviceHub` finds nothing (the test starts DeviceHub itself with `-shutdownStartedDevicesOnQuit NO` and quits it at the end). Run `scripts/slow-e2e.sh e2e/slow-ios-window.test.ts` |
+| Physical iOS | `uname -s` is `Darwin`; `SIMLOCK_PHYSICAL_IOS` is the UDID of an iPhone on USB (trusted, Developer Mode on, unlocked, Auto-Lock Never); `SIMLOCK_PHYSICAL_IOS_APP` is a `.app` signed for it. `/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" /Library/Developer/PrivateFrameworks/CoreDevice.framework/Resources/Info.plist` prints a version whose major is 642 or later (streaming a phone needs the CoreDevice of Xcode 27 or later; the framework is machine-wide and does not follow `xcode-select`). DeviceHub and Xcode are not running during the lane. The stream cases need the iPhone on iOS 27 or later; an older iPhone runs the refusal case instead. Run `scripts/slow-e2e.sh --physical e2e/slow-ios-physical.test.ts` |
+| iOS foldable | the iOS check; `xcrun simctl list runtimes` lists iOS 27.1 or later and `xcrun simctl list devicetypes` lists `iPhone Duo`; `SIMLOCK_E2E_AGENT_DEVICE` names the agent-device the lane pins (agent-device through simlock row); `command -v ffmpeg` finds it. Run `scripts/slow-e2e.sh e2e/slow-ios-foldable.test.ts` |
+| iOS simulator input | the iOS check; `xcrun simctl list runtimes` lists an iOS 27 or later runtime; `uname -m` is `arm64`; `SIMLOCK_E2E_AGENT_DEVICE` names the agent-device the lane pins (agent-device through simlock row). Run `scripts/slow-e2e.sh e2e/slow-ios-input.test.ts` |
+| agent-device through simlock | `node -v` is 22.12.0 or later (agent-device's own minimum); the iOS check and `uname -m` is `arm64` (the fixture app is arm64 only), or the Android check; `SIMLOCK_E2E_AGENT_DEVICE` (in `.slow-lane.env`) is the absolute path of `bin/agent-device.mjs` in an install of the agent-device version `package.json` pins for `@agent-device/proxy` (`npm install -g agent-device@<version>`, or a checkout at tag `v<version>` built with `pnpm install && pnpm build && pnpm build:android`, the last building the Android snapshot helper); room for two devices: `node -p "os.totalmem() / 2**30"` prints at least 7 for iOS or 12 for Android (simlock's 4 GiB OS reserve plus two of its default 1.5 GiB iOS or 4 GiB Android per-device budgets). Run `scripts/slow-e2e.sh e2e/slow-agent-device.test.ts` or `scripts/slow-e2e.sh e2e/slow-agent-device-gateway.test.ts` |
+| Physical Android | `command -v adb` finds it; `adb devices -l` lists `$SIMLOCK_PHYSICAL_ANDROID` on a USB transport (a `usb:` field) in state `device`; `SIMLOCK_PHYSICAL_ANDROID_APK` names an APK; `SIMLOCK_PHYSICAL_ANDROID_NETWORK` beside it names an address `adb devices -l` lists in state `device` with no `usb:` field, for the network case. Run `scripts/slow-e2e.sh --physical e2e/slow-android-physical.test.ts` |
+| agent-device with a physical phone | the agent-device through simlock checks above (the Android or iOS one), and the Physical Android checks with `SIMLOCK_PHYSICAL_ANDROID`, or the Physical iOS checks with `SIMLOCK_PHYSICAL_IOS`; for iOS also `SIMLOCK_E2E_IOS_TEAM_ID` and `SIMLOCK_E2E_IOS_BUNDLE_ID` (in `.slow-lane.env`); set `SIMLOCK_E2E_IOS_PROVISIONING_PROFILE` and `SIMLOCK_E2E_IOS_SIGNING_IDENTITY` only for manual signing, which an Xcode-managed profile fails. Run `scripts/slow-e2e.sh --physical e2e/slow-agent-device-physical.test.ts` |
+| Physical Android, a person at the phone | the Physical Android checks above, and `SIMLOCK_PHYSICAL_PERSON` is `1`. Run `scripts/slow-e2e.sh --physical-manual e2e/slow-android-physical-manual.test.ts` |
+| Physical iOS, a person at the phone | the Physical iOS checks above, a passcode set on the phone (locking it then needs the passcode), and `SIMLOCK_PHYSICAL_PERSON` is `1`. Run `scripts/slow-e2e.sh --physical-manual e2e/slow-ios-physical-manual.test.ts` |
+
+Two tags mark the phone lane. `physical` tests run unattended. `physical-manual`
+tests prompt a person in the log and wait up to 150 s for each step. Only a
+person running the lane by hand sets `SIMLOCK_PHYSICAL_PERSON`. The hardware
+verifier never does, so the second machine check fails and it reports
+`unavailable (needs a person)`.
+
+A Done when line needs the slow lane when it needs a real simulator or
+emulator. It says so in its own words ("on a Mac with an iOS runtime: ...")
+and names the slow-lane test that proves it.
+
+## Other tools' source
+
+A spec's Facts row about another tool cites that tool's source at the
+version this repo uses, or a command run on this machine; never a summary or
+the tool's docs alone.
+
+| Tool | Version | Read it |
+| ---- | ------- | ------- |
+| agent-device | the version `package.json` pins for `@agent-device/proxy` (tag `v<version>`) | `git -C <checkout> show v<version>:<path>` in a clone of `callstack/agent-device` (on a machine that runs the slow lane, the one `.slow-lane.env` names). No clone: `gh api 'repos/callstack/agent-device/contents/<path>?ref=v<version>' -H 'Accept: application/vnd.github.raw'`. The proxy as simlock bundles it: `node_modules/@agent-device/proxy/dist` |
+| Android SDK tools, Xcode tools | the installed ones | run them: `<tool> --help`, or the command itself |
+| simlock's own CLI | `main` | `pnpm build`, then `node dist/cli/main.js <command> --help` or the command itself |
+| systemd (Linux service units) | tag `v255` (Ubuntu 24.04 LTS); CI's fast lane runs on Linux (`ubuntu-24.04`), the slow lane does not | `gh api 'repos/systemd/systemd/contents/<path>?ref=v255' -H 'Accept: application/vnd.github.raw'` |
+| launchd, launchctl, plutil (macOS) | the installed ones | run them: a throwaway LaunchAgent under a `com.callstack.simlock.probe*` label, booted out afterwards |
+
+## Project checks
+
+- **Strict test areas** (testing rule 3): `src/leasing/`; in `src/core/`,
+  the registry and its lock (`registry.ts`, `serialized-decision.ts`,
+  `device-operation-claims.ts`), reclaim, quarantine and destruction
+  (`reclaim-coordinator.ts`, `quarantine-coordinator.ts`, `reaper.ts`,
+  `cleanup/`, `cleanup-executor.ts`, `nuke.ts`, `nuke-service.ts`,
+  `managed-device-lifecycle.ts`), ownership (`device-root.ts`,
+  `physical-enrollment.ts`) and startup (`startup-converger.ts`); and the
+  validators of wire input in `src/contract/` (safety rule 10).
+
+- **Published surfaces.** A change to a schema, a contract type or a
+  validator reruns the tests of every surface that publishes it: MCP
+  `tools/list`, HTTP error bodies, CLI help. A refinement can empty a
+  published schema while every unit test stays green.
+- **Contract shapes.** Every change to a contract shape bumps
+  `DAEMON_PROTOCOL_VERSION` by one in the same PR (a spec's "protocol +1 at
+  merge" means this too), so two tasks that change contract shapes
+  overlap even when they touch different files. The push hook and CI run
+  `.agents/scripts/protocol-bump-check.mjs`: a contract shape change with
+  no bump, or a bump with no shape change, fails. A contract edit that
+  changes no wire shape (a refactor, a client-only error code) carries the
+  commit trailer `Protocol-bump: none (<reason>)`.
+
+## Review measurement
+
+Every prompt a delivery stage or review lens is started with begins with
+this line, `-` for a key that does not apply yet:
+
+```
+ledger: pr=<M> issue=<N> stage=<build|audit|fix|hardware-fix|review|hardware> round=<1|2|fix-check> role=<implementer|reviewer|spec|code|claims|hardware-verifier> lens=<behaviour|tests|both>
+```
+
+`node .agents/scripts/review-metrics.mjs --pr <M> --issue <N> [--findings
+<file>]` reads the runs so tagged from Claude Code's transcripts on this
+machine and prints their models, seconds, tokens and cost, and with
+`--findings` the outcome and class counts; [REVIEW.md](../REVIEW.md) says
+what goes in the findings file and where the result is posted. With
+`--findings` it also checks the findings file and writes a class that
+starts with a rule and its number back as that rule plus `detail`; the
+script's header says what it refuses. Runs tagged `stage=replay` (a frozen snapshot reviewed
+again by `review-replay.sh`) are left out unless `--replay` is given.
+`node .agents/scripts/delivery-metrics.mjs [--end <iso>] [--days 14] [--prs <n,n>] [--json]`
+prints cost, time and autonomy per merged PR, the orchestrator included; its header lists every
+option. Run it weekly: it keeps the sleep record the wall times need.

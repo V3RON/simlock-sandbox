@@ -1,0 +1,275 @@
+import type { EventBus } from "../bus/index.js";
+import {
+  type Clock,
+  type Filesystem,
+  type Logger,
+  NoopLogger,
+  type TimerHandle,
+} from "../ports/index.js";
+import type { CleanupActionExecutor } from "./cleanup-executor.js";
+import {
+  automaticCleanupRules,
+  type CleanupConfig,
+  type CleanupRule,
+  type Proposal,
+  type RegistryView,
+} from "./cleanup/index.js";
+import type { Registry } from "./registry.js";
+import { stableError } from "./stable-error.js";
+
+export interface CleanupReaperOptions {
+  readonly clock: Clock;
+  readonly config: CleanupConfig;
+  readonly eventBus: EventBus;
+  readonly executor: CleanupActionExecutor;
+  readonly filesystem: Filesystem;
+  readonly logger?: Logger;
+  readonly registry: Registry;
+  readonly rules?: readonly CleanupRule[];
+  /** why: read target, learned-kind and live queue protection on every cleanup pass. */
+  readonly targetedDevices?: () => Promise<ReadonlySet<string>>;
+  readonly diskPath?: string;
+  readonly tickMs?: number;
+}
+
+export interface CleanupRunOptions {
+  readonly dryRun?: boolean;
+  readonly rule?: string;
+}
+
+export class CleanupReaper {
+  readonly #automaticRules: readonly CleanupRule[];
+  readonly #unsubscribe: readonly (() => void)[];
+  #followUpRequested = false;
+  #running: Promise<readonly Proposal[]> | undefined;
+  /** why: runs a request started (a dry run, a rule-scoped run), which `#running` does not hold. */
+  readonly #requestRuns = new Set<Promise<readonly Proposal[]>>();
+  #tickTimer: TimerHandle | undefined;
+  #disposed = false;
+  #underPressure = false;
+  readonly #logger: Logger;
+  readonly #loggedRuns = new WeakSet<Promise<readonly Proposal[]>>();
+
+  constructor(private readonly options: CleanupReaperOptions) {
+    this.#logger = options.logger?.child("reaper") ?? new NoopLogger();
+    this.#automaticRules = options.rules ?? automaticCleanupRules;
+    this.#unsubscribe = [
+      options.eventBus.subscribe("lease.released", () => this.#trigger()),
+      options.eventBus.subscribe("daemon.started", () => this.#trigger()),
+      options.eventBus.subscribe("disk.pressure-detected", () => this.#trigger()),
+    ];
+    this.#armTick();
+  }
+
+  get rules(): readonly CleanupRule[] {
+    return this.#automaticRules;
+  }
+
+  async run({ dryRun = false, rule }: CleanupRunOptions = {}): Promise<readonly Proposal[]> {
+    if (!dryRun && rule === undefined) {
+      return this.#scheduleRun();
+    }
+
+    const run = this.#runOnce(rule === undefined ? { dryRun } : { dryRun, rule });
+    this.#requestRuns.add(run);
+    const forget = () => {
+      this.#requestRuns.delete(run);
+    };
+    run.then(forget, forget);
+    return run;
+  }
+
+  dispose(): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#disposed = true;
+    for (const unsubscribe of this.#unsubscribe) {
+      unsubscribe();
+    }
+    if (this.#tickTimer !== undefined) {
+      this.options.clock.cancel(this.#tickTimer);
+      this.#tickTimer = undefined;
+    }
+  }
+
+  async settle(): Promise<void> {
+    // why: the run's failure reaches whoever started it; a stop only waits for every run to end.
+    await Promise.allSettled([this.#running, ...this.#requestRuns]);
+  }
+
+  async #runOnce({ dryRun = false, rule }: CleanupRunOptions = {}): Promise<readonly Proposal[]> {
+    // why: A dry run is a preview and must stay free of side effects: emitting the
+    // pressure fact from one would wake this reaper through its own subscription
+    // and turn `cleanup --dry-run` into a real cleanup.
+    const view = await this.#view({ observePressure: !dryRun });
+    const proposals = filterProposals(this.#rulesFor(rule), view);
+    if (dryRun) {
+      return proposals;
+    }
+
+    for (const proposal of proposals) {
+      // why: one action that throws (a device whose platform has no driver) must not abort the
+      // proposals after it. Only the action is contained: a rule or registry-view failure above
+      // still rejects the run.
+      try {
+        await this.options.executor.execute(proposal);
+      } catch (error: unknown) {
+        this.#logger.error("cleanup action failed", {
+          step: "cleanup",
+          action: proposal.action,
+          rule: proposal.rule,
+          target: proposal.target,
+          error: stableError(error),
+        });
+      }
+    }
+
+    return proposals;
+  }
+
+  #trigger(): void {
+    if (this.#disposed) {
+      return;
+    }
+    void this.#scheduleRunLogged();
+  }
+
+  /**
+   * why: A run nobody awaits: its failure has no caller to reach, so it is logged here. Triggers that
+   * arrive while a run is in flight share its promise, so a run is logged once, not once per
+   * trigger that joined it.
+   */
+  async #scheduleRunLogged(): Promise<void> {
+    const run = this.#scheduleRun();
+    try {
+      await run;
+    } catch (error: unknown) {
+      if (this.#loggedRuns.has(run)) return;
+      this.#loggedRuns.add(run);
+      this.#logger.error("scheduled cleanup run failed", {
+        step: "cleanup",
+        error: stableError(error),
+      });
+    }
+  }
+
+  #scheduleRun(): Promise<readonly Proposal[]> {
+    if (this.#running !== undefined) {
+      this.#followUpRequested = true;
+      return this.#running;
+    }
+
+    const running = this.#runScheduled();
+    this.#running = running;
+    void running.then(
+      () => {
+        if (this.#running === running) {
+          this.#running = undefined;
+        }
+      },
+      () => {
+        if (this.#running === running) {
+          this.#running = undefined;
+        }
+      },
+    );
+    return running;
+  }
+
+  async #runScheduled(): Promise<readonly Proposal[]> {
+    let proposals: readonly Proposal[] = [];
+    do {
+      this.#followUpRequested = false;
+      proposals = await this.#runOnce();
+    } while (this.#followUpRequested);
+    return proposals;
+  }
+
+  #armTick(): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#tickTimer = this.options.clock.setTimer(this.options.tickMs ?? 60_000, () => {
+      this.#tickTimer = undefined;
+      void this.#scheduleRunLogged().then(() => this.#armTick());
+    });
+  }
+
+  #rulesFor(name: string | undefined): readonly CleanupRule[] {
+    if (name === undefined) {
+      return this.#automaticRules;
+    }
+
+    return this.#automaticRules.filter((rule) => rule.name === name);
+  }
+
+  async #view({ observePressure }: { readonly observePressure: boolean }): Promise<RegistryView> {
+    const snapshot = this.options.registry.snapshot;
+    const diskFreeBytes = await this.options.filesystem.diskFree(this.options.diskPath ?? ".");
+    if (observePressure) this.#notePressureCrossing(diskFreeBytes);
+    return {
+      config: this.options.config,
+      devices: snapshot.virtualDevices,
+      diskFreeBytes,
+      leases: snapshot.leases,
+      now: this.options.clock.now(),
+      targeted: (await this.options.targetedDevices?.()) ?? new Set(),
+    };
+  }
+
+  /**
+   * why: disk.pressure-detected is a post-commit observer fact, not the trigger for
+   * idle-destroy's own behavior (that rule reads diskFreeBytes off the view
+   * directly). Edge-triggered so a sustained under-threshold condition emits
+   * once, not once per tick.
+   */
+  #notePressureCrossing(freeBytes: number): void {
+    const threshold = this.options.config.diskPressure.freeBytesThreshold;
+    const underPressure = freeBytes < threshold;
+    if (underPressure && !this.#underPressure) {
+      this.options.eventBus.emit(
+        "disk.pressure-detected",
+        { freeBytes, threshold },
+        "cleanup-reaper",
+      );
+    }
+    this.#underPressure = underPressure;
+  }
+}
+
+function filterProposals(rules: readonly CleanupRule[], view: RegistryView): readonly Proposal[] {
+  const deduped = dedupe(rules.flatMap((rule) => rule.evaluate(view)));
+  return deduped.filter((proposal) => isSafeProposal(proposal, view));
+}
+
+function dedupe(proposals: readonly Proposal[]): readonly Proposal[] {
+  const selected = new Map<string, Proposal>();
+
+  for (const proposal of proposals) {
+    const key = `${proposal.target}:${proposal.action}`;
+    if (!selected.has(key)) {
+      selected.set(key, proposal);
+    }
+  }
+
+  for (const proposal of selected.values()) {
+    if (proposal.action === "destroy") {
+      selected.delete(`${proposal.target}:shutdown`);
+    }
+  }
+
+  return [...selected.values()];
+}
+
+function isSafeProposal(proposal: Proposal, view: RegistryView): boolean {
+  const device = view.devices.find((candidate) => candidate.id === proposal.target);
+  if (device === undefined || view.leases.some((lease) => lease.deviceId === device.id)) {
+    return false;
+  }
+
+  return (
+    (proposal.action === "shutdown" && device.state === "ready") ||
+    (proposal.action === "destroy" && device.state === "shutdown")
+  );
+}

@@ -1,0 +1,637 @@
+// why: every wait of a relayed exchange is bounded (architecture rule on cross-process waits): one deadline covers the
+// channel wait and the wait for the head (a file upload's counts from its body's end, and its body is bounded by silence),
+// and an idle bound covers the response body, which may be a live stream that runs as long as someone reads it; the link bounds the channels open to a worker (ADR 0028).
+
+import {
+  isRelayFramingHeader,
+  isSimlockError,
+  relayHeaderPairs,
+  type AnySimlockError,
+} from "../contract/index.js";
+import { DispatchError } from "../daemon/dispatch.js";
+import { LinkChannelError, type LinkChannel } from "../link/index.js";
+import { type Clock, SystemClock, type TimerHandle } from "../ports/index.js";
+import { isUplinkLost, liveClient, type WorkerDirectory } from "./fleet-ports.js";
+import type { GatewayWorkerClient } from "./worker-client.js";
+
+export interface GatewayRelayOptions {
+  readonly directory: WorkerDirectory;
+  readonly deadlineMs?: number;
+  readonly idleMs?: number;
+  readonly clock?: Clock;
+  readonly proxyAuthHeader?: string;
+}
+
+export interface GatewayRelayCall {
+  readonly target: string;
+  readonly request: Request;
+  readonly tenant: string;
+  readonly leaseId?: string;
+  /** why: a file upload may run as long as bytes keep coming; its request body is bounded by silence, and the head deadline counts from the body's end. */
+  readonly upload?: { readonly name: string; readonly silenceMs: number };
+}
+
+export interface TwoWayRelay {
+  readonly status: number;
+  readonly headers: Headers;
+  readonly readable: ReadableStream<Uint8Array>;
+  readonly writable: WritableStream<Uint8Array>;
+}
+
+// why: agent-device's proxy allows 300 s per exchange; the rest is a margin.
+const DEFAULT_DEADLINE_MS = 330_000;
+// why: agent-device's proxy ends an exchange 300 s after it starts, and its RPC body may sit silent between progress
+// lines for most of that; a bound at or under 300 s would cut exchanges the worker still finishes. A live stream's
+// worker side already ends a capture silent for 30 s, so for a stream this only backs up a worker that hangs.
+const DEFAULT_IDLE_MS = 330_000;
+type RelayMethod = Parameters<GatewayWorkerClient["relayRequest"]>[0]["method"];
+// why: a worker's direction of a two-way relay is a live channel its module may leave quiet for long; 15 s of silence from the worker means it is gone (ADR 0049).
+const TWO_WAY_SILENCE_MS = 15_000;
+// why: the relay reads the worker's direction itself, so a module that reads slowly does not make a live worker look silent; the link holds what is beyond this.
+const TWO_WAY_READ_AHEAD_BYTES = 64 * 1024;
+const NO_BODY_STATUSES: ReadonlySet<number> = new Set([204, 205, 304]);
+
+function isStopped(error: unknown): boolean {
+  return error instanceof LinkChannelError && error.reason === "stopped";
+}
+
+export class GatewayRelay {
+  constructor(private readonly options: GatewayRelayOptions) {}
+
+  // why: a two-way relay's head hands back both directions of the channel; a refusal is a `Response`, as `relay` gives it.
+  relayTwoWay(workerId: string, call: GatewayRelayCall): Promise<Response | TwoWayRelay> {
+    return this.#exchange(workerId, call, true);
+  }
+
+  relay(workerId: string, call: GatewayRelayCall): Promise<Response> {
+    return this.#exchange(workerId, call, false) as Promise<Response>;
+  }
+
+  #exchange(
+    workerId: string,
+    call: GatewayRelayCall,
+    twoWay: boolean,
+  ): Promise<Response | TwoWayRelay> {
+    return new Promise<Response | TwoWayRelay>((resolve, reject) => {
+      const exchange = new Exchange({
+        call,
+        client: () => liveClient(this.options.directory.target(workerId)),
+        deadlineMs: this.options.deadlineMs ?? DEFAULT_DEADLINE_MS,
+        clock: this.options.clock ?? new SystemClock(),
+        ...(this.options.proxyAuthHeader === undefined
+          ? {}
+          : { proxyAuthHeader: this.options.proxyAuthHeader }),
+        idleMs: this.options.idleMs ?? DEFAULT_IDLE_MS,
+        reject,
+        resolve,
+        twoWay,
+        workerId,
+      });
+      exchange.start();
+    });
+  }
+}
+
+interface ExchangeInit {
+  readonly call: GatewayRelayCall;
+  readonly client: () => GatewayWorkerClient | undefined;
+  readonly deadlineMs: number;
+  readonly idleMs: number;
+  readonly clock: Clock;
+  readonly proxyAuthHeader?: string;
+  readonly resolve: (response: Response | TwoWayRelay) => void;
+  readonly reject: (error: unknown) => void;
+  readonly twoWay: boolean;
+  readonly workerId: string;
+}
+
+function callerHeaders(headers: readonly (readonly [string, string])[]): Headers | undefined {
+  const result = new Headers();
+  try {
+    for (const [name, value] of headers) {
+      // why: the gateway frames its own response, so a worker's framing headers must not reach the caller.
+      if (isRelayFramingHeader(name)) continue;
+      result.append(name, value);
+    }
+  } catch {
+    // why: `Headers` refuses a value above U+00FF that the push schema lets through.
+    return undefined;
+  }
+  return result;
+}
+
+class Exchange {
+  readonly #relayId = crypto.randomUUID();
+  readonly #opening = new AbortController();
+  #client: GatewayWorkerClient | undefined;
+  #channel: LinkChannel | undefined;
+  #reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  #ahead: Promise<ReadableStreamReadResult<Uint8Array>> | undefined;
+  #timer: TimerHandle | undefined;
+  #idleTimer: TimerHandle | undefined;
+  #silenceTimer: TimerHandle | undefined;
+  #callerBody: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  #requestSent = false;
+  #cancelSent = false;
+  #done = false;
+  #headed = false;
+  #answered = false;
+  #peerAborted = false;
+  #bodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  #writableController: WritableStreamDefaultController | undefined;
+  #piped = false;
+  #readEnded = false;
+  #writeEnded = false;
+  readonly #abortListener = () => this.#fail(this.init.call.request.signal.reason);
+
+  constructor(private readonly init: ExchangeInit) {}
+
+  start(): void {
+    const { call } = this.init;
+    const signal = call.request.signal;
+    if (signal.aborted) {
+      this.init.reject(signal.reason);
+      return;
+    }
+    signal.addEventListener("abort", this.#abortListener, { once: true });
+    this.#armDeadline();
+    void this.#run();
+  }
+
+  #armDeadline(): void {
+    const { deadlineMs, workerId } = this.init;
+    this.#timer = this.init.clock.setTimer(deadlineMs, () => {
+      this.#fail(
+        new DispatchError(
+          "WORKER_UNREACHABLE",
+          `worker ${workerId} did not finish the relayed request within ${String(deadlineMs)} ms`,
+          { workerId },
+        ),
+      );
+    });
+  }
+
+  #armSilence(): void {
+    const { upload } = this.init.call;
+    if (upload === undefined) return;
+    this.#silenceTimer = this.init.clock.setTimer(upload.silenceMs, () => {
+      this.#fail(
+        new DispatchError(
+          "UPLOAD_STALLED",
+          `No bytes of ${upload.name} arrived for ${String(upload.silenceMs / 1000)} s`,
+          { name: upload.name },
+        ),
+      );
+    });
+  }
+
+  #disarmSilence(): void {
+    if (this.#silenceTimer !== undefined) this.init.clock.cancel(this.#silenceTimer);
+    this.#silenceTimer = undefined;
+  }
+
+  async #run(): Promise<void> {
+    const client = this.init.client();
+    if (client === undefined) {
+      this.#fail(this.#unreachable());
+      return;
+    }
+    this.#client = client;
+    let channel: LinkChannel;
+    try {
+      channel = await client.openChannel({ signal: this.#opening.signal });
+    } catch (error: unknown) {
+      this.#fail(error instanceof DispatchError ? error : this.#unreachable());
+      return;
+    }
+    if (this.#done) {
+      channel.abort();
+      return;
+    }
+    this.#channel = channel;
+    this.#endStartDeadlineOfUpload();
+    this.#reader = channel.readable.getReader();
+    this.#look();
+    this.#sendRequest(client, channel);
+    if (!this.init.twoWay) await this.#upload(channel, this.init.call.request.body);
+  }
+
+  // why: an upload's time is bounded by silence from here on, so the start deadline ends once the channel is open.
+  #endStartDeadlineOfUpload(): void {
+    if (this.init.call.upload === undefined || this.#timer === undefined) return;
+    this.init.clock.cancel(this.#timer);
+    this.#timer = undefined;
+  }
+
+  #sendRequest(client: GatewayWorkerClient, channel: LinkChannel): void {
+    const { request } = this.init.call;
+    const body = request.body;
+    this.#requestSent = true;
+    client
+      .relayRequest(
+        {
+          channel: channel.id,
+          hasBody: body !== null,
+          ...(this.init.twoWay ? { twoWay: true as const } : {}),
+          headers: relayHeaderPairs(request.headers, {
+            dropCredentials: true,
+            ...(this.init.proxyAuthHeader === undefined
+              ? {}
+              : { proxyAuthHeader: this.init.proxyAuthHeader }),
+          }),
+          method: request.method as RelayMethod,
+          relayId: this.#relayId,
+          target: this.init.call.target,
+          tenant: this.init.call.tenant,
+          url: request.url,
+          ...(this.init.call.leaseId === undefined ? {} : { leaseId: this.init.call.leaseId }),
+        },
+        {
+          onRelayHead: (head) => this.#onHead(head.status, head.headers),
+          onRelayInvalid: () => this.#invalid(),
+        },
+      )
+      .then(
+        (answer) => this.#onAnswer(answer),
+        (error: unknown) => this.#onCallError(error),
+      );
+  }
+
+  async #upload(channel: LinkChannel, body: ReadableStream<Uint8Array> | null): Promise<void> {
+    const writer = channel.writable.getWriter();
+    if (body === null) {
+      await writer.close().catch(() => undefined);
+      this.#armHeadDeadline();
+      return;
+    }
+    const reader = body.getReader();
+    this.#callerBody = reader;
+    try {
+      for (;;) {
+        this.#armSilence();
+        const step = await reader.read();
+        this.#disarmSilence();
+        if (this.#done) return;
+        if (step.done) break;
+        await writer.write(step.value);
+      }
+      await writer.close();
+      this.#armHeadDeadline();
+    } catch (error: unknown) {
+      this.#uploadFailed(error, reader);
+    }
+  }
+
+  #uploadFailed(error: unknown, reader: ReadableStreamDefaultReader<Uint8Array>): void {
+    if (this.#done) return;
+    if (error instanceof LinkChannelError) {
+      // why: the worker stopped reading this direction, so the caller's body is no longer read.
+      if (error.reason === "stopped") {
+        reader.cancel().catch(() => undefined);
+        // why: no timer is left running once the body is no longer read, and the worker may never send a head.
+        this.#armHeadDeadline();
+      } else this.#onChannelError(error);
+      return;
+    }
+    this.#fail(error);
+  }
+
+  // why: an upload's head can arrive only after its body, so its deadline counts from the body's end.
+  #armHeadDeadline(): void {
+    if (this.init.call.upload === undefined || this.#done || this.#headed) return;
+    this.#armDeadline();
+  }
+
+  // why: a single read is kept ahead so a channel that fails before the head is seen without anyone reading the body.
+  #look(): Promise<ReadableStreamReadResult<Uint8Array>> {
+    if (this.#ahead === undefined) {
+      const read = (this.#reader as ReadableStreamDefaultReader<Uint8Array>).read();
+      read.then(
+        (step) => {
+          if (!step.done) this.#armIdle();
+        },
+        (error: unknown) => this.#onChannelError(error),
+      );
+      this.#ahead = read;
+    }
+    return this.#ahead;
+  }
+
+  #onHead(status: number, headers: readonly (readonly [string, string])[]): void {
+    if (this.#done) return;
+    if (this.#headed) {
+      this.#invalid();
+      return;
+    }
+    const responseHeaders = callerHeaders(headers);
+    if (responseHeaders === undefined) {
+      this.#invalid();
+      return;
+    }
+    this.#headed = true;
+    // why: once the head is in, the body is bounded by silence, not by the deadline, so a live stream is not cut.
+    if (this.#timer !== undefined) this.init.clock.cancel(this.#timer);
+    this.#disarmSilence();
+    if (this.init.twoWay && this.#openOrRefuse(status, responseHeaders)) return;
+    this.#armIdle();
+    const method = this.init.call.request.method;
+    if (method === "HEAD" || NO_BODY_STATUSES.has(status)) {
+      this.init.resolve(new Response(null, { headers: responseHeaders, status }));
+      void this.#drain();
+      return;
+    }
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        cancel: () => this.#abandon(),
+        pull: (controller) => this.#pull(controller),
+        start: (controller) => {
+          this.#bodyController = controller;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    this.init.resolve(new Response(stream, { headers: responseHeaders, status }));
+  }
+
+  // why: a 2xx head opens the two directions; a refusal has no writer, so the gateway's direction ends here and the refusal is answered as a one-way body.
+  #openOrRefuse(status: number, headers: Headers): boolean {
+    if (status >= 200 && status < 300) {
+      this.#openTwoWay(status, headers);
+      return true;
+    }
+    void this.#channel?.writable
+      .getWriter()
+      .close()
+      .catch(() => undefined);
+    return false;
+  }
+
+  #openTwoWay(status: number, headers: Headers): void {
+    this.#piped = true;
+    const writer = (this.#channel as LinkChannel).writable.getWriter();
+    const readable = new ReadableStream<Uint8Array>(
+      {
+        cancel: () => this.#abandon(),
+        pull: (controller) => this.#pump(controller),
+        start: (controller) => {
+          this.#bodyController = controller;
+        },
+      },
+      new ByteLengthQueuingStrategy({ highWaterMark: TWO_WAY_READ_AHEAD_BYTES }),
+    );
+    const writable = new WritableStream<Uint8Array>({
+      abort: (reason) => {
+        this.#abandon();
+        this.#bodyController?.error(reason);
+      },
+      close: async () => {
+        try {
+          await writer.close();
+        } catch (error: unknown) {
+          // why: closing a writable the peer already errored rejects with a TypeError, so the stored reason on `closed` says whether it was a STOP or which failure it was.
+          const stored: unknown = await writer.closed.then(
+            () => undefined,
+            (reason: unknown) => reason,
+          );
+          const reason = stored instanceof LinkChannelError ? stored : error;
+          if (!isStopped(reason)) {
+            this.#onChannelError(reason);
+            throw reason;
+          }
+        }
+        this.#writeEnded = true;
+        this.#maybeComplete();
+      },
+      start: (controller) => {
+        this.#writableController = controller;
+      },
+      write: async (chunk) => {
+        try {
+          await writer.write(chunk);
+        } catch (error: unknown) {
+          // why: a worker that stopped reading ended the gateway's direction only; the worker's direction goes on, and the module's writable errors alone.
+          if (isStopped(error)) {
+            this.#writeEnded = true;
+            this.#maybeComplete();
+          } else this.#onChannelError(error);
+          throw error;
+        }
+      },
+    });
+    this.#armIdle();
+    this.init.resolve({ headers, readable, status, writable });
+  }
+
+  // why: the pump reads the worker's direction only while the module's queue has room, so the silence bound runs only while the relay is waiting on the worker.
+  async #pump(controller: ReadableStreamDefaultController<Uint8Array>): Promise<void> {
+    this.#armIdle();
+    let step: ReadableStreamReadResult<Uint8Array>;
+    try {
+      step = await this.#look();
+    } catch {
+      return;
+    }
+    this.#ahead = undefined;
+    if (this.#done) return;
+    if (step.done) {
+      this.#disarmIdle();
+      controller.close();
+      this.#readEnded = true;
+      this.#maybeComplete();
+      return;
+    }
+    controller.enqueue(step.value);
+    if ((controller.desiredSize ?? 0) <= 0) this.#disarmIdle();
+  }
+
+  #maybeComplete(): void {
+    if (this.#readEnded && this.#writeEnded) this.#finish();
+  }
+
+  #disarmIdle(): void {
+    if (this.#idleTimer !== undefined) this.init.clock.cancel(this.#idleTimer);
+    this.#idleTimer = undefined;
+  }
+
+  async #pull(controller: ReadableStreamDefaultController<Uint8Array>): Promise<void> {
+    let step: ReadableStreamReadResult<Uint8Array>;
+    try {
+      step = await this.#look();
+    } catch {
+      return;
+    }
+    this.#ahead = undefined;
+    if (this.#done) return;
+    if (step.done) {
+      controller.close();
+      this.#finish();
+      return;
+    }
+    controller.enqueue(step.value);
+  }
+
+  // why: a response with no body still ends with the channel's end, which frees the channel and its timers.
+  async #drain(): Promise<void> {
+    try {
+      for (;;) {
+        const step = await this.#look();
+        this.#ahead = undefined;
+        if (this.#done) return;
+        if (step.done) {
+          this.#finish();
+          return;
+        }
+      }
+    } catch {
+      // why: a failed channel is reported by `#onChannelError`.
+    }
+  }
+
+  #armIdle(): void {
+    if (!this.#headed || this.#done) return;
+    if (this.#idleTimer !== undefined) this.init.clock.cancel(this.#idleTimer);
+    const { clock, workerId } = this.init;
+    const idleMs = this.#piped ? TWO_WAY_SILENCE_MS : this.init.idleMs;
+    this.#idleTimer = clock.setTimer(idleMs, () => {
+      this.#fail(
+        new DispatchError(
+          "WORKER_UNREACHABLE",
+          `worker ${workerId} sent nothing on the relayed response for ${String(idleMs)} ms`,
+          { workerId },
+        ),
+      );
+    });
+  }
+
+  #invalid(): void {
+    this.#fail(
+      new DispatchError("INTERNAL", `worker ${this.init.workerId} sent an invalid relay response`),
+    );
+  }
+
+  #unreachable(): DispatchError {
+    return new DispatchError(
+      "WORKER_UNREACHABLE",
+      `Worker ${this.init.workerId} is not reachable`,
+      {
+        workerId: this.init.workerId,
+      },
+    );
+  }
+
+  #onChannelError(error: unknown): void {
+    if (this.#done) return;
+    const { workerId } = this.init;
+    if (!(error instanceof LinkChannelError)) {
+      this.#fail(error);
+      return;
+    }
+    switch (error.reason) {
+      case "aborted":
+        // why: the worker's `relay.request` answer says why it aborted; when none comes, the deadline ends the wait,
+        // or after the head the idle bound does.
+        this.#peerAborted = true;
+        if (this.#answered) this.#fail(this.#endedEarly());
+        return;
+      case "closed":
+        this.#fail(this.#unreachable());
+        return;
+      case "not-accepted":
+        this.#fail(
+          new DispatchError(
+            "WORKER_UNREACHABLE",
+            `worker ${workerId} did not take the relayed request within 30 s`,
+            { workerId },
+          ),
+        );
+        return;
+      case "stalled":
+        this.#fail(
+          new DispatchError(
+            "INTERNAL",
+            this.#headed
+              ? `the reader of worker ${workerId}'s relayed response fell behind for 60 s`
+              : `worker ${workerId} did not read the relayed request body for 60 s`,
+          ),
+        );
+        return;
+      default:
+        this.#invalid();
+    }
+  }
+
+  #endedEarly(): DispatchError {
+    const { workerId } = this.init;
+    return this.#headed
+      ? new DispatchError("INTERNAL", `worker ${workerId} ended the relayed response early`)
+      : new DispatchError("INTERNAL", `worker ${workerId} ended the relay without a response`);
+  }
+
+  #onAnswer(answer: { readonly cancelled?: true | undefined }): void {
+    if (this.#done) return;
+    if (this.#peerAborted) {
+      this.#fail(this.#endedEarly());
+      return;
+    }
+    if (answer.cancelled === true || !this.#headed) {
+      this.#fail(
+        new DispatchError(
+          "INTERNAL",
+          `worker ${this.init.workerId} ended the relay without a response`,
+        ),
+      );
+      return;
+    }
+    // why: the body ends at the channel's end, not at this answer, which may overtake the body's last bytes.
+    this.#answered = true;
+  }
+
+  #onCallError(error: unknown): void {
+    this.#fail(isSimlockError(error) ? this.#translate(error) : error);
+  }
+
+  #translate(error: AnySimlockError): DispatchError {
+    if (isUplinkLost(error)) {
+      return new DispatchError("WORKER_UNREACHABLE", error.message, {
+        workerId: this.init.workerId,
+      });
+    }
+    return new DispatchError(error.code, error.message, error.details);
+  }
+
+  // why: a caller that stops reading its response is not a failure, but the worker must be told.
+  #abandon(): void {
+    if (this.#done) return;
+    this.#sendCancel();
+    this.#channel?.abort();
+    this.#finish();
+  }
+
+  #fail(error: unknown): void {
+    if (this.#done) return;
+    this.#sendCancel();
+    this.#opening.abort(error);
+    this.#channel?.abort();
+    if (this.#headed) {
+      this.#bodyController?.error(error);
+      this.#writableController?.error(error);
+    } else this.init.reject(error);
+    this.#finish();
+  }
+
+  #sendCancel(): void {
+    if (!this.#requestSent || this.#cancelSent || this.#client === undefined) return;
+    this.#cancelSent = true;
+    this.#client.relayCancel({ relayId: this.#relayId }).catch(() => undefined);
+  }
+
+  #finish(): void {
+    if (this.#done) return;
+    this.#done = true;
+    if (this.#timer !== undefined) this.init.clock.cancel(this.#timer);
+    if (this.#idleTimer !== undefined) this.init.clock.cancel(this.#idleTimer);
+    this.#disarmSilence();
+    this.init.call.request.signal.removeEventListener("abort", this.#abortListener);
+    this.#callerBody?.cancel().catch(() => undefined);
+  }
+}

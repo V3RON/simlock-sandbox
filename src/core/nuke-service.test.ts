@@ -1,0 +1,521 @@
+import { describe, expect, it } from "vitest";
+
+import { EventBus } from "../bus/index.js";
+import { FakeClock, JsonLinesLogger, MemoryLogSink } from "../ports/index.js";
+import { loadTestRegistry } from "./testing.js";
+import type { VirtualDevice, LeaseRecord } from "./domain.js";
+import { FakeDriver } from "./fake-driver.js";
+import { DeviceOperationClaims } from "./device-operation-claims.js";
+import { DriverCatalog } from "./driver-catalog.js";
+import { ManagedDeviceLifecycle } from "./managed-device-lifecycle.js";
+import { SerializedDecision } from "./serialized-decision.js";
+import { NukeService, type NukeDeviceLifecycle, type NukeRegistryView } from "./nuke-service.js";
+
+/** why: no settle ever runs in these tests, so holding the settler runs the work as it is. */
+const noSettler = { holdWhile: <Result>(work: () => Promise<Result>) => work() };
+
+const device = (id: string, state: VirtualDevice["state"]): VirtualDevice => ({
+  physical: false,
+  createdAt: 0,
+  driverData: { privateDriverData: id },
+  driverDeviceId: `driver_${id}`,
+  id,
+  spec: { physical: false, model: "Phone", osVersion: "1", platform: "ios" },
+  mode: "full",
+  state,
+});
+
+class MutableRegistry implements NukeRegistryView {
+  devices: VirtualDevice[];
+  leases: LeaseRecord[] = [];
+
+  constructor(devices: VirtualDevice[]) {
+    this.devices = devices;
+  }
+
+  get snapshot() {
+    return { leases: this.leases, virtualDevices: this.devices };
+  }
+}
+
+function createHarness(
+  devices: VirtualDevice[],
+  onForget: () => void = () => undefined,
+  drivers: readonly FakeDriver[] = [],
+  removeBaselines: () => Promise<{
+    readonly failure?: unknown;
+    readonly names: readonly string[];
+  }> = async () => ({ names: [] }),
+) {
+  const registry = new MutableRegistry(devices);
+  const calls: string[] = [];
+  const lifecycle: NukeDeviceLifecycle = {
+    async shutdown(target) {
+      calls.push(`shutdown:${target.id}`);
+      const index = registry.devices.findIndex((candidate) => candidate.id === target.id);
+      if (index === -1 || registry.devices[index]?.state !== "ready") return undefined;
+      const updated = { ...target, state: "shutdown" as const };
+      registry.devices[index] = updated;
+      return updated;
+    },
+    async destroy(target) {
+      calls.push(`destroy:${target.id}`);
+      const index = registry.devices.findIndex((candidate) => candidate.id === target.id);
+      if (index === -1 || registry.devices[index]?.state !== "shutdown") return undefined;
+      const updated = { ...target, state: "deleted" as const };
+      registry.devices[index] = updated;
+      return updated;
+    },
+  };
+  const service = new NukeService({
+    acquisition: {
+      async beginMaintenance() {
+        calls.push("maintenance:begin");
+      },
+      async endMaintenance() {
+        calls.push("maintenance:end");
+      },
+    },
+    baselines: { removeAll: removeBaselines },
+    devices: lifecycle,
+    drivers,
+    leases: {
+      async beginMaintenance() {
+        calls.push("release-maintenance:begin");
+      },
+      async releaseAllDuringMaintenance(reason) {
+        calls.push(`release:${reason}`);
+        return ["lse_1", "lse_2"];
+      },
+      async endMaintenance() {
+        calls.push("release-maintenance:end");
+      },
+    },
+    registry,
+    seedSettler: noSettler,
+    warmPool: { forget: onForget },
+  });
+  return { calls, lifecycle, registry, service };
+}
+
+describe("NukeService", () => {
+  it("deletes every source of kind seed with --delete-devices, keeps a baseline and an orphan source, and keeps every source in a plain nuke", async () => {
+    const seed = { id: "seed-1", kind: "seed", model: "iPhone", osVersion: "27.0" } as const;
+    const baseline = {
+      id: "base-1",
+      kind: "baseline",
+      model: "iPhone",
+      osVersion: "27.0",
+    } as const;
+    const driver = new FakeDriver({ clock: new FakeClock(), platform: "ios" });
+    const orphan = {
+      id: "orphan-1",
+      kind: "seed",
+      model: "unknown",
+      orphan: true,
+      osVersion: "unknown",
+    } as const;
+    driver.setSources([seed, baseline, orphan]);
+    const harness = createHarness([], () => undefined, [driver]);
+
+    await harness.service.nuke(false);
+    expect((await driver.listSources()).map((source) => source.id)).toEqual([
+      "seed-1",
+      "base-1",
+      "orphan-1",
+    ]);
+
+    await harness.service.nuke(true);
+    expect((await driver.listSources()).map((source) => source.id)).toEqual(["base-1", "orphan-1"]);
+  });
+
+  it("goes on deleting the other seeds and the other drivers' seeds when one seed will not delete or one driver's sources cannot be read", async () => {
+    const stuck = { id: "seed-stuck", kind: "seed", model: "iPhone", osVersion: "27.0" } as const;
+    const other = { ...stuck, id: "seed-other" };
+    const unreadable = new FakeDriver({ clock: new FakeClock(), platform: "android" });
+    const driver = new FakeDriver({ clock: new FakeClock(), platform: "ios" });
+    unreadable.failOn("listSources", 1, new Error("catalog unreadable"));
+    driver.setSources([stuck, other]);
+    driver.failOn("destroySource", 1, new Error("simctl delete failed"));
+    const harness = createHarness([], () => undefined, [unreadable, driver]);
+
+    await expect(harness.service.nuke(true)).resolves.toEqual({
+      releasedLeaseIds: ["lse_1", "lse_2"],
+      removedBaselines: [],
+    });
+
+    expect((await driver.listSources()).map((source) => source.id)).toEqual(["seed-stuck"]);
+  });
+
+  it("still reports the released leases and reopens admission when a baseline source will not delete, answering the names whose rows went", async () => {
+    const harness = createHarness(
+      [],
+      () => undefined,
+      [],
+      async () => ({ failure: new Error("destroySource failed"), names: ["checkout"] }),
+    );
+
+    await expect(harness.service.nuke(true)).resolves.toEqual({
+      releasedLeaseIds: ["lse_1", "lse_2"],
+      removedBaselines: ["checkout"],
+    });
+    expect(harness.calls.at(-1)).toBe("maintenance:end");
+  });
+
+  it("fences acquisition before releasing killed leases and returns their ids", async () => {
+    const harness = createHarness([]);
+
+    await expect(harness.service.nuke(false)).resolves.toEqual({
+      releasedLeaseIds: ["lse_1", "lse_2"],
+      removedBaselines: [],
+    });
+
+    expect(harness.calls).toEqual([
+      "maintenance:begin",
+      "release-maintenance:begin",
+      "release:killed",
+      "release-maintenance:end",
+      "maintenance:end",
+    ]);
+  });
+
+  it("clears the warm pool's record before it resets devices, and still resets them when forget throws", async () => {
+    const clearing = createHarness([device("ready", "ready")], () => {
+      clearing.calls.push("forget");
+    });
+    const throwing = createHarness([device("ready", "ready")], () => {
+      throwing.calls.push("forget");
+      throw new Error("disk I/O error");
+    });
+
+    await clearing.service.nuke(false);
+    await throwing.service.nuke(false);
+
+    for (const run of [clearing, throwing]) {
+      expect(run.calls).toEqual([
+        "maintenance:begin",
+        "release-maintenance:begin",
+        "release:killed",
+        "forget",
+        "shutdown:ready",
+        "release-maintenance:end",
+        "maintenance:end",
+      ]);
+      expect(run.registry.devices).toMatchObject([{ id: "ready", state: "shutdown" }]);
+    }
+  });
+
+  it("targets only non-deleted registry records and supports shutdown-only mode", async () => {
+    const ready = device("registered", "ready");
+    const harness = createHarness([ready, device("already-deleted", "deleted")]);
+
+    await harness.service.nuke(false);
+
+    expect(harness.calls).toEqual([
+      "maintenance:begin",
+      "release-maintenance:begin",
+      "release:killed",
+      "shutdown:registered",
+      "release-maintenance:end",
+      "maintenance:end",
+    ]);
+    expect(harness.registry.devices).toMatchObject([
+      { id: "registered", state: "shutdown" },
+      { id: "already-deleted", state: "deleted" },
+    ]);
+  });
+
+  it("deletes ready and shutdown registry records only after they are shutdown", async () => {
+    const harness = createHarness([device("ready", "ready"), device("shutdown", "shutdown")]);
+
+    await harness.service.nuke(true);
+
+    expect(harness.calls).toEqual([
+      "maintenance:begin",
+      "release-maintenance:begin",
+      "release:killed",
+      "shutdown:ready",
+      "destroy:ready",
+      "destroy:shutdown",
+      "release-maintenance:end",
+      "maintenance:end",
+    ]);
+    expect(harness.registry.devices.map((candidate) => candidate.state)).toEqual([
+      "deleted",
+      "deleted",
+    ]);
+  });
+
+  it("never asks the lifecycle to touch a currently leased device", async () => {
+    const leased = device("leased", "ready");
+    const harness = createHarness([leased]);
+    harness.registry.leases = [
+      {
+        deviceId: leased.id,
+        grantedAt: 0,
+        id: "lse_live",
+        requesterId: "agent",
+        ownerId: "agent",
+        lastRenewedAt: 0,
+        idChosenByRequester: false,
+        ttlMs: 60_000,
+        ttlDeadline: 1,
+      },
+    ];
+
+    await harness.service.nuke(true);
+
+    expect(harness.calls).toEqual([
+      "maintenance:begin",
+      "release-maintenance:begin",
+      "release:killed",
+      "release-maintenance:end",
+      "maintenance:end",
+    ]);
+  });
+
+  it("skips lifecycle-refused and state-changed targets without forcing destruction", async () => {
+    const refused = device("refused", "ready");
+    const changed = device("changed", "ready");
+    const harness = createHarness([refused, changed]);
+    harness.lifecycle.shutdown = async (target) => {
+      harness.calls.push(`shutdown:${target.id}`);
+      if (target.id === "refused") {
+        harness.registry.devices[0] = { ...target, state: "shutdown" };
+      }
+      if (target.id === "changed") {
+        harness.registry.devices[1] = { ...target, state: "deleted" };
+      }
+      return undefined;
+    };
+
+    await harness.service.nuke(true);
+
+    expect(harness.calls).toEqual([
+      "maintenance:begin",
+      "release-maintenance:begin",
+      "release:killed",
+      "shutdown:refused",
+      "shutdown:changed",
+      "release-maintenance:end",
+      "maintenance:end",
+    ]);
+  });
+
+  it("reopens admission even when reset work fails", async () => {
+    const harness = createHarness([]);
+    let fail = true;
+    harness.service = new NukeService({
+      acquisition: {
+        async beginMaintenance() {
+          harness.calls.push("maintenance:begin");
+        },
+        async endMaintenance() {
+          harness.calls.push("maintenance:end");
+        },
+      },
+      baselines: { removeAll: async () => ({ names: [] }) },
+      devices: harness.lifecycle,
+      drivers: [],
+      leases: {
+        async beginMaintenance() {
+          harness.calls.push("release-maintenance:begin");
+        },
+        async releaseAllDuringMaintenance() {
+          if (fail) {
+            fail = false;
+            throw new Error("release failed");
+          }
+          harness.calls.push("release:killed");
+          return [];
+        },
+        async endMaintenance() {
+          harness.calls.push("release-maintenance:end");
+        },
+      },
+      registry: harness.registry,
+
+      seedSettler: noSettler,
+      warmPool: { forget() {} },
+    });
+
+    await expect(harness.service.nuke(false)).rejects.toThrow("release failed");
+    await expect(harness.service.nuke(false)).resolves.toEqual({
+      releasedLeaseIds: [],
+      removedBaselines: [],
+    });
+    expect(harness.calls).toEqual([
+      "maintenance:begin",
+      "release-maintenance:begin",
+      "release-maintenance:end",
+      "maintenance:end",
+      "maintenance:begin",
+      "release-maintenance:begin",
+      "release:killed",
+      "release-maintenance:end",
+      "maintenance:end",
+    ]);
+  });
+
+  it("does not abort the reset on a device whose platform has no driver, and still resets every device after it", async () => {
+    // why: the driverless records are registered first so the attempts that must throw precede
+    // the healthy ones — that order is what a whole-run abort turns on. Only an ios driver is
+    // catalogued, so acting on an android record throws NoDriverError, as it does for a platform
+    // discovery refused. The ready ghost exercises the shutdown verb, the shut-down ghost the
+    // destroy verb; a healthy ios device follows each. `--delete-devices` makes one pass prove
+    // both verbs.
+    const clock = new FakeClock(1_000);
+    const eventBus = new EventBus(clock);
+    const driver = new FakeDriver({ availableOsVersions: ["1"], clock, platform: "ios" });
+    let nextId = 1;
+    const registry = await loadTestRegistry({
+      clock,
+      eventBus,
+      idGenerator: { generate: () => `${nextId++}` },
+    });
+    const lifecycle = new ManagedDeviceLifecycle(
+      new DriverCatalog([driver]),
+      registry,
+      new SerializedDecision(),
+      new DeviceOperationClaims(),
+      clock,
+    );
+    const service = new NukeService({
+      acquisition: {
+        async beginMaintenance() {},
+        async endMaintenance() {},
+      },
+      baselines: { removeAll: async () => ({ names: [] }) },
+      devices: lifecycle,
+      drivers: [],
+      leases: {
+        async beginMaintenance() {},
+        async releaseAllDuringMaintenance() {
+          return [];
+        },
+        async endMaintenance() {},
+      },
+      registry,
+
+      seedSettler: noSettler,
+      warmPool: { forget() {} },
+    });
+
+    async function register(
+      spec: VirtualDevice["spec"],
+      driverData: unknown,
+      driverDeviceId: string,
+    ) {
+      const device = await registry.registerDevice({
+        driverData,
+        driverDeviceId,
+        provisionDuration: 0,
+        spec,
+      });
+      await registry.transitionDevice(device.id, "ready", {
+        event: "device.ready",
+        payload: { bootDuration: 0, deviceId: device.id },
+      });
+      return device;
+    }
+    const android = {
+      physical: false,
+      model: "Pixel 8",
+      osVersion: "35",
+      platform: "android",
+    } as const;
+    const ios = { physical: false, model: "Phone", osVersion: "1", platform: "ios" } as const;
+
+    const ghostReady = await register(
+      android,
+      { fakeDeviceId: "ghost-ready-android" },
+      "ghost-ready-android",
+    );
+    const provisionedReady = await driver.provision(ios);
+    const healthyReady = await register(
+      ios,
+      provisionedReady.driverData,
+      provisionedReady.deviceId,
+    );
+    const ghostShutdown = await register(
+      android,
+      { fakeDeviceId: "ghost-shutdown-android" },
+      "ghost-shutdown-android",
+    );
+    await registry.transitionDevice(ghostShutdown.id, "shutdown", {
+      event: "device.shutdown",
+      payload: { deviceId: ghostShutdown.id, initiator: "test" },
+    });
+    const provisionedShutdown = await driver.provision(ios);
+    const healthyShutdown = await register(
+      ios,
+      provisionedShutdown.driverData,
+      provisionedShutdown.deviceId,
+    );
+    await registry.transitionDevice(healthyShutdown.id, "shutdown", {
+      event: "device.shutdown",
+      payload: { deviceId: healthyShutdown.id, initiator: "test" },
+    });
+
+    await expect(service.nuke(true)).resolves.toEqual({
+      releasedLeaseIds: [],
+      removedBaselines: [],
+    });
+
+    const stateOf = (deviceId: string) =>
+      registry.snapshot.devices.find((candidate) => candidate.id === deviceId)?.state;
+    expect([
+      stateOf(ghostReady.id),
+      stateOf(healthyReady.id),
+      stateOf(ghostShutdown.id),
+      stateOf(healthyShutdown.id),
+    ]).toEqual(["ready", "deleted", "shutdown", "deleted"]);
+    expect(
+      driver.calls
+        .filter((call) => call.operation === "shutdown" || call.operation === "destroy")
+        .map((call) => `${call.operation} ${(call.arguments[0] as { deviceId: string }).deviceId}`)
+        .sort(),
+    ).toEqual(
+      [
+        `destroy ${healthyShutdown.driverDeviceId}`,
+        `destroy ${healthyReady.driverDeviceId}`,
+        `shutdown ${healthyReady.driverDeviceId}`,
+      ].sort(),
+    );
+  });
+
+  it("logs a device it cannot reset at error, naming the device, platform and error", async () => {
+    const sink = new MemoryLogSink();
+    const harness = createHarness([device("dev_1", "ready")]);
+    harness.lifecycle.shutdown = async () => {
+      throw new Error("reset exploded");
+    };
+    const service = new NukeService({
+      acquisition: { async beginMaintenance() {}, async endMaintenance() {} },
+      baselines: { removeAll: async () => ({ names: [] }) },
+      devices: harness.lifecycle,
+      drivers: [],
+      leases: {
+        async beginMaintenance() {},
+        async releaseAllDuringMaintenance() {
+          return [];
+        },
+        async endMaintenance() {},
+      },
+      logger: new JsonLinesLogger({ clock: new FakeClock(1_000), sink }),
+      registry: harness.registry,
+
+      seedSettler: noSettler,
+      warmPool: { forget() {} },
+    });
+
+    await service.nuke(false);
+    expect(sink.records).toEqual([
+      expect.objectContaining({
+        level: "error",
+        module: "daemon.nuke",
+        fields: { deviceId: "dev_1", error: "Error: reset exploded", platform: "ios" },
+      }),
+    ]);
+  });
+});

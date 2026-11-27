@@ -1,0 +1,190 @@
+import { Hono } from "hono";
+import { describe, expect, it } from "vitest";
+
+import {
+  ComponentInstallTimeoutError,
+  InsufficientDiskSpaceError,
+  LicenseNotAcceptedError,
+  NoDriverError,
+  RuntimeMissingError,
+  UnknownLeaseError,
+  UnknownModelError,
+} from "../core/index.js";
+import {
+  LeaseIdTakenError,
+  NoCapacityError,
+  RequesterAlreadyLeasedError,
+} from "../leasing/index.js";
+import { classifyError, StartupFailedError } from "../daemon/error-code.js";
+import {
+  DispatchError,
+  DoctorUnavailableError,
+  NukeUnavailableError,
+} from "../daemon/dispatcher.js";
+import { ERROR_TABLE } from "../contract/index.js";
+import { ExecOutputDeliveryStalledError } from "../ports/index.js";
+import {
+  errorResponse,
+  HttpApiError,
+  mapError,
+  NO_CAPACITY_RETRY_AFTER_SECONDS,
+} from "./errors.js";
+
+describe("mapError", () => {
+  it("passes an HttpApiError's own status/code/extra through unchanged", () => {
+    const error = new HttpApiError(403, "FORBIDDEN", "nope", { requesterId: "req-1" });
+    expect(mapError(error)).toEqual({
+      code: "FORBIDDEN",
+      extra: { requesterId: "req-1" },
+      message: "nope",
+      status: 403,
+    });
+  });
+
+  it("maps RequesterAlreadyLeasedError to 409, naming the existing lease when there is one", () => {
+    const withLease = mapError(new RequesterAlreadyLeasedError("agent-1", "lse_1"));
+    expect(withLease.status).toBe(409);
+    expect(withLease.code).toBe("REQUESTER_ALREADY_LEASED");
+    expect(withLease.extra).toEqual({ existingLeaseId: "lse_1" });
+
+    const withoutLease = mapError(new RequesterAlreadyLeasedError("agent-1"));
+    expect(withoutLease.extra).toBeUndefined();
+  });
+
+  it("maps LeaseIdTakenError and a DispatchError of LEASE_ID_TAKEN to 409, the DispatchError naming the ID in extra", () => {
+    expect(mapError(new LeaseIdTakenError("ad-7f3a"))).toMatchObject({
+      code: "LEASE_ID_TAKEN",
+      status: 409,
+    });
+    expect(mapError(new DispatchError("LEASE_ID_TAKEN", "in use", { leaseId: "ad-7f3a" }))).toEqual(
+      {
+        code: "LEASE_ID_TAKEN",
+        extra: { leaseId: "ad-7f3a" },
+        message: "in use",
+        status: 409,
+      },
+    );
+  });
+
+  it("maps NoCapacityError to 503", () => {
+    expect(mapError(new NoCapacityError())).toMatchObject({ code: "NO_CAPACITY", status: 503 });
+  });
+
+  it("maps UnknownModelError, RuntimeMissingError, NoDriverError to 422", () => {
+    expect(mapError(new UnknownModelError("ios", "iPhone 3G"))).toMatchObject({
+      code: "UNKNOWN_MODEL",
+      status: 422,
+    });
+    expect(mapError(new RuntimeMissingError("ios", "9.0"))).toMatchObject({
+      code: "RUNTIME_MISSING",
+      status: 422,
+    });
+    expect(mapError(new NoDriverError("android"))).toMatchObject({
+      code: "NO_DRIVER",
+      status: 422,
+    });
+  });
+
+  it("maps UnknownLeaseError to 404", () => {
+    expect(mapError(new UnknownLeaseError("lse_missing"))).toMatchObject({
+      code: "UNKNOWN_LEASE",
+      status: 404,
+    });
+  });
+
+  // why: Review finding B5: these four previously fell through `mapError`'s own hand-written
+  // `instanceof` chain (which didn't have branches for them) to 500 INTERNAL, while the socket
+  // transport's `errorCode` (now `classifyError`, shared by both) reported the real code. Each
+  // assertion below is checked against `ERROR_TABLE` directly -- the single source both
+  // transports now read -- rather than a hardcoded status, so this test would fail if the table
+  // and `mapError` ever drifted again.
+  it("agrees with the socket transport's classifyError for every core error it recognizes, reading ERROR_TABLE for the HTTP status", () => {
+    const cases: readonly [unknown, string][] = [
+      [new InsufficientDiskSpaceError("ios", 8 * 1024 ** 3, 0), "INSUFFICIENT_DISK_SPACE"],
+      [
+        new LicenseNotAcceptedError("android", "system-images;android-35;google_apis"),
+        "LICENSE_NOT_ACCEPTED",
+      ],
+      [new ComponentInstallTimeoutError("android", "35", 1_200_000), "DOWNLOAD_TIMEOUT"],
+      [new StartupFailedError(), "DAEMON_STARTUP_FAILED"],
+      [new DoctorUnavailableError(), "DOCTOR_UNAVAILABLE"],
+      [new NukeUnavailableError(), "NUKE_UNAVAILABLE"],
+    ];
+    for (const [error, expectedCode] of cases) {
+      expect(classifyError(error)).toBe(expectedCode);
+      const mapped = mapError(error);
+      expect(mapped.code).toBe(expectedCode);
+      expect(mapped.status).toBe(ERROR_TABLE[expectedCode as keyof typeof ERROR_TABLE].httpStatus);
+      expect(mapped.status).not.toBe(500);
+    }
+  });
+
+  it("collapses an unrecognized error to 500 INTERNAL without leaking its message", () => {
+    const mapped = mapError(new Error("some internal implementation detail, e.g. a stack frame"));
+    expect(mapped).toEqual({ code: "INTERNAL", message: "Internal error", status: 500 });
+  });
+
+  // why: Round 4, F1: this used to be unrecognized -- not "explicitly INTERNAL", just absent from
+  // `classifyError` entirely, which is what let it fall through the *other* branch this
+  // finding fixes (Dispatcher#awaitExec's timeout throw being pre-empted by this very
+  // rejection). Asserted directly against `classifyError`, not just `mapError`'s ??
+  // "INTERNAL" default, because that default would hide the branch's absence.
+  it("classifies ExecOutputDeliveryStalledError explicitly, rather than leaving it to fall through unrecognized", () => {
+    expect(classifyError(new ExecOutputDeliveryStalledError())).toBe("INTERNAL");
+  });
+
+  it("collapses a non-Error thrown value the same way", () => {
+    expect(mapError("boom")).toEqual({ code: "INTERNAL", message: "Internal error", status: 500 });
+  });
+
+  it("forwards a DispatchError's details for a code the contract declares one for", () => {
+    const mapped = mapError(
+      new DispatchError("WORKER_CONNECTED", "already connected", {
+        workerId: "wrk_1",
+      }),
+    );
+    expect(mapped).toMatchObject({ code: "WORKER_CONNECTED", extra: { workerId: "wrk_1" } });
+  });
+
+  // why: Hardening: `DispatchError.details` is `unknown` -- nothing at the type level stops a
+  // handler from attaching an object to a code `ErrorDetailsMap` declares as
+  // `Record<string, never>` (no details at all). Before this fix, `mapError`'s only gate was
+  // "is `.details` object-shaped", which this would have passed straight through onto the
+  // wire; `CODES_WITH_DECLARED_DETAILS` is what `BAD_REQUEST` is deliberately absent from.
+  it("does not forward a DispatchError's details for a code the contract declares none for", () => {
+    const mapped = mapError(
+      new DispatchError("BAD_REQUEST", "malformed", { internal: "should never reach the wire" }),
+    );
+    expect(mapped).toEqual({ code: "BAD_REQUEST", message: "malformed", status: 400 });
+    expect(mapped).not.toHaveProperty("extra");
+  });
+});
+
+describe("errorResponse", () => {
+  function appWithError(error: unknown) {
+    const app = new Hono();
+    app.get("/boom", (c) => errorResponse(c, error));
+    return app;
+  }
+
+  it("writes the standard {error:{code,message}} body", async () => {
+    const response = await appWithError(new UnknownLeaseError("lse_1")).request("/boom");
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      error: { code: "UNKNOWN_LEASE", message: "Unknown lease: lse_1" },
+    });
+  });
+
+  it("sets Retry-After on a NO_CAPACITY response", async () => {
+    const response = await appWithError(new NoCapacityError()).request("/boom");
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe(String(NO_CAPACITY_RETRY_AFTER_SECONDS));
+  });
+
+  it("never includes a stack trace for an unrecognized error", async () => {
+    const response = await appWithError(new Error("leaked?")).request("/boom");
+    const body = (await response.json()) as { error: { message: string } };
+    expect(body.error.message).toBe("Internal error");
+    expect(JSON.stringify(body)).not.toContain("leaked?");
+  });
+});

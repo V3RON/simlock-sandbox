@@ -1,0 +1,230 @@
+import type {
+  CapacityDecision,
+  CapacityDevice,
+  CapacityPlatform,
+  CapacityRefusal,
+  CapacityStrategy,
+  PlannedCapacityDevice,
+  RamBudget,
+  RegisteredCapacityDevice,
+  RunningCapacity,
+} from "./strategy.js";
+
+/** why: the one thing capacity reads of a worker's memory pressure, so it never names host-load. */
+export interface MemoryPressureStepReader {
+  current(): { readonly step: "none" | "warming-paused" | "new-devices-paused" } | undefined;
+}
+
+const NEW_DEVICES_PAUSED: CapacityRefusal = { ok: false, reason: "memory-pressure" };
+
+export interface CapacityReservation {
+  release(): void;
+}
+
+export type CapacityReservationAttempt =
+  | { readonly ok: true; readonly reservation: CapacityReservation }
+  | CapacityRefusal;
+
+interface ReservationEntry {
+  readonly platform: CapacityPlatform;
+}
+
+type ProvisioningEntry = PlannedCapacityDevice;
+
+interface BootEntry {
+  readonly deviceId: string;
+}
+
+/**
+ * why: Stateful accounting around a pure capacity strategy.
+ *
+ * It deliberately has no knowledge of queueing, device selection, registry
+ * mutation, drivers, or of which strategy it is holding. Callers supply a fresh
+ * registry snapshot for every decision and retain reservations until their
+ * corresponding operation ends.
+ */
+export class CapacityCoordinator {
+  readonly #provisioningReservations: ProvisioningEntry[] = [];
+  readonly #runningReservations: ReservationEntry[] = [];
+  readonly #bootReservations: BootEntry[] = [];
+  readonly #bootActivityListeners = new Set<(underWay: number) => void>();
+
+  constructor(
+    private readonly strategy: CapacityStrategy,
+    private readonly onReservationsChanged: () => void = () => undefined,
+    private readonly memoryPressure?: MemoryPressureStepReader,
+  ) {}
+
+  /** why: ADR 0090 §2: the settler waits for a quiet worker; it hears every take and release of a creation, boot or rewarm reservation. */
+  // fallow-ignore-next-line unused-class-member -- the seed settler reads it through a Pick of this class.
+  onBootActivity(listener: (underWay: number) => void): () => void {
+    this.#bootActivityListeners.add(listener);
+    return () => void this.#bootActivityListeners.delete(listener);
+  }
+
+  /** why: checked before the strategy is asked, under every strategy (ADR 0068 §4). */
+  newDevicesPaused(): boolean {
+    return this.memoryPressure?.current()?.step === "new-devices-paused";
+  }
+
+  /**
+   * why: Reserves both a future device slot and its future running slot.
+   * Provisioning counts against the strategy's device budget and running limits
+   * until released, including before the device appears in a registry snapshot.
+   */
+  tryReserveProvisioning(
+    device: PlannedCapacityDevice,
+    devices: readonly CapacityDevice[],
+  ): CapacityReservationAttempt {
+    if (this.newDevicesPaused()) return NEW_DEVICES_PAUSED;
+    const provision = this.canProvision(device, devices);
+    if (!provision.ok) return provision;
+
+    const running = this.canReserveRunning(device.platform, devices);
+    if (!running.ok) return running;
+
+    const reservation: ProvisioningEntry = { mode: device.mode, platform: device.platform };
+    this.#provisioningReservations.push(reservation);
+    return {
+      ok: true,
+      reservation: this.#reservation(this.#provisioningReservations, reservation),
+    };
+  }
+
+  /**
+   * why: Reserves a running slot and the RAM to boot the shut-down `device`. The RAM
+   * is checked first. Until released, the device counts at its full size in every
+   * decision, because it boots full before any slim pass.
+   */
+  tryReserveBoot(
+    device: RegisteredCapacityDevice,
+    devices: readonly CapacityDevice[],
+  ): CapacityReservationAttempt {
+    if (this.newDevicesPaused()) return NEW_DEVICES_PAUSED;
+    const boot = this.canBoot(device, devices);
+    if (!boot.ok) return boot;
+    const running = this.canReserveRunning(device.platform, devices);
+    if (!running.ok) return running;
+
+    const runningEntry = { platform: device.platform };
+    this.#runningReservations.push(runningEntry);
+    const bootEntry = { deviceId: device.id };
+    this.#bootReservations.push(bootEntry);
+    const releaseRunning = this.#reservation(this.#runningReservations, runningEntry);
+    const releaseBoot = this.#reservation(this.#bootReservations, bootEntry);
+    return {
+      ok: true,
+      reservation: {
+        release: () => {
+          releaseRunning.release();
+          releaseBoot.release();
+        },
+      },
+    };
+  }
+
+  tryReserveRewarm(
+    device: RegisteredCapacityDevice,
+    devices: readonly CapacityDevice[],
+  ): CapacityReservationAttempt {
+    if (this.newDevicesPaused()) return NEW_DEVICES_PAUSED;
+    const boot = this.canBoot(device, devices);
+    if (!boot.ok) return boot;
+
+    const bootEntry = { deviceId: device.id };
+    this.#bootReservations.push(bootEntry);
+    return { ok: true, reservation: this.#reservation(this.#bootReservations, bootEntry) };
+  }
+
+  /**
+   * why: Whether `device` may be created, read-only. The one question `tryReserveProvisioning` asks
+   * before it reserves, and the one `atRamBudget` reads, so what status reports and what the
+   * planner does cannot disagree.
+   */
+  canProvision(
+    device: PlannedCapacityDevice,
+    devices: readonly CapacityDevice[],
+  ): CapacityDecision {
+    return this.strategy.canProvision(device, this.#withReservations(devices));
+  }
+
+  atRamBudget(platform: CapacityPlatform, devices: readonly CapacityDevice[]): boolean {
+    const decision = this.canProvision({ mode: "full", platform }, devices);
+    return !decision.ok && decision.reason === "ram-budget";
+  }
+
+  canBoot(device: CapacityDevice, devices: readonly CapacityDevice[]): CapacityDecision {
+    return this.strategy.canBoot(device, this.#withReservations(devices));
+  }
+
+  canReserveRunning(
+    platform: CapacityPlatform,
+    devices: readonly CapacityDevice[],
+  ): CapacityDecision {
+    return this.strategy.canReserveRunning(platform, devices, this.#allRunningReservations());
+  }
+
+  runningCapacity(devices: readonly CapacityDevice[]): RunningCapacity {
+    return this.strategy.runningCapacity(devices, this.#allRunningReservations());
+  }
+
+  deviceLimit(platform: CapacityPlatform): number {
+    return this.strategy.deviceLimit(platform);
+  }
+
+  /**
+   * why: The RAM budget over `devices` alone: in-flight provisioning and boot
+   * reservations are left out, so the use reported equals what the listed devices
+   * add up to.
+   */
+  ramBudget(devices: readonly CapacityDevice[]): RamBudget | undefined {
+    return this.strategy.ramBudget(devices);
+  }
+
+  #withReservations(devices: readonly CapacityDevice[]): CapacityDevice[] {
+    const booting = new Set(this.#bootReservations.map(({ deviceId }) => deviceId));
+    return [
+      ...devices.map((device) =>
+        device.id !== undefined && booting.has(device.id)
+          ? {
+              ...device,
+              mode: "full" as const,
+              state: device.state === "shutdown" ? "booting" : device.state,
+            }
+          : device,
+      ),
+      ...this.#provisioningReservations.map(asProvisioningDevice),
+    ];
+  }
+
+  #allRunningReservations(): CapacityPlatform[] {
+    return [...this.#provisioningReservations, ...this.#runningReservations].map(
+      ({ platform }) => platform,
+    );
+  }
+
+  #reservation<Entry>(reservations: Entry[], reservation: Entry): CapacityReservation {
+    let released = false;
+    this.#changed();
+    return {
+      release: () => {
+        if (released) return;
+        released = true;
+        const index = reservations.indexOf(reservation);
+        if (index !== -1) reservations.splice(index, 1);
+        this.#changed();
+      },
+    };
+  }
+
+  /** why: a creation, boot or rewarm reservation is a device being made or booted; a running-slot entry alone is not one. */
+  #changed(): void {
+    this.onReservationsChanged();
+    const underWay = this.#provisioningReservations.length + this.#bootReservations.length;
+    for (const listener of this.#bootActivityListeners) listener(underWay);
+  }
+}
+
+function asProvisioningDevice(reservation: ProvisioningEntry): CapacityDevice {
+  return { mode: reservation.mode, platform: reservation.platform, state: "provisioning" };
+}

@@ -1,0 +1,46 @@
+{
+  "name": "simlock-website",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --dir .. openapi website/public/openapi.json && astro dev",
+    "build": "pnpm --dir .. openapi website/public/openapi.json && astro build",
+    "preview": "astro preview",
+    "check": "pnpm --dir .. openapi website/public/openapi.json && astro check",
+    "og": "node scripts/og.mjs"
+  },
+  "dependencies": {
+    "@astrojs/markdown-satteri": "^0.3.8",
+    "@astrojs/mdx": "^8.1.6",
+    "@astrojs/sitemap": "^3.7.4",
+    "@astrojs/starlight": "^0.42.2",
+    "astro": "^7.3.3",
+    "hast-util-select": "^6.0.4",
+    "rehype-parse": "^9.0.1",
+    "rehype-remark": "^10.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-stringify": "^11.0.0",
+    "sharp": "^0.35.4",
+    "starlight-llm-actions": "0.13.0",
+    "starlight-openapi": "0.27.0",
+    "unified": "^11.0.5",
+    "unist-util-remove": "^4.0.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.10",
+    "playwright-core": "^1.62.1",
+    "typescript": "~5.9.2"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.8.1",
+      "onFail": "download"
+    }
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

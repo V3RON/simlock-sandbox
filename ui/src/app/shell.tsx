@@ -1,0 +1,157 @@
+import { useEffect } from "react";
+
+import { AppFrame, Button, CommandPalette, Icon, Sidebar, Status, StatusDot } from "../ds";
+import { isBehind, versionLine } from "../model/versions";
+import { NotFoundScreen } from "../screens/not-found";
+import { useDaemonFacts, useDaemonMode } from "../state/live";
+import { usePath } from "../state/router";
+import { useSearchPalette, useSearchSession } from "../state/search";
+import {
+  useInboxCount,
+  useConnectionStatus,
+  useSignedIn,
+  useSignOut,
+  useTokenCheck,
+} from "../state/shell";
+import { useSidebar } from "../state/sidebar";
+import { ROUTES, routeFor } from "./routes";
+
+const PAGES = ROUTES.map((route) => ({ label: route.label, path: route.path }));
+
+export function Shell() {
+  const path = usePath();
+  const route = routeFor(path);
+  const inbox = useInboxCount();
+  const sidebar = useSidebar();
+  const palette = useSearchPalette();
+  useTokenCheck();
+
+  useEffect(() => {
+    document.title = route === undefined ? "Simlock" : `${route.label} · Simlock`;
+  }, [route]);
+
+  const entries = ROUTES.map((entry) => ({
+    current: entry === route,
+    ...(entry.group === undefined ? {} : { group: entry.group }),
+    icon: entry.icon,
+    label: entry.label,
+    to: entry.path,
+    ...(entry.path === "/inbox" && inbox !== undefined ? { alert: true, count: inbox } : {}),
+  }));
+
+  return (
+    <AppFrame
+      sidebar={
+        <Sidebar
+          entries={entries}
+          collapsed={sidebar.collapsed}
+          onToggle={sidebar.toggle}
+          onSearch={palette.show}
+          footer={(collapsed) => <SidebarFoot collapsed={collapsed} />}
+        />
+      }
+    >
+      {route === undefined ? <NotFoundScreen /> : <route.Screen />}
+      {palette.open ? <SearchDialog hide={palette.hide} /> : null}
+    </AppFrame>
+  );
+}
+
+// why: the gateway's own version is the operator's to act on, so a worker's console and a
+// collapsed sidebar stay quiet; the "newer" rule is the contract's, through `versionLine`.
+export function UpdateNotice({ collapsed }: { readonly collapsed: boolean }) {
+  const mode = useDaemonMode();
+  const facts = { ...useDaemonFacts(), leased: 0, update: null };
+  if (collapsed || mode !== "gateway" || !isBehind(facts)) return null;
+  return <p className="update-notice">{versionLine(facts)}</p>;
+}
+
+function SidebarFoot({ collapsed }: { readonly collapsed: boolean }) {
+  const signedIn = useSignedIn();
+  const signOut = useSignOut();
+  return (
+    <>
+      <UpdateNotice collapsed={collapsed} />
+      <div className="sidebar-account">
+        <span className="account-avatar-wrap">
+          <span className="account-avatar" aria-hidden="true">
+            {signedIn.name?.slice(0, 1).toUpperCase() ?? "•"}
+          </span>
+          {collapsed ? <ConnectionDot /> : null}
+        </span>
+        <div className="account-detail">
+          {signedIn.name === undefined || collapsed ? null : (
+            <p className="signed-in-as" title={signedIn.name}>
+              <span className="visually-hidden">Signed in as </span>
+              {signedIn.name}
+            </p>
+          )}
+          <ConnectionStatus collapsed={collapsed} />
+        </div>
+        {signedIn.canSignOut ? (
+          <SignOutButton collapsed={collapsed} name={signedIn.name} onClick={signOut} />
+        ) : null}
+      </div>
+    </>
+  );
+}
+
+// why: a collapsed rail has no room for a word, so the state is a dot on the avatar's corner.
+function ConnectionDot() {
+  const status = useConnectionStatus();
+  return <StatusDot tone={status.tone} label={status.word} />;
+}
+
+// why: the connection's word is a live region so a screen reader hears it change; the data's age
+// beside it ticks every second, so it stays outside the region.
+function ConnectionStatus({ collapsed }: { readonly collapsed: boolean }) {
+  const status = useConnectionStatus();
+  return (
+    <div className="connection">
+      {collapsed ? (
+        <span role="status" className="visually-hidden">
+          {status.word}
+        </span>
+      ) : (
+        <Status tone={status.tone}>
+          <span role="status">{status.word}</span>
+          {status.age === undefined ? null : <span> — data from {status.age} ago</span>}
+        </Status>
+      )}
+    </div>
+  );
+}
+
+function SignOutButton(props: {
+  readonly collapsed: boolean;
+  readonly name: string | undefined;
+  readonly onClick: () => void;
+}) {
+  const { collapsed, name, onClick } = props;
+  return (
+    <Button
+      variant="secondary"
+      className="sign-out"
+      onClick={onClick}
+      aria-label="Sign out"
+      title={collapsed && name !== undefined ? `Sign out (${name})` : "Sign out"}
+    >
+      <Icon name="signOut" />
+      <span className="nav-label">Sign out</span>
+    </Button>
+  );
+}
+
+function SearchDialog({ hide }: { readonly hide: () => void }) {
+  const session = useSearchSession(PAGES, hide);
+  return (
+    <CommandPalette
+      groups={session.groups}
+      typed={session.typed}
+      empty={session.empty}
+      onType={session.type}
+      onChoose={session.choose}
+      onClose={hide}
+    />
+  );
+}

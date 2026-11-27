@@ -1,0 +1,152 @@
+---
+title: Run e2e tests from CI
+description: Run an e2e test suite from a Linux CI runner on a Simlock farm with the @simlock/e2e device provider, an agent token, one device per test worker, and a cleanup step.
+sidebar:
+  order: 12
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+**Result:** a CI job runs your mobile test suite on devices from a Simlock farm, with no Mac or emulator on the runner, and gives every device back when it ends.
+
+This page uses the [`e2e` runner](https://www.npmjs.com/package/@e2e-dev/mobile) (`@e2e-dev/mobile`) with the `@simlock/e2e` device provider. For Maestro, Detox, Appium or plain commands, see [Other runners](#other-runners).
+
+## Before you start
+
+- A farm whose HTTP API the CI runner can reach over HTTPS: a gateway or a standalone worker.
+- agent-device on, on the farm ([Drive an app's UI with agent-device](/simlock/docs/using-devices/agent-device)). The provider talks to `<url>/v1/agent-device`.
+- A project that already runs with `@e2e-dev/mobile` 0.12.9 or newer.
+
+## Set up the job
+
+<Steps>
+
+1. **Create an agent token** on the worker, or on the gateway for a fleet. The secret is shown once:
+
+   ```sh
+   simlock token create --role agent --label ci-runner-3
+   ```
+
+2. **Store the secret and the farm URL** as CI secrets, `SIMLOCK_TOKEN` and `SIMLOCK_URL`, and pass them to the job as environment variables. Never put the token in a file in the repository.
+
+3. **Raise the token's lease limit.** A token holds one lease at a time by default, and a run with `workers: 4` holds four. Ask the operator to set `lease.maxPerRequester` to at least the number of workers ([Use several devices at once](/simlock/docs/using-devices/several-devices)).
+
+4. **Install the provider:**
+
+   ```sh
+   npm install --save-dev @simlock/e2e agent-device@0.21.42 simlock
+   ```
+
+   `agent-device` 0.21.40 or newer is a peer dependency: the provider uses your copy of its client. `@simlock/e2e` has the version number of the Simlock release it was tested with; use the one that matches your farm. `simlock` is for the cleanup step.
+
+5. **Configure the runner:**
+
+   ```ts
+   // e2e.config.ts
+   import { mobile } from "@e2e-dev/mobile";
+   import { simlockDevices } from "@simlock/e2e";
+
+   export default {
+     targets: [
+       {
+         name: "ios",
+         engine: mobile({
+           platform: "ios",
+           device: simlockDevices({
+             url: process.env.SIMLOCK_URL!,
+             token: process.env.SIMLOCK_TOKEN!,
+             platform: "ios",
+             device: "iPhone 17 Pro",
+           }),
+         }),
+         app: { bundleId: "com.example.app", appPath: "build/Example.app" },
+       },
+     ],
+     workers: 4,
+   };
+   ```
+
+   Each test worker gets its own device. The provider uploads the build named by `appPath` and installs it, then each of `extraApps`. A target with no `appPath` gets only the `extraApps`.
+
+6. **Add a cleanup step** that frees the job's devices even when the job fails or is cancelled:
+
+   ```yaml
+   env:
+     SIMLOCK_RUN: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ strategy.job-index }}
+   steps:
+     # ...the steps that lease and test...
+     - name: Free the devices
+       if: always()
+       run: npx simlock release --run "$SIMLOCK_RUN"
+   ```
+
+</Steps>
+
+**Check:** the job's log shows the tests running on the farm, and the cleanup step prints `{"leaseIds":[…],"requestIds":[…]}` with what it freed.
+
+### How the cleanup step works
+
+- Every lease the provider takes carries the run id: its `runId` option, else `SIMLOCK_RUN`, else on GitHub Actions `<run id>-<run attempt>`. Elsewhere, with neither set, it sends the runner's own run id, which no cleanup step knows; set `SIMLOCK_RUN`.
+- `simlock release --run` releases the run's leases and cancels its requests still waiting. It touches only the token's own leases: an agent token cannot free another job's devices, and another run id is left alone.
+- A `SIMLOCK_RUN` outside the run id rule makes the provider throw at config load.
+
+## Options
+
+`simlockDevices(options)` checks every option when the config loads. A bad value, or an option it does not know, throws at once with the option's name.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `url` | required | The farm: an `http://` or `https://` URL of the gateway or worker, without `/v1`. A trailing slash is dropped. |
+| `token` | required | An agent token. |
+| `platform` | required | `"ios"` or `"android"`. It must match the target's platform. |
+| `device` | required | A model the farm lists, such as `iPhone 17 Pro`. See [Lease a specific model or OS](/simlock/docs/using-devices/lease-a-specific-device). |
+| `osVersion` | the farm's choice | An OS version or range. |
+| `imageTag` | the farm's choice | An Android system image tag, such as `google_apis_playstore`. |
+| `deviceMode` | the farm's default | `"slim"` or `"full"`, for iOS. |
+| `deviceBaseline` | none | A saved baseline to start from ([Lease a copy of a prepared device](/simlock/docs/using-devices/lease-a-prepared-device)). |
+| `extraApps` | `[]` | Paths of more apps (`.app`, `.apk`) to install on every device, after the app under test. |
+| `ttlMs` | `180000` | The lease time in milliseconds, at least `30000`. The provider renews each lease every third of it. |
+| `queueMs` | `1200000` | How long a test worker waits for a free device, in milliseconds. |
+| `installConcurrency` | `3` | How many app installs run at once from this machine. |
+| `runId` | `SIMLOCK_RUN`, else GitHub Actions' run id, else the runner's | The run id every lease carries. 1 to 128 letters, digits, `.`, `_` or `-`. |
+
+The provider sends `deviceMode` and `deviceBaseline` only when you set them.
+
+## What to expect
+
+- **Size the run to the farm.** The runner asks for one device per test worker, all at once. A farm with room for two iOS devices serves `workers: 4` two at a time. Set `workers` to the number of devices to hold, and make sure the farm and `lease.maxPerRequester` allow that many.
+- **A full farm makes it wait, not fail.** The provider asks again every 10 to 15 seconds, with a new lease id each time, and logs `simlock: no free ios device on the farm; waiting for one` once, for up to `queueMs`.
+- **A failed install swaps the device once.** The provider gives that device back and leases one other. An upload that was cut, or an answer saying a retry may work, sends the install again to the same device, up to three tries.
+- **The run ends, the devices go.** When the run ends, fails or is interrupted, the provider gives every device back at once. Closing a test session does not release a device.
+- **A killed job's devices expire.** A killed job cannot release or renew, so its leases run out within `ttlMs` (3 minutes by default), unless the cleanup step frees them sooner. Keep `ttlMs` short for that reason.
+
+## Run simlock commands from a job
+
+A job that is not an `e2e` run uses `simlock` commands with the same two secrets, from a runner with no daemon. Set `SIMLOCK_AGENT_ID` to one value for every step of the job, so `simlock adb` and `simlock simctl` find the lease the job took:
+
+```sh
+export SIMLOCK_AGENT_ID="$CI_JOB_ID"
+simlock lease --platform android --detach
+simlock adb shell getprop ro.build.version.release
+```
+
+The same cleanup step frees what it leased. More: [Use an existing farm](/simlock/docs/getting-started/existing-farm).
+
+## Other runners
+
+A Maestro, Detox or Appium job leases a device with the same token through the HTTP API or agent-device: lease a device, run the tests against it, renew the lease while they run, and release it at the end. A lease you do not renew ends after its TTL. See [Lease over the HTTP API](/simlock/docs/using-devices/http-api).
+
+<Aside type="caution" title="Proxies that cut long requests">
+An app upload is one request. If the runner reaches the farm through a proxy or tunnel that cuts long requests, such as Cloudflare at 100 seconds, a large app on a slow link fails to upload. Keep the app small, run the job close to the farm, or reach the farm without such a proxy. `installConcurrency` limits how many uploads share the link.
+</Aside>
+
+## When it fails
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `simlock: no free ios device on the farm within 20 min` | No device was free within `queueMs`. | Lower `workers`, raise `queueMs`, or add capacity. |
+| `simlock: could not set up a device after 2 tries: <message>` | The install failed on two devices. | Read the message; check `appPath` and that the build is for a simulator or emulator. |
+| `simlock: lease <id> was ended by the farm; failures on its device are infrastructure, not tests` | An operator released the lease while the run lived. | Run the job again. |
+| The config throws with an option's name | A bad or unknown option, or a bad `SIMLOCK_RUN`. | Fix the option. |
+| The run fails at once, without waiting | The farm refused the request, for example a bad token. | Read the reason; see [agent-device errors](/simlock/docs/using-devices/agent-device#when-it-fails). |
+| An upload fails after three tries | A proxy cuts long requests. | See the caution above. |

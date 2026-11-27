@@ -1,0 +1,437 @@
+/**
+ * why: The fleet, expressed in the same shapes one machine uses (ADR 0005 §20/§21): pure functions
+ * over worker views, with no clock, no I/O and no state of their own, so what a gateway
+ * reports is a function of what it currently knows and nothing else.
+ */
+import type { z } from "zod";
+
+import {
+  CATALOG_LIST_LIMITS,
+  deviceClassSchema,
+  INSTALL_LIST_LIMIT,
+  OPERATIONS,
+  type DeviceClass,
+  type Platform,
+} from "../contract/index.js";
+import type { FleetLeaseIndex } from "./lease-index.js";
+import type { WorkerView } from "./worker-registry.js";
+
+type StatusOutput = z.infer<(typeof OPERATIONS)["status.get"]["output"]>;
+type CatalogOutput = z.infer<(typeof OPERATIONS)["catalog.get"]["output"]>;
+type StatusCapacity = NonNullable<StatusOutput["capacity"]>;
+type PlatformCatalog = CatalogOutput["platforms"][number];
+type CatalogImage = NonNullable<PlatformCatalog["images"]>[number];
+
+const PLATFORMS: readonly Platform[] = ["ios", "android"];
+
+const EMPTY_PLATFORM_CAPACITY = {
+  atRamBudget: false,
+  limit: 0,
+  maxRunning: 0,
+  overLimit: false,
+  reserved: 0,
+  running: 0,
+  used: 0,
+  warm: 0,
+};
+
+const EMPTY_GLOBAL_CAPACITY = {
+  maxRunning: 0,
+  overLimit: false,
+  reserved: 0,
+  running: 0,
+  warm: 0,
+};
+
+export interface AggregateStatusOptions {
+  readonly health: StatusOutput["daemon"]["health"];
+  readonly version: string;
+  readonly latestVersion?: string | null;
+  // why: the gateway's own update and its last failure; none when nothing is running.
+  readonly progress?: Pick<StatusOutput["daemon"], "update" | "lastUpdateFailure">;
+  readonly host: StatusOutput["host"];
+  readonly load?: StatusOutput["load"];
+  readonly queueDepth: number;
+  readonly physicalQueueDepth?: number;
+  readonly waiting?: StatusOutput["waiting"];
+  readonly leaseIndex?: Pick<FleetLeaseIndex, "project">;
+}
+
+/**
+ * why: Capacity sums connected workers only: an unreachable machine's last-known free slots are not capacity.
+ * Devices and leases include every view: a lease on a machine that dropped off still holds a device.
+ */
+export function aggregateStatus(
+  views: readonly WorkerView[],
+  options: AggregateStatusOptions,
+): StatusOutput {
+  return {
+    capacity: sumCapacity(views.filter((view) => view.connection === "connected")),
+    daemon: {
+      health: options.health,
+      mode: "gateway",
+      version: options.version,
+      update: options.progress?.update ?? null,
+      lastUpdateFailure: options.progress?.lastUpdateFailure ?? null,
+      latestVersion: options.latestVersion ?? null,
+    },
+    host: options.host,
+    ...(options.load === undefined ? {} : { load: options.load }),
+    installs: fleetInstalls(views),
+    devices: views.flatMap((view) =>
+      (view.devices ?? []).map((device) => ({ ...device, workerId: view.id })),
+    ),
+    leases: views.flatMap((view) =>
+      (view.leases ?? []).map((lease) =>
+        options.leaseIndex === undefined
+          ? { ...lease, workerId: view.id }
+          : options.leaseIndex.project(lease, view.id, view.label),
+      ),
+    ),
+    queueDepth: options.queueDepth,
+    ...(options.physicalQueueDepth === undefined
+      ? {}
+      : { physicalQueueDepth: options.physicalQueueDepth }),
+    waiting: [...(options.waiting ?? [])],
+    warmPool: { enabled: false, reserveRunning: { android: 0, ios: 0 }, targets: [] },
+    workers: [...views],
+  };
+}
+
+function fleetInstalls(views: readonly WorkerView[]): NonNullable<StatusOutput["installs"]> {
+  return views
+    .flatMap((view) => (view.installs ?? []).map((install) => ({ ...install, workerId: view.id })))
+    .sort((a, b) => a.since - b.since)
+    .slice(0, INSTALL_LIST_LIMIT);
+}
+
+function sumCapacity(views: readonly WorkerView[]): StatusCapacity {
+  const capacity: StatusCapacity = {
+    android: { ...EMPTY_PLATFORM_CAPACITY },
+    global: { ...EMPTY_GLOBAL_CAPACITY },
+    ios: { ...EMPTY_PLATFORM_CAPACITY },
+  };
+  let counted = false;
+  for (const view of views) {
+    const reported = view.capacity;
+    if (reported === undefined) continue;
+    for (const platform of PLATFORMS) {
+      capacity[platform] = {
+        // why: True only when *every* reporting worker is at its budget: while one has room, the fleet
+        // does. The first reporter sets it, so an empty fleet stays false.
+        atRamBudget: counted
+          ? capacity[platform].atRamBudget && reported[platform].atRamBudget
+          : reported[platform].atRamBudget,
+        limit: capacity[platform].limit + reported[platform].limit,
+        maxRunning: capacity[platform].maxRunning + reported[platform].maxRunning,
+        // why: True if *any* worker is over its own limit: the fleet has a machine in trouble, and
+        // summing booleans any other way would hide it behind the ones that are fine.
+        overLimit: capacity[platform].overLimit || reported[platform].overLimit,
+        reserved: capacity[platform].reserved + reported[platform].reserved,
+        running: capacity[platform].running + reported[platform].running,
+        used: capacity[platform].used + reported[platform].used,
+        warm: capacity[platform].warm + reported[platform].warm,
+      };
+    }
+    capacity.global = {
+      maxRunning: capacity.global.maxRunning + reported.global.maxRunning,
+      overLimit: capacity.global.overLimit || reported.global.overLimit,
+      reserved: capacity.global.reserved + reported.global.reserved,
+      running: capacity.global.running + reported.global.running,
+      warm: capacity.global.warm + reported.global.warm,
+    };
+    counted = true;
+    const ramBudget = sumRamBudget(capacity.ramBudget, reported.ramBudget);
+    if (ramBudget !== undefined) capacity.ramBudget = ramBudget;
+  }
+  return capacity;
+}
+
+type RamBudget = NonNullable<StatusCapacity["ramBudget"]>;
+
+function sumRamBudget(
+  sum: RamBudget | undefined,
+  reported: RamBudget | undefined,
+): RamBudget | undefined {
+  if (reported === undefined) return sum;
+  if (sum === undefined) return { ...reported };
+  return {
+    limitBytes: sum.limitBytes + reported.limitBytes,
+    overLimit: sum.overLimit || reported.overLimit,
+    usedBytes: sum.usedBytes + reported.usedBytes,
+  };
+}
+
+/**
+ * why: ADR 0005 §21: the union of the connected workers' catalogs, each model and runtime annotated
+ * with the workers that have it.
+ *
+ * Connected workers only: a catalog answers "what can this fleet give me", and a machine whose
+ * uplink is closed can give nothing. `incompatible` workers are excluded for the same reason
+ * (the gateway never even read their catalog). A drained worker *is* included -- draining stops
+ * new dispatches, but it is a temporary operator state, and a catalog that shrank while a
+ * machine was drained would read as models having been uninstalled.
+ *
+ * `defaultRuntime` survives only when every worker offering that platform names the same one;
+ * so does `defaultImageTag`, where a worker that names none is a disagreement.
+ * A fleet whose machines default differently has no single default, and picking one at random
+ * would make `simlock lease` non-deterministic across an unchanged fleet.
+ *
+ * `modelRuntimes` pairs a model with a runtime only when one worker pairs them itself (ADR 0008
+ * §4). It is never built from the fleet's `models` and `runtimes`: one worker having a model and
+ * another having a runtime does not make the pair leasable anywhere.
+ *
+ * `modelClasses` is the union over workers; when two class one model differently, the first
+ * worker in id order wins. `customModels` lists a model when any worker that lists it marks it custom, and is absent when
+ * none does. `modelAliases` is the union per model, deduplicated ignoring case. `images` is the union by
+ * runtime, tag, and ABI, and is absent when no worker reports the field at all. Each worker's
+ * lists fit the contract's bounds but their union may not, so both are cut to those bounds after
+ * sorting: an answer its own clients refuse would lose the whole catalog, not a tail of it.
+ */
+export function aggregateCatalog(views: readonly WorkerView[], platform?: Platform): CatalogOutput {
+  const byPlatform = indexCatalogs(views, platform);
+  const platforms: PlatformCatalog[] = [];
+  // why: Iterated over `PLATFORMS` rather than the map's own keys so the answer is ordered the same
+  // way a worker's own `catalog.get` orders it, whichever worker happened to connect first.
+  for (const candidate of PLATFORMS) {
+    const bucket = byPlatform.get(candidate);
+    if (bucket !== undefined) platforms.push(renderPlatform(candidate, bucket));
+  }
+  return { platforms };
+}
+
+/** why: One platform's models and runtimes, each mapped to the workers that reported it, plus every
+ * `defaultRuntime` seen for it -- which is what makes disagreement visible to `renderPlatform`
+ * rather than resolved silently at insertion. */
+interface CatalogBucket {
+  readonly models: Map<string, string[]>;
+  readonly runtimes: Map<string, string[]>;
+  readonly modelRuntimes: Map<string, Set<string>>;
+  readonly modelAliases: Map<string, Map<string, string>>;
+  readonly modelClasses: Map<string, DeviceClass>;
+  images: Map<string, CatalogImage> | undefined;
+  readonly customModels: Set<string>;
+  readonly slimCategories: Set<string>;
+  /** why: ADR 0082 §4: the modes the workers that list `modes` serve; `anyServesBoth` is set by the first worker with no field, and then the merged entry has none. */
+  readonly modes: Set<"slim" | "full">;
+  anyServesBoth: boolean;
+  /** why: ADR 0084 §3: stays true only while every worker reporting the platform says `virtualDevices: false`. */
+  phonesOnly: boolean;
+  readonly defaults: Set<string | undefined>;
+  /** why: absent ones count as `undefined`, so one worker without a default image tag is a disagreement (ADR 0078 §3). */
+  readonly imageTagDefaults: Set<string | undefined>;
+  /** why: Each worker's own `classDefaults`, so a class a worker has none for is seen as disagreement. */
+  readonly classDefaults: Partial<Record<DeviceClass, string>>[];
+}
+
+function indexCatalogs(
+  views: readonly WorkerView[],
+  platform: Platform | undefined,
+): Map<Platform, CatalogBucket> {
+  const byPlatform = new Map<Platform, CatalogBucket>();
+  // why: In id order, so a model two workers class differently keeps the first worker's class.
+  const inIdOrder = [...views].sort((left, right) => left.id.localeCompare(right.id));
+  for (const view of inIdOrder) {
+    if (view.connection !== "connected") continue;
+    for (const entry of view.catalog ?? []) {
+      if (platform === undefined || entry.platform === platform) {
+        addCatalogEntry(byPlatform, entry, view.id);
+      }
+    }
+  }
+  return byPlatform;
+}
+
+function addCatalogEntry(
+  byPlatform: Map<Platform, CatalogBucket>,
+  entry: PlatformCatalog,
+  workerId: string,
+): void {
+  const bucket = byPlatform.get(entry.platform) ?? emptyBucket();
+  byPlatform.set(entry.platform, bucket);
+  addNames(bucket, entry, workerId);
+  addModelClasses(bucket.modelClasses, entry);
+  addCustomModels(bucket.customModels, entry);
+  bucket.phonesOnly &&= entry.virtualDevices === false;
+  for (const category of entry.slimCategories ?? []) bucket.slimCategories.add(category);
+  if (entry.modes === undefined) bucket.anyServesBoth = true;
+  for (const mode of entry.modes ?? []) bucket.modes.add(mode);
+  if (entry.images !== undefined) bucket.images = addImages(bucket.images, entry, entry.images);
+  bucket.defaults.add(entry.defaultRuntime);
+  bucket.imageTagDefaults.add(entry.defaultImageTag);
+  bucket.classDefaults.push(listedClassDefaults(entry));
+}
+
+function addNames(bucket: CatalogBucket, entry: PlatformCatalog, workerId: string): void {
+  for (const model of entry.models) annotate(bucket.models, model, workerId);
+  for (const runtime of entry.runtimes) annotate(bucket.runtimes, runtime, workerId);
+  for (const model of entry.models) addPairings(bucket.modelRuntimes, entry, model);
+  for (const model of entry.models) addAliases(bucket.modelAliases, entry, model);
+}
+
+function emptyBucket(): CatalogBucket {
+  return {
+    classDefaults: [],
+    customModels: new Set<string>(),
+    defaults: new Set<string | undefined>(),
+    imageTagDefaults: new Set<string | undefined>(),
+    images: undefined,
+    modelAliases: new Map<string, Map<string, string>>(),
+    modelClasses: new Map<string, DeviceClass>(),
+    modelRuntimes: new Map<string, Set<string>>(),
+    models: new Map<string, string[]>(),
+    runtimes: new Map<string, string[]>(),
+    anyServesBoth: false,
+    modes: new Set<"slim" | "full">(),
+    phonesOnly: true,
+    slimCategories: new Set<string>(),
+  };
+}
+
+/**
+ * why: A worker's class defaults with any naming a model the worker does not list itself dropped, so
+ * the fleet never shows a default nobody can lease; a dropped class counts as the worker having none.
+ */
+function listedClassDefaults(entry: PlatformCatalog): Partial<Record<DeviceClass, string>> {
+  const listed: Partial<Record<DeviceClass, string>> = {};
+  for (const deviceClass of deviceClassSchema.options) {
+    const model = entry.classDefaults[deviceClass];
+    if (model !== undefined && entry.models.includes(model)) listed[deviceClass] = model;
+  }
+  return listed;
+}
+
+function addAliases(
+  index: Map<string, Map<string, string>>,
+  entry: PlatformCatalog,
+  model: string,
+): void {
+  const own = Object.hasOwn(entry.modelAliases, model) ? entry.modelAliases[model] : undefined;
+  const aliases = index.get(model) ?? new Map<string, string>();
+  for (const alias of own ?? []) {
+    const key = alias.toLocaleLowerCase();
+    if (key !== model.toLocaleLowerCase() && !aliases.has(key)) aliases.set(key, alias);
+  }
+  if (aliases.size > 0) index.set(model, aliases);
+}
+
+/**
+ * why: Folds one worker's model classes into the fleet's. A model already classed by an earlier
+ * worker keeps that class, so the caller feeds workers in id order; a class for a name the
+ * worker does not list itself is dropped.
+ */
+function addModelClasses(index: Map<string, DeviceClass>, entry: PlatformCatalog): void {
+  for (const [model, deviceClass] of Object.entries(entry.modelClasses)) {
+    if (entry.models.includes(model) && !index.has(model)) index.set(model, deviceClass);
+  }
+}
+
+function addCustomModels(index: Set<string>, entry: PlatformCatalog): void {
+  for (const model of entry.customModels ?? []) {
+    if (entry.models.includes(model)) index.add(model);
+  }
+}
+
+function addImages(
+  index: Map<string, CatalogImage> | undefined,
+  entry: PlatformCatalog,
+  images: readonly CatalogImage[],
+): Map<string, CatalogImage> {
+  const merged = index ?? new Map<string, CatalogImage>();
+  for (const image of images) {
+    if (!entry.runtimes.includes(image.runtime)) continue;
+    const { abi, runtime, tag } = image;
+    merged.set(JSON.stringify([runtime, tag, abi]), { abi, runtime, tag });
+  }
+  return merged;
+}
+
+function addPairings(index: Map<string, Set<string>>, entry: PlatformCatalog, model: string): void {
+  const paired = index.get(model) ?? new Set<string>();
+  // why: Own keys only: a model a worker names `constructor` must not read Object.prototype's.
+  const own = Object.hasOwn(entry.modelRuntimes, model) ? entry.modelRuntimes[model] : undefined;
+  // why: A pairing is the worker's claim; one with a runtime it does not list itself is dropped.
+  for (const runtime of own ?? []) if (entry.runtimes.includes(runtime)) paired.add(runtime);
+  index.set(model, paired);
+}
+
+function agreedClassDefaults(
+  workers: readonly Partial<Record<DeviceClass, string>>[],
+): Partial<Record<DeviceClass, string>> {
+  const agreed: Partial<Record<DeviceClass, string>> = {};
+  for (const deviceClass of deviceClassSchema.options) {
+    const reported = new Set(workers.map((worker) => worker[deviceClass]));
+    const [only] = reported;
+    if (reported.size === 1 && only !== undefined) agreed[deviceClass] = only;
+  }
+  return agreed;
+}
+
+function renderPlatform(platform: Platform, bucket: CatalogBucket): PlatformCatalog {
+  const agreedDefault = bucket.defaults.size === 1 ? [...bucket.defaults][0] : undefined;
+  const agreedImageTag =
+    bucket.imageTagDefaults.size === 1 ? [...bucket.imageTagDefaults][0] : undefined;
+  const runtimes = [...bucket.runtimes.keys()].sort();
+  return {
+    classDefaults: agreedClassDefaults(bucket.classDefaults),
+    ...(bucket.customModels.size === 0
+      ? {}
+      : {
+          customModels: [...bucket.customModels].sort().slice(0, CATALOG_LIST_LIMITS.customModels),
+        }),
+    ...(bucket.images === undefined
+      ? {}
+      : {
+          images: [...bucket.images]
+            .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+            .slice(0, CATALOG_LIST_LIMITS.images)
+            .map(([, image]) => image),
+        }),
+    modelAliases: Object.fromEntries(
+      [...bucket.modelAliases]
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .slice(0, CATALOG_LIST_LIMITS.aliasedModels)
+        .map(([model, aliases]) => [
+          model,
+          [...aliases.values()].sort().slice(0, CATALOG_LIST_LIMITS.aliasesPerModel),
+        ]),
+    ),
+    modelClasses: Object.fromEntries(
+      [...bucket.modelClasses]
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .slice(0, CATALOG_LIST_LIMITS.aliasedModels),
+    ),
+    modelRuntimes: Object.fromEntries(
+      [...bucket.modelRuntimes].map(([model, paired]) => [model, [...paired].sort()]),
+    ),
+    models: [...bucket.models.keys()].sort(),
+    modelWorkers: Object.fromEntries(bucket.models),
+    platform,
+    runtimes,
+    runtimeWorkers: Object.fromEntries(bucket.runtimes),
+    ...slimFields(bucket),
+    ...(bucket.phonesOnly ? { virtualDevices: false as const } : {}),
+    ...(agreedDefault === undefined ? {} : { defaultRuntime: agreedDefault }),
+    ...(agreedImageTag === undefined ? {} : { defaultImageTag: agreedImageTag }),
+  };
+}
+
+/** why: the iOS-only fields of the merged entry: the slim categories any worker names, and the modes, left out once any worker serves both. */
+function slimFields(bucket: CatalogBucket) {
+  return {
+    ...(bucket.slimCategories.size === 0
+      ? {}
+      : {
+          slimCategories: [...bucket.slimCategories]
+            .sort()
+            .slice(0, CATALOG_LIST_LIMITS.slimCategories),
+        }),
+    ...(bucket.anyServesBoth ? {} : { modes: [...bucket.modes].sort() }),
+  };
+}
+
+function annotate(index: Map<string, string[]>, key: string, workerId: string): void {
+  const workers = index.get(key) ?? [];
+  if (!workers.includes(workerId)) workers.push(workerId);
+  index.set(key, workers);
+}

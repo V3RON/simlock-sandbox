@@ -1,0 +1,143 @@
+import type { MissingPrerequisite, PrerequisiteCheck } from "../../core/index.js";
+import type { Filesystem, ProcessRunner } from "../../ports/index.js";
+import { adbPath, emulatorHelpLists, emulatorPath, locateSdk, sdkToolBin } from "./sdk-paths.js";
+
+const SDKMANAGER_TIMEOUT_MS = 30_000;
+const EMULATOR_HELP_TIMEOUT_MS = 30_000;
+/** why: every flag `AndroidDriver` puts on each emulator launch; an emulator that does not list one exits at start (#1199). */
+const REQUIRED_EMULATOR_FLAGS = [
+  "-avd",
+  "-port",
+  "-no-snapshot-save",
+  "-grpc",
+  "-grpc-use-token",
+] as const;
+const COMMAND_LINE_TOOLS_PAGE = "https://developer.android.com/studio#command-line-tools-only";
+
+interface AndroidPrerequisitesOptions {
+  readonly env: Readonly<Record<string, string | undefined>>;
+  readonly filesystem: Filesystem;
+  readonly homeDirectory: string;
+  /** why: the SDK's file names depend on the host (`adb.exe` on Windows); injected so either can be tested anywhere. */
+  readonly platform?: NodeJS.Platform;
+  readonly processRunner: ProcessRunner;
+}
+
+export function androidPrerequisites(options: AndroidPrerequisitesOptions): PrerequisiteCheck {
+  return {
+    check: () => missingAndroidPrerequisites(options),
+    platform: "android",
+  };
+}
+
+async function missingAndroidPrerequisites(
+  options: AndroidPrerequisitesOptions,
+): Promise<readonly MissingPrerequisite[]> {
+  const platform = options.platform ?? process.platform;
+  const location = await locateSdk(
+    options.env,
+    options.homeDirectory,
+    options.filesystem,
+    platform,
+  );
+  if (location.kind === "absent") {
+    // why: One finding, not one per tool: with no SDK at all, every tool is missing for the same reason.
+    return [
+      {
+        message: `No Android SDK found; searched: ${location.searched.join(", ")}.`,
+        prerequisite: "android-sdk",
+        remedy:
+          "Install Android Studio (https://developer.android.com/studio), or the command-line " +
+          `tools (${COMMAND_LINE_TOOLS_PAGE}), and set ANDROID_HOME to the SDK directory.`,
+      },
+    ];
+  }
+
+  const root = location.kind === "complete" ? location.paths.root : location.root;
+  const missing: MissingPrerequisite[] = [];
+  const tools = await sdkToolBin(root, options.filesystem, platform);
+  if (tools === undefined) {
+    missing.push({
+      message: `The Android SDK command-line tools (sdkmanager, avdmanager) are not in ${root}.`,
+      prerequisite: "android-cmdline-tools",
+      remedy:
+        `Download the command-line tools from ${COMMAND_LINE_TOOLS_PAGE} and unpack them to ` +
+        `${root}/cmdline-tools/latest; sdkmanager cannot install itself.`,
+    });
+  }
+  const emulator = emulatorPath(root, platform);
+  if (!(await options.filesystem.exists(emulator))) {
+    missing.push({
+      message: `The Android emulator package is not installed in ${root}.`,
+      prerequisite: "android-emulator",
+      remedy: "Run `sdkmanager --install emulator`.",
+    });
+  }
+  if (!(await options.filesystem.exists(adbPath(root, platform)))) {
+    missing.push({
+      message: `The Android platform-tools package (adb) is not installed in ${root}.`,
+      prerequisite: "android-platform-tools",
+      remedy: "Run `sdkmanager --install platform-tools`.",
+    });
+  }
+  if (tools !== undefined) {
+    const jdk = await missingJdk(options.processRunner, tools.sdkmanager);
+    if (jdk !== undefined) missing.push(jdk);
+  }
+  missing.push(...(await outdatedEmulatorIfInstalled(options.processRunner, emulator, missing)));
+  return missing;
+}
+
+async function outdatedEmulatorIfInstalled(
+  processRunner: ProcessRunner,
+  emulator: string,
+  missing: readonly MissingPrerequisite[],
+): Promise<MissingPrerequisite[]> {
+  if (missing.some((found) => found.prerequisite === "android-emulator")) return [];
+  const outdated = await outdatedEmulator(processRunner, emulator);
+  return outdated === undefined ? [] : [outdated];
+}
+
+async function outdatedEmulator(
+  processRunner: ProcessRunner,
+  emulator: string,
+): Promise<MissingPrerequisite | undefined> {
+  const result = await processRunner.run(emulator, ["-help"], {
+    timeoutMs: EMULATOR_HELP_TIMEOUT_MS,
+  });
+  // why: some emulators print their usage to stderr.
+  const usage = `${result.stdout}\n${result.stderr}`;
+  const unsupported = REQUIRED_EMULATOR_FLAGS.filter((flag) => !emulatorHelpLists(usage, flag));
+  if (unsupported.length === 0) return undefined;
+  return {
+    message: `The installed Android emulator does not accept ${unsupported.join(", ")}, which Simlock passes on every launch.`,
+    prerequisite: "android-emulator",
+    remedy: "Run `sdkmanager --install emulator`.",
+  };
+}
+
+/**
+ * why: `sdkmanager` is a Java program, so a failing `--version` is how a missing or unusable JDK
+ * shows. A run the timeout ended (`null` exit code) says nothing about the JDK and rejects.
+ */
+async function missingJdk(
+  processRunner: ProcessRunner,
+  sdkmanager: string,
+): Promise<MissingPrerequisite | undefined> {
+  const result = await processRunner.run(sdkmanager, ["--version"], {
+    timeoutMs: SDKMANAGER_TIMEOUT_MS,
+  });
+  if (result.code === null) {
+    throw new Error(`${sdkmanager} --version did not finish within ${SDKMANAGER_TIMEOUT_MS}ms`);
+  }
+  if (result.code === 0) return undefined;
+  const firstLine = result.stderr
+    .split("\n")
+    .find((line) => line.trim() !== "")
+    ?.trim();
+  return {
+    message: `sdkmanager cannot run${firstLine === undefined ? "" : `: ${firstLine}`}`,
+    prerequisite: "android-jdk",
+    remedy: "Install a JDK and set JAVA_HOME to it.",
+  };
+}

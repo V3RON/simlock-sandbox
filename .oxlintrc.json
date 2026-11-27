@@ -1,0 +1,80 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "categories": {
+    "correctness": "error"
+  },
+  "overrides": [
+    {
+      "files": ["src/gateway/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["**/core/index.js"],
+                "allowImportNames": [
+                  "DeviceClass",
+                  "DeviceRequest",
+                  "DeviceRequirement",
+                  "DeviceSpec",
+                  "FittableSpec",
+                  "LeaseProgress",
+                  "LeaseRecord",
+                  "LeaseRequestFailure",
+                  "LeaseRequestLimits",
+                  "MaxPerRequester",
+                  "SerializedDecision",
+                  "UsageReader",
+                  "baselineMismatch",
+                  "createUsageReader",
+                  "findCatalogModel",
+                  "fits",
+                  "fitsPhysical",
+                  "modelClass",
+                  "newLeaseRequestId",
+                  "noPhysicalMatch",
+                  "pairedRuntimes",
+                  "redactConfig"
+                ],
+                "message": "the gateway may import only the names its allow-list gives"
+              },
+              {
+                "group": ["**/leasing/index.js"],
+                "allowImportNames": [
+                  "HeldLease",
+                  "IdempotencyConflictError",
+                  "InMemoryLeaseRequestStore",
+                  "LeaseRequestBook",
+                  "LeaseRequestForbiddenError",
+                  "LeaseRequestOptions",
+                  "lineOf",
+                  "QueuePlace",
+                  "QueueTimeoutError",
+                  "ReplayedLeaseRequestError",
+                  "RequestCancelledError",
+                  "RequesterAlreadyLeasedError",
+                  "requesterLimitDecision",
+                  "WaitQueue",
+                  "WaiterState",
+                  "WaitingRequest"
+                ],
+                "message": "the gateway may import only the names its allow-list gives from leasing: the request book, the in-memory store, the wait queue, their errors and their types"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["**/*.test.ts", "**/test-*.ts"],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    }
+  ],
+  "env": {
+    "builtin": true
+  }
+}

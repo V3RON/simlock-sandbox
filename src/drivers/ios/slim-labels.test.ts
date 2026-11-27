@@ -1,0 +1,121 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  labelsFor,
+  NEVER_DISABLE_LABELS,
+  resolveSlimCategories,
+  SLIM_CATEGORIES,
+  slimSignature,
+} from "./slim-labels.js";
+
+// why: pure logic with many cases (category resolution, label dedupe and the shipped data), no port involved.
+describe("SLIM_CATEGORIES", () => {
+  it("every category has at least one label", () => {
+    for (const category of SLIM_CATEGORIES) {
+      expect(category.labels.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("matches simslim v0.14.0: an unset slim set has 16 categories and 173 labels, and a set naming mdm has exactly its 3", () => {
+    const all = resolveSlimCategories(undefined).categories;
+    const other = SLIM_CATEGORIES.find((c) => c.name === "other");
+    const mdm = resolveSlimCategories(["mdm"]);
+
+    expect(all).toHaveLength(16);
+    expect(labelsFor(all)).toHaveLength(173);
+    expect(mdm.unknown).toEqual([]);
+    expect(labelsFor(mdm.categories)).toEqual([
+      "com.apple.RemoteManagementAgent",
+      "com.apple.managedassetsd",
+      "com.apple.remotemanagementd",
+    ]);
+    expect(other?.labels).toContain("com.apple.accessibility.axassetsd");
+    expect(other?.labels).toContain("com.apple.ClipServices.clipserviced");
+  });
+
+  it("matches simslim v0.14.0: navd is in widgets, and the never-disable labels are in no category", () => {
+    const widgets = SLIM_CATEGORIES.find((c) => c.name === "widgets");
+    const slimmable = new Set(SLIM_CATEGORIES.flatMap((c) => c.labels));
+
+    expect(widgets?.labels).toContain("com.apple.navd");
+    expect([...NEVER_DISABLE_LABELS].sort()).toEqual([
+      "com.apple.assistantd",
+      "com.apple.gamed",
+      "com.apple.sharingd",
+    ]);
+    for (const label of NEVER_DISABLE_LABELS) {
+      expect(slimmable.has(label)).toBe(false);
+    }
+  });
+
+  it("no label is empty", () => {
+    for (const category of SLIM_CATEGORIES) {
+      for (const label of category.labels) {
+        expect(label.trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
+});
+
+describe("resolveSlimCategories", () => {
+  it("resolves to every category when undefined", () => {
+    const { categories, unknown } = resolveSlimCategories(undefined);
+    expect(categories).toEqual(SLIM_CATEGORIES);
+    expect(unknown).toEqual([]);
+  });
+
+  it("resolves a subset by name, preserving requested order", () => {
+    const { categories, unknown } = resolveSlimCategories(["telemetry", "siri"]);
+    expect(categories.map((c) => c.name)).toEqual(["telemetry", "siri"]);
+    expect(unknown).toEqual([]);
+  });
+
+  it("dedupes repeated requested names", () => {
+    const { categories } = resolveSlimCategories(["siri", "siri"]);
+    expect(categories.map((c) => c.name)).toEqual(["siri"]);
+  });
+
+  it("reports unknown names separately instead of throwing", () => {
+    const { categories, unknown } = resolveSlimCategories(["siri", "bogus", "also-bogus"]);
+    expect(categories.map((c) => c.name)).toEqual(["siri"]);
+    expect(unknown).toEqual(["bogus", "also-bogus"]);
+  });
+
+  it("resolves an empty request to no categories", () => {
+    const { categories, unknown } = resolveSlimCategories([]);
+    expect(categories).toEqual([]);
+    expect(unknown).toEqual([]);
+  });
+});
+
+describe("labelsFor", () => {
+  it("dedupes labels shared across categories and sorts them", () => {
+    const store = SLIM_CATEGORIES.find((c) => c.name === "store")!;
+    const icloud = SLIM_CATEGORIES.find((c) => c.name === "icloud")!;
+    const labels = labelsFor([store, icloud]);
+    const asSet = new Set(labels);
+    expect(asSet.size).toBe(labels.length);
+    expect([...labels]).toEqual([...labels].sort());
+    expect(labels).toContain("com.apple.amsaccountsd");
+  });
+
+  it("returns an empty array for no categories", () => {
+    expect(labelsFor([])).toEqual([]);
+  });
+});
+
+describe("slimSignature", () => {
+  it("is stable regardless of input category order", () => {
+    const forward = slimSignature(SLIM_CATEGORIES);
+    const reversed = slimSignature([...SLIM_CATEGORIES].reverse());
+    expect(forward).toBe(reversed);
+  });
+
+  it("changes when a category's labels change", () => {
+    const original = SLIM_CATEGORIES[0]!;
+    const mutated = { ...original, labels: [...original.labels, "com.apple.made-up-daemon"] };
+    const before = slimSignature([original]);
+    const after = slimSignature([mutated]);
+    expect(before).not.toBe(after);
+  });
+});

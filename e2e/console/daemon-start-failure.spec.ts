@@ -1,0 +1,54 @@
+import { holdLoopbackPort } from "../helpers/port.js";
+import { expect, startDaemon, test } from "./fixtures.js";
+
+/**
+ * why: reproduces #673. A failed daemon start reports only what the CLI guessed at while it polled
+ * for a socket (`Timed out starting simlock daemon: connect ENOENT <home>/daemon.sock`, or
+ * `Daemon connection closed` once the daemon answered and then tore itself down), never the reason
+ * it wrote to `daemon.log` -- and `startDaemon`'s catch deletes that log with the rest of the home,
+ * so the cause cannot be read afterwards either. The conflict below is the EADDRINUSE family of
+ * #553, staged by holding the HTTP port the daemon is about to bind.
+ */
+
+function reported(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  return error.cause === undefined
+    ? error.message
+    : `${error.message}\ncause: ${String(error.cause)}`;
+}
+
+test("a daemon start that cannot bind its HTTP port reports the port conflict", async () => {
+  const daemon = await startDaemon("worker");
+  try {
+    // why: restarting on its own home and port first shows that same start is accepted, so the
+    // refused one below can only be about the port this test comes to hold.
+    await daemon.stop();
+    await daemon.start();
+
+    await daemon.stop();
+    const held = await holdLoopbackPort(daemon.port);
+    let failure: unknown;
+    let started = false;
+    try {
+      await daemon.start();
+      started = true;
+    } catch (error: unknown) {
+      failure = error;
+    } finally {
+      await held.release();
+    }
+
+    if (started) {
+      throw new Error(
+        `premise: the daemon bound port ${String(daemon.port)}, which this test holds`,
+      );
+    }
+    // why: `daemon start` waits for the daemon to leave `starting` and exits 1 when it stopped (#981),
+    // so the failure is the CLI's own exit, not a clean exit followed by a log wait.
+    expect(reported(failure)).toContain("daemon start failed (exit code 1)");
+    expect(reported(failure)).toContain("EADDRINUSE");
+    expect(reported(failure)).toContain(String(daemon.port));
+  } finally {
+    await daemon.dispose();
+  }
+});

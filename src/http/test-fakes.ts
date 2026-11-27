@@ -1,0 +1,245 @@
+import {
+  type DeviceRecord,
+  type LeaseRecord,
+  SerializedDecision,
+  type LeaseGrant,
+  type VirtualDevice,
+} from "../core/index.js";
+import {
+  InMemoryLeaseRequestStore,
+  LeaseRequestBook,
+  type LeaseRequestOptions,
+} from "../leasing/index.js";
+import {
+  describeSchemaIssues,
+  OPERATIONS,
+  requestedDevice,
+  type OperationName,
+} from "../contract/index.js";
+import type { HttpLeaseFiles } from "./app.js";
+import { DispatchError } from "../daemon/dispatch.js";
+import type { DispatchSession } from "../daemon/dispatcher.js";
+import { describeLeaseRequestFailure } from "../daemon/error-code.js";
+import { type Clock, FakeClock, type IdGenerator } from "../ports/index.js";
+
+export function sequenceIdGenerator(prefix = "id"): IdGenerator {
+  let next = 0;
+  return {
+    generate: () => {
+      next += 1;
+      return `${prefix}-${next}`;
+    },
+  };
+}
+
+export function makeDevice(overrides: Partial<VirtualDevice> = {}): VirtualDevice {
+  return {
+    createdAt: 0,
+    driverData: undefined,
+    driverDeviceId: "ABCD-1234",
+    id: "dev_1",
+    mode: "full",
+    physical: false,
+    spec: { model: "iPhone 17 Pro", osVersion: "26.5", physical: false, platform: "ios" },
+    state: "leased",
+    ...overrides,
+  };
+}
+
+export function makeLease(overrides: Partial<LeaseRecord> = {}): LeaseRecord {
+  return {
+    deviceId: "dev_1",
+    grantedAt: 1_000,
+    id: "lse_1",
+    ownerId: "tok_agent",
+    requesterId: "tok_agent",
+    lastRenewedAt: 1_000,
+    idChosenByRequester: false,
+    ttlMs: 60_000,
+    ttlDeadline: 1_000 + 900_000,
+    ...overrides,
+  };
+}
+
+export function makeGrant(
+  overrides: {
+    readonly device?: Partial<VirtualDevice>;
+    readonly lease?: Partial<LeaseRecord>;
+  } = {},
+): LeaseGrant {
+  return {
+    device: makeDevice(overrides.device),
+    environment: {},
+    lease: makeLease(overrides.lease),
+    timing: {
+      estimatedBootMs: 0,
+      estimatedProvisionMs: 0,
+      estimatedReadyMs: 0,
+      estimatedReclaimMs: 0,
+    },
+  };
+}
+
+/**
+ * A scripted call this fake's `dispatch()` recorded and did not resolve synchronously via
+ * `handlers` -- `resolve`/`reject` settle the promise `dispatch()` returned, and `session` is
+ * exposed so a test can drive a `lease.request` call's `onProgress` override the same way it
+ * used to reach into `FakeLeaseCommands.calls[i].options.onProgress`.
+ */
+export interface FakeDispatchCall {
+  readonly operation: OperationName;
+  readonly input: unknown;
+  readonly session: DispatchSession;
+  readonly resolve: (value: unknown) => void;
+  readonly reject: (error: unknown) => void;
+}
+
+/**
+ * why: Test double for `HttpDispatch` (`src/http/dispatcher-session.ts`). Deliberately does not
+ * reproduce the real `Dispatcher`'s input parsing, role check, `authorize` hook, or startup
+ * parking -- those are covered against the real thing in `daemon/dispatcher.test.ts`,
+ * `daemon/dispatcher-leases.test.ts` and `daemon/server.test.ts`. This fake exists to let
+ * HTTP's own routing/serialization tests (`app.test.ts`, `tracker.test.ts`) script an
+ * operation's answer without standing up a full
+ * `createLeasing`/`Registry`/`CleanupReaper`.
+ *
+ * Two ways to script an answer: register a synchronous `handlers[operation]` for the common
+ * "this call always answers the same way" case, or -- for `lease.request`'s progress-then-grant
+ * flow, which needs to drive `session.onProgress` before settling -- leave it unregistered and
+ * resolve/reject the pushed `FakeDispatchCall` from `calls` once the test is ready.
+ */
+export class FakeDispatcher {
+  readonly calls: FakeDispatchCall[] = [];
+  readonly handlers: Partial<
+    Record<OperationName, (input: never, session: DispatchSession) => unknown>
+  > = {};
+  /**
+   * The real request rules over an in-memory store, standing in for the daemon's: an unhandled
+   * `lease.request` is admitted (or replayed) through it exactly as the real coordinator does,
+   * and the call a test settles is the request's own wait. Doubles as the HTTP app's
+   * `leaseRequests` reader.
+   */
+  readonly requests: LeaseRequestBook<LeaseGrant>;
+
+  constructor(clock: Clock = new FakeClock(1_000)) {
+    this.requests = new LeaseRequestBook<LeaseGrant>({
+      decisions: new SerializedDecision(),
+      describeFailure: describeLeaseRequestFailure,
+      store: new InMemoryLeaseRequestStore({
+        clock,
+        idGenerator: sequenceIdGenerator("req"),
+        limits: { maxRecords: 10_000, retentionMs: 600_000 },
+      }),
+    });
+  }
+
+  dispatch(operation: OperationName, input: unknown, session: DispatchSession): Promise<unknown> {
+    if (operation === "lease.request" && this.handlers[operation] === undefined) {
+      return this.#requestLease(input, session);
+    }
+    const handler = this.handlers[operation];
+    if (handler !== undefined) {
+      const settled = Promise.resolve(handler(input as never, session));
+      this.calls.push({
+        input,
+        operation,
+        reject: () => {},
+        resolve: () => {},
+        session,
+      });
+      return settled;
+    }
+    return new Promise((resolve, reject) => {
+      this.calls.push({ input, operation, reject, resolve, session });
+    });
+  }
+
+  /** The dispatcher's input parse and `lease.request` handler, and the coordinator's admission,
+   * minus the queue: the pushed call's `session.onProgress` is the request's own progress sink. */
+  async #requestLease(raw: unknown, session: DispatchSession): Promise<unknown> {
+    const parsed = OPERATIONS["lease.request"].input.safeParse(raw);
+    if (!parsed.success) {
+      throw new DispatchError("BAD_REQUEST", describeSchemaIssues(parsed.error.issues));
+    }
+    const input = parsed.data;
+    const request = requestedDevice(input);
+    const options = fakeRequestOptions(input, session);
+    const replay = this.requests.replay(request, options);
+    if (replay !== undefined) return replay;
+    const { started } = await this.requests.admit(request, options, (_id, onProgress) => ({
+      promise: new Promise<LeaseGrant>((resolve, reject) => {
+        this.calls.push({
+          input,
+          operation: "lease.request",
+          reject,
+          resolve: resolve as (value: unknown) => void,
+          session: { ...session, onProgress },
+        });
+      }),
+    }));
+    return started.promise;
+  }
+}
+
+/** What the dispatcher's `lease.request` handler hands the coordinator for this input. */
+function fakeRequestOptions(
+  input: {
+    readonly owner?: string | undefined;
+    readonly requesterId?: string | undefined;
+    readonly idempotencyKey?: string | undefined;
+  },
+  session: DispatchSession,
+): LeaseRequestOptions {
+  return {
+    ownerId: input.owner ?? session.principal,
+    requesterId: input.requesterId ?? session.principal,
+    ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+    ...(session.onProgress === undefined ? {} : { onProgress: session.onProgress }),
+    ...(session.onRequestAdmitted === undefined ? {} : { onAdmitted: session.onRequestAdmitted }),
+  };
+}
+
+/**
+ * `FakeDispatcher.dispatch` is called synchronously from within `LeaseRequestTracker.submit`,
+ * but only once the HTTP layer's own async work (body parsing, auth, validation) reaches the
+ * handler -- so a caller driving a request through `app.request()` must pump the microtask
+ * queue before `dispatcher.calls[index]` exists. Awaiting the whole response first would
+ * deadlock: `submit`'s returned promise doesn't settle until a progress/grant/reject callback
+ * fires.
+ */
+export async function waitForDispatch(
+  dispatcher: FakeDispatcher,
+  operation: OperationName,
+  index = 0,
+): Promise<FakeDispatchCall> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const matches = dispatcher.calls.filter((call) => call.operation === operation);
+    if (matches.length > index) return matches[index] as FakeDispatchCall;
+    await Promise.resolve();
+  }
+  throw new Error(`${operation} was never dispatched`);
+}
+
+export class FakeRegistry {
+  devices: DeviceRecord[] = [];
+  leases: LeaseRecord[] = [];
+
+  // fallow-ignore-next-line unused-class-member -- reached structurally through HttpGatewayDeps.registry.
+  get snapshot(): {
+    readonly devices: readonly DeviceRecord[];
+    readonly leases: readonly LeaseRecord[];
+    readonly components: readonly [];
+    readonly virtualDevices: readonly VirtualDevice[];
+  } {
+    return {
+      components: [],
+      devices: this.devices,
+      leases: this.leases,
+      virtualDevices: this.devices.filter((device): device is VirtualDevice => !device.physical),
+    };
+  }
+}
+
+export const noLeaseFiles: HttpLeaseFiles = {
+  handle: () => Promise.reject(new Error("this harness serves no lease files")),
+};
