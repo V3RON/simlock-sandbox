@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -14,6 +14,12 @@ import {
   type ServiceState,
   TaskSchedulerServiceManager,
 } from "./index.js";
+
+// why: lets one test give a directory the answer Node on Windows gives a drive root, which rejects a recursive `mkdir` with EPERM though it exists; every other call goes to the real `mkdir`.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, mkdir: vi.fn(actual.mkdir) };
+});
 
 describe("NodeDaemonLauncher", () => {
   it("rejects asynchronous spawn failures", async () => {
@@ -51,6 +57,37 @@ describe("NodeDaemonLauncher", () => {
       await expect.poll(async () => (await readFile(logPath, "utf8")).trim()).toBe(resolvedHome);
     } finally {
       await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  it("starts the daemon with a home directly under a drive root, whose recursive mkdir Windows rejects with EPERM", async () => {
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const driveRoot = await mkdtemp(join(tmpdir(), "simlock-drive-"));
+    const home = join(driveRoot, "simlock");
+    const logPath = join(home, "daemon.log");
+    vi.mocked(mkdir).mockImplementation(async (path, options) => {
+      if (path === driveRoot && typeof options === "object" && options?.recursive === true) {
+        throw Object.assign(new Error(`EPERM: operation not permitted, mkdir '${driveRoot}'`), {
+          code: "EPERM",
+          path: driveRoot,
+          syscall: "mkdir",
+        });
+      }
+      return actual.mkdir(path, options);
+    });
+    const launcher = new NodeDaemonLauncher({
+      args: ["-e", "console.log(process.env.SIMLOCK_HOME)"],
+      command: process.execPath,
+      logPath,
+      simlockHome: home,
+    });
+
+    try {
+      await expect(launcher.launch().then(() => "launched")).resolves.toBe("launched");
+      await expect.poll(async () => (await readFile(logPath, "utf8")).trim()).toBe(home);
+    } finally {
+      vi.mocked(mkdir).mockImplementation(actual.mkdir);
+      await rm(driveRoot, { force: true, recursive: true });
     }
   });
 
