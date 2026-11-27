@@ -43,8 +43,14 @@ export const leaseSimulatorInputSchema = leaseRequestFields.omit({
 export const leaseSimulatorCheckedInputSchema =
   leaseSimulatorInputSchema.superRefine(refuseModelWithClass());
 
-/** `lease.request`'s output verbatim -- the device/lease/timing grant. */
-export const leaseSimulatorOutputSchema = OPERATIONS["lease.request"].output;
+/**
+ * why: `lease.request`'s output -- the device/lease/timing grant -- plus `hint`, this tool's own
+ * word on a slim lease. It rides in the structured result because Codex hands only that to the
+ * model; the daemon contract carries no such field.
+ */
+export const leaseSimulatorOutputSchema = OPERATIONS["lease.request"].output.extend({
+  hint: z.string().max(1024).optional(),
+});
 
 export const listDevicesInputSchema = OPERATIONS["catalog.get"].input;
 

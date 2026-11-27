@@ -7,7 +7,8 @@ import {
 import { describe, expect, it } from "vitest";
 import { SimlockError } from "../client/index.js";
 import { FakeSimlockClient, sampleGrant, startingStatus } from "./test-support.js";
-import { leaseSimulatorInputSchema } from "./contracts.js";
+import type { CatalogGetOutput, LeaseGrant } from "../client/index.js";
+import { leaseSimulatorInputSchema, leaseSimulatorOutputSchema } from "./contracts.js";
 import { call, connectedServer, text, waitFor } from "./test-server.js";
 
 describe("MCP server (smoke)", () => {
@@ -595,3 +596,87 @@ describe("MCP server (smoke)", () => {
     }
   });
 });
+
+describe("MCP server: lease_simulator on a slim iOS device", () => {
+  const CATEGORIES = [
+    "widgets",
+    "siri",
+    "search",
+    "icloud",
+    "store",
+    "pim",
+    "web",
+    "family",
+    "health",
+    "photos",
+    "apps",
+    "messaging",
+    "connectivity",
+    "telemetry",
+    "mdm",
+    "other",
+  ];
+  const catalogOf = (slimCategories: string[]): CatalogGetOutput => ({
+    platforms: [
+      {
+        platform: "ios",
+        models: [],
+        runtimes: [],
+        modelRuntimes: {},
+        modelAliases: {},
+        modelClasses: {},
+        classDefaults: {},
+        slimCategories,
+      },
+    ],
+  });
+  const hintFor = (names: readonly string[]): string =>
+    `slim: ${names.join(", ")} off; pass except: ["<name>"] or mode: "full"`;
+
+  it("answers the grant plus a hint naming the categories off, in the structured result and the text, and none otherwise", async () => {
+    const rows: {
+      name: string;
+      grant: LeaseGrant;
+      input?: Record<string, unknown>;
+      hint: string | undefined;
+    }[] = [
+      {
+        name: "slim, all 16",
+        grant: slimGrant(),
+        hint: hintFor(CATEGORIES),
+      },
+      {
+        name: "slim, except store",
+        grant: slimGrant(["store"]),
+        input: { except: ["store"] },
+        hint: hintFor(CATEGORIES.filter((name) => name !== "store")),
+      },
+      { name: "full", grant: sampleGrant(), hint: undefined },
+    ];
+    for (const row of rows) {
+      const client = new FakeSimlockClient();
+      client.requestLeaseImpl = () => Promise.resolve(row.grant);
+      client.getCatalogImpl = () => Promise.resolve(catalogOf(CATEGORIES));
+      const { mcpClient, close } = await connectedServer(client);
+      try {
+        const lease = await call(mcpClient, "lease_simulator", {
+          model: "iPhone 17 Pro",
+          platform: "ios",
+          ...row.input,
+        });
+        expect(lease.isError, row.name).not.toBe(true);
+        const { hint, ...rest } = leaseSimulatorOutputSchema.parse(lease.structuredContent);
+        expect(hint, row.name).toBe(row.hint);
+        expect(rest, row.name).toEqual(row.grant);
+        expect(JSON.parse(text(lease)), row.name).toEqual(lease.structuredContent);
+      } finally {
+        await close();
+      }
+    }
+  });
+});
+
+function slimGrant(except?: string[]): LeaseGrant {
+  const grant = sampleGrant();
+  return { ...grant, device: { ...grant.device, mode: "slim", ...(except && { except }) } };
+}
