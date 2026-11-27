@@ -88,4 +88,64 @@ describe("createLeasing: a platform nuke", () => {
       harness.registry.snapshot.devices.find((device) => device.id === physical.id)?.state,
     ).toBe("ready");
   });
+
+  it("a platform nuke with --delete-devices deletes only that platform's seeds and baselines, never an orphan, and without it deletes none", async () => {
+    const sourceOf = (platform: Platform, kind: "baseline" | "seed", orphan = false) => ({
+      id: `${platform}-${kind}${orphan ? "-orphan" : ""}`,
+      kind,
+      model: "Phone",
+      osVersion: "1",
+      ...(orphan ? { orphan: true as const } : {}),
+    });
+    const cases = [
+      { deleteDevices: true, platform: "ios", removed: "ios-base" },
+      { deleteDevices: true, platform: "android", removed: "android-base" },
+      { deleteDevices: false, platform: "ios", removed: undefined },
+    ] as const;
+
+    for (const { deleteDevices, platform, removed } of cases) {
+      const clock = new FakeClock(1_000);
+      const ios = new FakeDriver({ availableOsVersions: ["26.5"], clock, platform: "ios" });
+      const android = new FakeDriver({ availableOsVersions: ["36"], clock, platform: "android" });
+      const harness = await createHarness({ driver: ios, drivers: [ios, android] });
+      const drivers = { android, ios };
+      for (const [name, driver] of Object.entries(drivers) as [Platform, FakeDriver][]) {
+        driver.setSources([
+          sourceOf(name, "seed"),
+          sourceOf(name, "baseline"),
+          sourceOf(name, "seed", true),
+        ]);
+        harness.state.database
+          .prepare(
+            "INSERT INTO baselines (name, version, platform, model, os_version, mode, saved_at, source_id) VALUES (?, 1, ?, 'Phone', '1', 'full', 'now', ?)",
+          )
+          .run(`${name}-base`, name, `${name}-baseline`);
+      }
+      const events: unknown[] = [];
+      harness.bus.subscribe("baseline.removed", (event) => events.push(event.payload));
+
+      const report = await new Nuke({ executor: harness.engine, registry: harness.registry }).run({
+        deleteDevices,
+        platform,
+      });
+
+      const kept = (name: Platform) =>
+        drivers[name].listSources().then((all) => all.map((x) => x.id));
+      const other = platform === "ios" ? "android" : "ios";
+      expect(report.removedBaselines, platform).toEqual(removed === undefined ? [] : [removed]);
+      expect(events, platform).toEqual(
+        removed === undefined ? [] : [{ name: removed, reason: "nuke", version: 1 }],
+      );
+      expect(await kept(platform), platform).toEqual(
+        deleteDevices
+          ? [`${platform}-seed-orphan`]
+          : [`${platform}-seed`, `${platform}-baseline`, `${platform}-seed-orphan`],
+      );
+      expect(await kept(other), platform).toEqual([
+        `${other}-seed`,
+        `${other}-baseline`,
+        `${other}-seed-orphan`,
+      ]);
+    }
+  });
 });
