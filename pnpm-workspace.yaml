@@ -8,7 +8,6 @@ minimumReleaseAgeExclude:
   - "@e2e-dev/mobile@0.12.9"
   - e2e@0.25.0
 overrides:
-  "@hono/node-server": 2.1.5
   ip-address: ">=10.3.1"
 packageExtensions:
   # dependency-cruiser parses TypeScript with the typescript package beside it, and supports only typescript <7; the project itself builds with 7.
