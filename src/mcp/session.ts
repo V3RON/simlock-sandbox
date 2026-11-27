@@ -16,6 +16,7 @@ import {
   awaitWithin,
   reconnectWhileWaiting,
   RELEASE_TIMEOUT_MS,
+  slimCategoriesOff,
   startLeaseRenewal,
   startReconnect,
   UNREACHABLE_GIVE_UP_MS,
@@ -204,7 +205,13 @@ export class McpSession {
       }
       this.#heldLeaseId = grant.lease.id;
       this.#startRenewal(grant.lease);
-      return grant;
+      const categoriesOff = await slimCategoriesOff(client, grant.device, this.#clock);
+      return categoriesOff.length === 0
+        ? grant
+        : {
+            ...grant,
+            hint: `slim: ${categoriesOff.join(", ")} off; pass except: ["<name>"] or mode: "full"`,
+          };
     });
   }
 
