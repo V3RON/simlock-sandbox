@@ -129,12 +129,17 @@ export class Seeds {
   async listSources(): Promise<readonly DriverSource[]> {
     await this.#sweepLeftovers();
     const rows = this.#sources.readyRows();
-    const orphans = await this.#orphanSources();
+    const folders = await this.#sourceFolders();
+    const orphans = this.#orphanSources(folders);
     if (rows.length === 0) return orphans;
     const catalog = await this.#simctl.loadCatalog();
     return [
       ...rows.map((row) => {
-        const staleReason = sourceStaleReason(row, catalog);
+        const staleReason =
+          sourceStaleReason(row, catalog) ??
+          (row.udid !== undefined && !folders.includes(row.udid)
+            ? goneReason(row.kind)
+            : undefined);
         return {
           id: row.sourceId,
           kind: row.kind,
@@ -462,9 +467,9 @@ export class Seeds {
   }
 
   /** why: a simulator in the sources set that no row names is a leftover of a crash; `doctor` reports it and only `--purge-orphans` deletes it. */
-  async #orphanSources(): Promise<readonly DriverSource[]> {
+  #orphanSources(folders: readonly string[]): readonly DriverSource[] {
     const named = new Set(this.#sources.allUdids());
-    return (await this.#sourceFolders())
+    return folders
       .filter((udid) => !named.has(udid))
       .map((udid) => ({
         id: udid,
@@ -835,6 +840,12 @@ function sourceStaleReason(row: SourceRow, catalog: SimctlCatalog): string | und
     return `device type ${row.deviceTypeId} is not available`;
   }
   return undefined;
+}
+
+function goneReason(kind: SourceRow["kind"]): string {
+  return kind === "seed"
+    ? "its simulator is gone; the next lease of its kind makes it again"
+    : "its simulator is gone; save it again";
 }
 
 function seedSpecKey(resolved: ResolvedIosSpec): string {
