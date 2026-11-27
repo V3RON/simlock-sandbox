@@ -192,6 +192,7 @@ async function runLease(
   };
   // why: set once a held remote lease is granted: a drop then starts the reconnect instead of ending the command.
   let onDropped: (() => void) | undefined;
+  let commandEnded = false;
   const subscribe = (target: SimlockAdminClient): (() => void) => {
     const offLeaseLost = target.onLeaseLost((push) => {
       if (push.leaseId !== ourLeaseId) return;
@@ -396,13 +397,19 @@ async function runLease(
     const result = { ...grant, role: client.role };
     if (values["export-env"] === true) writeExportEnv(environment, result);
     else writeResult((value) => environment.stdout.write(value), result);
-    const categoriesOff = await slimCategoriesOff(client, grant.device, environment.clock);
-    if (categoriesOff.length > 0) {
-      environment.stderr.write(
-        `${JSON.stringify({ notice: `slim: ${categoriesOff.map(escapeControl).join(", ")} off; use --except <name> or --mode full` })}\n`,
-      );
+    // why: Not awaited on the hold path: a farm drop during the catalog read must find `onDropped` installed, or it ends the command instead of reconnecting (ADR 0081 section 4).
+    const hintWritten = slimCategoriesOff(client, grant.device, environment.clock).then(
+      (categoriesOff) => {
+        if (commandEnded || categoriesOff.length === 0) return;
+        environment.stderr.write(
+          `${JSON.stringify({ notice: `slim: ${categoriesOff.map(escapeControl).join(", ")} off; use --except <name> or --mode full` })}\n`,
+        );
+      },
+    );
+    if (termination === undefined) {
+      await hintWritten;
+      return 0;
     }
-    if (termination === undefined) return 0;
     if (connectionLost) return ERROR_TABLE.DAEMON_CONNECTION_LOST.cliExitCode;
     const grantedLease = grant.lease;
     const beginRenewal = (ttlMs: number, ttlDeadline: number): void => {
@@ -488,6 +495,7 @@ async function runLease(
   } finally {
     // why: Stopped before the release, always: a renew must never race the release of the lease it
     // is renewing, and no timer may outlive this command.
+    commandEnded = true;
     renewal?.stop();
     reconnect?.stop();
     await releaseHeldLease();

@@ -48,8 +48,11 @@ export const leaseSimulatorCheckedInputSchema =
  * word on a slim lease. It rides in the structured result because Codex hands only that to the
  * model; the daemon contract carries no such field.
  */
+/** why: the longest `hint` the output carries; the session leaves out a longer line. */
+export const HINT_MAX_LENGTH = 1024;
+
 export const leaseSimulatorOutputSchema = OPERATIONS["lease.request"].output.extend({
-  hint: z.string().max(1024).optional(),
+  hint: z.string().max(HINT_MAX_LENGTH).optional(),
 });
 
 export const listDevicesInputSchema = OPERATIONS["catalog.get"].input;

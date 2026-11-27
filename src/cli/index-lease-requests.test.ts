@@ -1010,13 +1010,14 @@ describe("simlock lease: a slim iOS lease says which categories are off", () => 
   const grantFor = (
     device: { mode?: "full" | "slim"; except?: string[] },
     platform: "ios" | "android" = "ios",
+    physical = false,
   ): Awaited<ReturnType<SimlockAdminClient["requestLease"]>> => ({
     device: {
-      physical: false,
+      physical,
       driverDeviceId: "dev_1",
       id: "dev_1",
       ...device,
-      spec: { physical: false, model: "iPhone 17", osVersion: "26.5", platform },
+      spec: { physical, model: "iPhone 17", osVersion: "26.5", platform },
     },
     environment: {},
     lease: {
@@ -1112,6 +1113,12 @@ describe("simlock lease: a slim iOS lease says which categories are off", () => 
       {
         name: "Android",
         grant: grantFor({}, "android"),
+        expected: "",
+        catalogCalls: 0,
+      },
+      {
+        name: "physical",
+        grant: grantFor({}, "ios", true),
         expected: "",
         catalogCalls: 0,
       },

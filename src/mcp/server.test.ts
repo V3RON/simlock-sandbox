@@ -660,6 +660,21 @@ describe("MCP server: lease_simulator on a slim iOS device", () => {
         hint: undefined,
       },
       {
+        name: "physical",
+        grant: physicalGrant(),
+        input: { physical: true },
+        hint: undefined,
+      },
+      {
+        name: "hint longer than the output schema allows",
+        grant: slimGrant(),
+        catalog: () =>
+          Promise.resolve(
+            catalogOf(Array.from({ length: 16 }, (_, index) => `c${index}`.padEnd(80, "x"))),
+          ),
+        hint: undefined,
+      },
+      {
         name: "catalog read rejects",
         grant: slimGrant(),
         catalog: () => Promise.reject(new Error("catalog unavailable")),
@@ -707,6 +722,15 @@ describe("MCP server: lease_simulator on a slim iOS device", () => {
 function androidDevice(): LeaseGrant["device"] {
   const { device } = sampleGrant();
   return { ...device, spec: { ...device.spec, platform: "android" } };
+}
+
+function physicalGrant(): LeaseGrant {
+  const grant = sampleGrant();
+  const { mode: _mode, ...device } = grant.device;
+  return {
+    ...grant,
+    device: { ...device, physical: true, spec: { ...device.spec, physical: true } },
+  };
 }
 
 function slimGrant(except?: string[]): LeaseGrant {

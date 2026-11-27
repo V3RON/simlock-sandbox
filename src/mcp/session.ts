@@ -37,6 +37,7 @@ import type {
   RotateDeviceOutput,
   RunOnDeviceInput,
 } from "./contracts.js";
+import { HINT_MAX_LENGTH } from "./contracts.js";
 import { errorMessage } from "../shared/index.js";
 
 /**
@@ -206,12 +207,10 @@ export class McpSession {
       this.#heldLeaseId = grant.lease.id;
       this.#startRenewal(grant.lease);
       const categoriesOff = await slimCategoriesOff(client, grant.device, this.#clock);
-      return categoriesOff.length === 0
-        ? grant
-        : {
-            ...grant,
-            hint: `slim: ${categoriesOff.join(", ")} off; pass except: ["<name>"] or mode: "full"`,
-          };
+      if (categoriesOff.length === 0) return grant;
+      const hint = `slim: ${categoriesOff.join(", ")} off; pass except: ["<name>"] or mode: "full"`;
+      // why: `leaseSimulatorOutputSchema` caps `hint` at `HINT_MAX_LENGTH`; the line is a courtesy, so a longer one is left out rather than failing the output of a lease already held.
+      return hint.length > HINT_MAX_LENGTH ? grant : { ...grant, hint };
     });
   }
 
