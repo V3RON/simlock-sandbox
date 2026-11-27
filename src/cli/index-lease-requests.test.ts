@@ -1008,7 +1008,7 @@ describe("simlock lease: a slim iOS lease says which categories are off", () => 
     "other",
   ];
   const grantFor = (
-    device: { mode: "full" | "slim"; except?: string[] },
+    device: { mode?: "full" | "slim"; except?: string[] },
     platform: "ios" | "android" = "ios",
   ): Awaited<ReturnType<SimlockAdminClient["requestLease"]>> => ({
     device: {
@@ -1062,36 +1062,100 @@ describe("simlock lease: a slim iOS lease says which categories are off", () => 
     `${JSON.stringify({ notice: `slim: ${names(list)} off; use --except <name> or --mode full` })}\n`;
 
   it("prints one stderr notice naming the categories the slim device has off, after the grant on stdout", async () => {
-    const rows: {
-      args: string[];
+    type Row = {
+      name: string;
+      args?: string[];
       grant: ReturnType<typeof grantFor>;
+      catalog?: () => Promise<CatalogGetOutput>;
       expected: string;
-    }[] = [
+      catalogCalls?: number;
+    };
+    const all = (): Promise<CatalogGetOutput> => Promise.resolve(catalogOf(CATEGORIES));
+    const rows: Row[] = [
+      { name: "slim, all 16", grant: grantFor({ mode: "slim" }), expected: hintLine(CATEGORIES) },
       {
-        args: ["--mode", "slim"],
-        grant: grantFor({ mode: "slim" }),
-        expected: hintLine(CATEGORIES),
-      },
-      {
-        args: ["--mode", "slim", "--except", "siri"],
+        name: "slim, --except siri",
+        args: ["--except", "siri"],
         grant: grantFor({ mode: "slim", except: ["siri"] }),
         expected: hintLine(CATEGORIES.filter((name) => name !== "siri")),
       },
-      { args: ["--mode", "full"], grant: grantFor({ mode: "full" }), expected: "" },
+      {
+        name: "except covers the list",
+        grant: grantFor({ mode: "slim", except: ["a", "b"] }),
+        catalog: () => Promise.resolve(catalogOf(["a", "b"])),
+        expected: "",
+      },
+      {
+        name: "empty slimCategories",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => Promise.resolve(catalogOf([])),
+        expected: "",
+      },
+      {
+        name: "absent slimCategories",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => Promise.resolve(catalogOf(undefined)),
+        expected: "",
+      },
+      {
+        name: "no iOS entry",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => Promise.resolve({ platforms: [] }),
+        expected: "",
+      },
+      {
+        name: "full",
+        grant: grantFor({ mode: "full" }),
+        expected: "",
+        catalogCalls: 0,
+      },
+      {
+        name: "Android",
+        grant: grantFor({}, "android"),
+        expected: "",
+        catalogCalls: 0,
+      },
+      {
+        name: "catalog read rejects",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => Promise.reject(new Error("catalog unavailable")),
+        expected: "",
+      },
+      {
+        name: "catalog read unanswered past 2 s",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => new Promise<CatalogGetOutput>(() => {}),
+        expected: "",
+      },
     ];
     for (const row of rows) {
       const output = outputCapture();
+      let catalogCalls = 0;
       const client = fakeClient({
         requestLease: () => Promise.resolve(row.grant),
-        getCatalog: () => Promise.resolve(catalogOf(CATEGORIES)),
+        getCatalog: () => {
+          catalogCalls += 1;
+          return (row.catalog ?? all)();
+        },
       });
-      const exitCode = await runCli(
-        ["lease", "--platform", "ios", ...row.args, "--detach"],
-        output.environmentWith({ connectAdmin: async () => client }),
-      );
-      expect(exitCode, row.args.join(" ")).toBe(0);
-      expect(slimLines(output.stderr), row.args.join(" ")).toBe(row.expected);
-      expect(JSON.parse(output.stdout).device.mode, row.args.join(" ")).toBe(row.grant.device.mode);
+      const environment = output.environmentWith({ connectAdmin: async () => client });
+      let settled = false;
+      const exitCode = runCli(
+        ["lease", "--platform", row.grant.device.spec.platform, ...(row.args ?? []), "--detach"],
+        environment,
+      ).then((code) => {
+        settled = true;
+        return code;
+      });
+      for (let tick = 0; tick < 100 && !settled; tick += 1) {
+        (environment.clock as FakeClock).advance(50);
+        await settle();
+      }
+      expect(settled, `${row.name}: lease had not settled by 5 s`).toBe(true);
+      expect(await exitCode, row.name).toBe(0);
+      expect(slimLines(output.stderr), row.name).toBe(row.expected);
+      expect(JSON.parse(output.stdout).lease.id, row.name).toBe("lse_1");
+      if (row.catalogCalls !== undefined) expect(catalogCalls, row.name).toBe(row.catalogCalls);
     }
   });
 });
