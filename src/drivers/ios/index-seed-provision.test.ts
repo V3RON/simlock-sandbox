@@ -158,6 +158,68 @@ describe("IosSimctlDriver", () => {
     ]);
   });
 
+  it("an iOS lease of a kind whose seed simulator is gone is granted on a new seed, made once and without a simctl call for the gone one", async () => {
+    const goneUdid = "00000000-0000-0000-0000-0000000000bb";
+    const copyUdid = "00000000-0000-0000-0000-000000000002";
+    const cloneInvocation = sourcesSimctl("clone", seedUdid, driverData.name, deviceRoot);
+    const cases = [
+      { name: "folder present", made: 0, seed: seedUdid, setFolder: true, twice: false },
+      { name: "deleted by hand", made: 1, seed: goneUdid, setFolder: true, twice: false },
+      { name: "sources set missing", made: 1, seed: goneUdid, setFolder: false, twice: false },
+      { name: "two provisions at once", made: 1, seed: goneUdid, setFolder: true, twice: true },
+    ];
+
+    for (const { name, made, seed, setFolder, twice } of cases) {
+      const database = await seededDatabase({ udid: seed });
+      const filesystem = new MemoryFilesystem();
+      await plantManagedDevice(filesystem);
+      if (seed === seedUdid) await plantSeedClone(filesystem);
+      else if (setFolder) await filesystem.mkdirp(sourcesSetPath);
+      await filesystem.mkdirp(`${deviceRoot}/${copyUdid}/data`);
+      const [create, boot, bootstatus, listapps, shutdown, seedClone, deleteThrowaway] =
+        throwawaySeedSteps();
+      const make = [
+        create,
+        boot,
+        bootstatus,
+        listapps,
+        shutdown,
+        { ...seedClone, onSpawn: () => plantSeedClone(filesystem) },
+        deleteThrowaway,
+      ];
+      const clones = [cloneInvocation, cloneInvocation].map((match) => ({
+        match,
+        result: { code: 0, stderr: "", stdout: `${copyUdid}\n` },
+      }));
+      const runner = new ScriptedProcessRunner([
+        { match: listInvocation, result: { code: 0, stderr: "", stdout: listFixture } },
+        ...(twice
+          ? [{ match: listInvocation, result: { code: 0, stderr: "", stdout: listFixture } }]
+          : []),
+        ...(made === 0 ? [] : make),
+        ...(twice ? clones : clones.slice(0, 1)),
+      ]);
+      const driver = await createDriver(runner, new FakeClock(), filesystem, database);
+
+      const grants = await Promise.all(
+        twice ? [driver.provision(spec), driver.provision(spec)] : [driver.provision(spec)],
+      );
+
+      expect(grants.length, name).toBe(twice ? 2 : 1);
+      expect(
+        runner.calls.filter((call) => call.args[3] === "create"),
+        name,
+      ).toHaveLength(made);
+      expect(
+        runner.calls.filter((call) => call.args.includes(goneUdid)),
+        name,
+      ).toEqual([]);
+      expect(database.prepare("SELECT state, udid FROM ios_source_data").all(), name).toEqual([
+        { state: "ready", udid: seedUdid },
+      ]);
+    }
+  });
+
   it("a clone that fails makes the provision throw and keeps the seed and its row", async () => {
     const database = await seededDatabase();
     const runner = new ScriptedProcessRunner([
