@@ -1,6 +1,6 @@
 # Lease policy
 
-Does: the client-side renew timer the CLI and MCP share — renew at a third of the TTL.
+Does: the client-side renew timer the CLI and MCP share — renew at a third of the TTL — and the slim hint line's category list.
 
 ## Rules
 

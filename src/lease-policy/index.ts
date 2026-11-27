@@ -32,6 +32,7 @@
  *   and neither can extend a lease the daemon did not.
  */
 import { isSimlockError, SimlockError, type AnySimlockError } from "../contract/index.js";
+import type { SimlockClient } from "../client/index.js";
 import type { Clock, TimerHandle } from "../ports/index.js";
 
 const RENEW_DIVISOR = 3;
@@ -83,6 +84,36 @@ export async function awaitWithin<T>(
     return await Promise.race([work, expiry]);
   } finally {
     if (timer !== undefined) clock.cancel(timer);
+  }
+}
+
+/**
+ * why: How long a lease waits for the catalog read behind the slim hint line. The line is a courtesy,
+ * so a slow answer costs the line, never the lease.
+ */
+const SLIM_HINT_TIMEOUT_MS = 2_000;
+
+/**
+ * why: The categories a slim iOS device has off, for the hint line a lease prints: the catalog's
+ * `slimCategories` minus the categories the lease kept. Never throws; `[]` means no line.
+ */
+export async function slimCategoriesOff(
+  client: Pick<SimlockClient, "getCatalog">,
+  device: { readonly mode?: string | undefined; readonly except?: readonly string[] | undefined },
+  clock: Clock,
+): Promise<readonly string[]> {
+  if (device.mode !== "slim") return [];
+  try {
+    const catalog = await awaitWithin(
+      clock,
+      SLIM_HINT_TIMEOUT_MS,
+      client.getCatalog({ platform: "ios" }),
+      "the catalog read for the slim hint timed out",
+    );
+    const categories = catalog.platforms.find((entry) => entry.platform === "ios")?.slimCategories;
+    return (categories ?? []).filter((name) => !(device.except ?? []).includes(name));
+  } catch {
+    return [];
   }
 }
 

@@ -6,7 +6,8 @@ import {
   MemoryIpcTransport,
   FakeSystemStats,
 } from "../ports/index.js";
-import { waitingRequestSchema } from "../contract/index.js";
+import { SimlockError, waitingRequestSchema, type AnySimlockError } from "../contract/index.js";
+import type { CatalogGetOutput, SimlockAdminClient } from "../admin/index.js";
 import type { DeviceRecoveredPush, DeviceUnhealthyPush } from "../simlock-client/client.js";
 import { runCli, type CliEnvironment } from "./index.js";
 import { buildCliEnvironment } from "./environment.js";
@@ -984,5 +985,227 @@ describe("simlock lease: a request names a model, a class, or nothing", () => {
     expect(output.stdout).toBe(
       "Request req_1: a, ios class phone >=18 <26, queued at 1, waiting 0s\n",
     );
+  });
+});
+
+describe("simlock lease: a slim iOS lease says which categories are off", () => {
+  const CATEGORIES = [
+    "widgets",
+    "siri",
+    "search",
+    "icloud",
+    "store",
+    "pim",
+    "web",
+    "family",
+    "health",
+    "photos",
+    "apps",
+    "messaging",
+    "connectivity",
+    "telemetry",
+    "mdm",
+    "other",
+  ];
+  const grantFor = (
+    device: { mode?: "full" | "slim"; except?: string[] },
+    platform: "ios" | "android" = "ios",
+    physical = false,
+  ): Awaited<ReturnType<SimlockAdminClient["requestLease"]>> => ({
+    device: {
+      physical,
+      driverDeviceId: "dev_1",
+      id: "dev_1",
+      ...device,
+      spec: { physical, model: "iPhone 17", osVersion: "26.5", platform },
+    },
+    environment: {},
+    lease: {
+      deviceId: "dev_1",
+      grantedAt: 0,
+      id: "lse_1",
+      lastRenewedAt: 0,
+      idChosenByRequester: false,
+      ownerId: "test-requester",
+      requesterId: "test-requester",
+      ttlDeadline: 60_000,
+      ttlMs: 60_000,
+    },
+    timing: {
+      estimatedBootMs: 0,
+      estimatedProvisionMs: 0,
+      estimatedReadyMs: 0,
+      estimatedReclaimMs: 0,
+    },
+  });
+  const catalogOf = (slimCategories: string[] | undefined): CatalogGetOutput => ({
+    platforms: [
+      {
+        platform: "ios",
+        models: [],
+        runtimes: [],
+        modelRuntimes: {},
+        modelAliases: {},
+        modelClasses: {},
+        classDefaults: {},
+        ...(slimCategories !== undefined && { slimCategories }),
+      },
+    ],
+  });
+  const slimLines = (stderr: string): string =>
+    stderr
+      .split("\n")
+      .filter((line) => line.startsWith('{"notice":"slim:'))
+      .map((line) => `${line}\n`)
+      .join("");
+  const names = (list: readonly string[]): string => list.join(", ");
+  const hintLine = (list: readonly string[]): string =>
+    `${JSON.stringify({ notice: `slim: ${names(list)} off; use --except <name> or --mode full` })}\n`;
+
+  it("prints one stderr notice naming the categories the slim device has off, after the grant on stdout", async () => {
+    type Row = {
+      name: string;
+      args?: string[];
+      grant: ReturnType<typeof grantFor>;
+      catalog?: () => Promise<CatalogGetOutput>;
+      expected: string;
+      catalogCalls?: number;
+      dropDuringRead?: boolean;
+    };
+    const all = (): Promise<CatalogGetOutput> => Promise.resolve(catalogOf(CATEGORIES));
+    const rows: Row[] = [
+      { name: "slim, all 16", grant: grantFor({ mode: "slim" }), expected: hintLine(CATEGORIES) },
+      {
+        name: "slim, --except siri",
+        args: ["--except", "siri"],
+        grant: grantFor({ mode: "slim", except: ["siri"] }),
+        expected: hintLine(CATEGORIES.filter((name) => name !== "siri")),
+      },
+      {
+        name: "except covers the list",
+        grant: grantFor({ mode: "slim", except: ["a", "b"] }),
+        catalog: () => Promise.resolve(catalogOf(["a", "b"])),
+        expected: "",
+      },
+      {
+        name: "empty slimCategories",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => Promise.resolve(catalogOf([])),
+        expected: "",
+      },
+      {
+        name: "absent slimCategories",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => Promise.resolve(catalogOf(undefined)),
+        expected: "",
+      },
+      {
+        name: "no iOS entry",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => Promise.resolve({ platforms: [] }),
+        expected: "",
+      },
+      {
+        name: "full",
+        grant: grantFor({ mode: "full" }),
+        expected: "",
+        catalogCalls: 0,
+      },
+      {
+        name: "Android",
+        grant: grantFor({}, "android"),
+        expected: "",
+        catalogCalls: 0,
+      },
+      {
+        name: "physical",
+        grant: grantFor({}, "ios", true),
+        expected: "",
+        catalogCalls: 0,
+      },
+      {
+        name: "catalog read rejects",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => Promise.reject(new Error("catalog unavailable")),
+        expected: "",
+      },
+      {
+        name: "catalog read unanswered past 2 s",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => new Promise<CatalogGetOutput>(() => {}),
+        expected: "",
+      },
+      {
+        name: "connection lost during the unanswered catalog read",
+        grant: grantFor({ mode: "slim" }),
+        catalog: () => new Promise<CatalogGetOutput>(() => {}),
+        expected: "",
+        dropDuringRead: true,
+      },
+    ];
+    for (const row of rows) {
+      const output = outputCapture();
+      let catalogCalls = 0;
+      let connectionLost: ((error: AnySimlockError) => void) | undefined;
+      const client = fakeClient({
+        requestLease: () => Promise.resolve(row.grant),
+        onConnectionLost: (listener) => {
+          connectionLost = listener;
+          return () => {};
+        },
+        getCatalog: () => {
+          catalogCalls += 1;
+          if (row.dropDuringRead === true) {
+            connectionLost?.(
+              new SimlockError("DAEMON_CONNECTION_LOST", "transport", "socket closed", {}),
+            );
+          }
+          return (row.catalog ?? all)();
+        },
+      });
+      const environment = output.environmentWith({ connectAdmin: async () => client });
+      let settled = false;
+      const exitCode = runCli(
+        ["lease", "--platform", row.grant.device.spec.platform, ...(row.args ?? []), "--detach"],
+        environment,
+      ).then((code) => {
+        settled = true;
+        return code;
+      });
+      for (let tick = 0; tick < 100 && !settled; tick += 1) {
+        (environment.clock as FakeClock).advance(50);
+        await settle();
+      }
+      expect(settled, `${row.name}: lease had not settled by 5 s`).toBe(true);
+      expect(await exitCode, row.name).toBe(0);
+      expect(slimLines(output.stderr), row.name).toBe(row.expected);
+      if (row.dropDuringRead === true) {
+        expect(output.stderr, `${row.name}: a --detach lease holds nothing to lose`).not.toContain(
+          "DAEMON_CONNECTION_LOST",
+        );
+      }
+      expect(JSON.parse(output.stdout).lease.id, row.name).toBe("lse_1");
+      if (row.catalogCalls !== undefined) expect(catalogCalls, row.name).toBe(row.catalogCalls);
+    }
+    const exported = outputCapture();
+    await runCli(
+      ["lease", "--platform", "ios", "--mode", "slim", "--detach", "--export-env"],
+      exported.environmentWith({
+        connectAdmin: async () =>
+          fakeClient({
+            requestLease: () =>
+              Promise.resolve({
+                ...grantFor({ mode: "slim" }),
+                environment: { ANDROID_SERIAL: "dev_1" },
+              }),
+            getCatalog: () => Promise.resolve(catalogOf(CATEGORIES)),
+          }),
+      }),
+    );
+    expect(exported.stdout, "--export-env writes export lines, no notice").toContain(
+      "export ANDROID_SERIAL=",
+    );
+    expect(exported.stdout).not.toContain("notice");
+    expect(slimLines(exported.stderr), "--export-env").toBe(hintLine(CATEGORIES));
   });
 });
