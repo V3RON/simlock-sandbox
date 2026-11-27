@@ -1,3 +1,4 @@
+import type { Platform } from "./domain.js";
 import type { NukeExecutor } from "./core-ports.js";
 import type { Registry } from "./registry.js";
 
@@ -8,6 +9,7 @@ export interface NukeOptions {
 
 export interface NukeRunOptions {
   readonly deleteDevices: boolean;
+  readonly platform?: Platform | undefined;
 }
 
 export class Nuke {
