@@ -56,10 +56,23 @@ describe.skipIf(process.platform !== "darwin")(
             stdio: "ignore",
           });
           const killed = new Promise<void>((resolve) => shutdown.on("close", () => resolve()));
+          // why: A kill landing before simctl asked CoreSimulator to shut down would leave a booted simulator, which is not the state a timed-out destroy meets.
+          const stateOf = async (): Promise<string | undefined> =>
+            (await setDevices(deviceSet)).find((device) => device.udid === udid)?.state;
+          const deadline = Date.now() + 30_000;
+          let state = await stateOf();
+          while (state === "Booted" && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            state = await stateOf();
+          }
+          expect(state, "the simulator never began shutting down before the kill").not.toBe(
+            "Booted",
+          );
           shutdown.kill("SIGKILL");
           await killed;
 
-          await simctlInSet(deviceSet, ["delete", udid]);
+          // why: The driver's own limit for the delete, so a delete that needs longer than production allows fails here.
+          await simctlInSet(deviceSet, ["delete", udid], { timeoutMs: 30_000 });
           expect(
             (await setDevices(deviceSet)).map((device) => device.udid),
             "simctl delete left the simulator behind",
