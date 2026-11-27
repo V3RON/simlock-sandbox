@@ -103,14 +103,18 @@ export async function slimCategoriesOff(
   clock: Clock,
 ): Promise<readonly string[]> {
   if (device.mode !== "slim") return [];
-  const catalog = await awaitWithin(
-    clock,
-    SLIM_HINT_TIMEOUT_MS,
-    client.getCatalog({ platform: "ios" }),
-    "the catalog read for the slim hint timed out",
-  );
-  const categories = catalog.platforms.find((entry) => entry.platform === "ios")?.slimCategories;
-  return (categories ?? []).filter((name) => !(device.except ?? []).includes(name));
+  try {
+    const catalog = await awaitWithin(
+      clock,
+      SLIM_HINT_TIMEOUT_MS,
+      client.getCatalog({ platform: "ios" }),
+      "the catalog read for the slim hint timed out",
+    );
+    const categories = catalog.platforms.find((entry) => entry.platform === "ios")?.slimCategories;
+    return (categories ?? []).filter((name) => !(device.except ?? []).includes(name));
+  } catch {
+    return [];
+  }
 }
 
 /**
