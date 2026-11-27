@@ -24,6 +24,7 @@ import { UDID_PATTERN } from "./device-set-leftovers.js";
 import {
   IosSourceTable,
   type ReadySeed,
+  type SourceFile,
   type SourceRecord,
   type SourceRow,
 } from "./source-data.js";
@@ -432,12 +433,14 @@ export class Seeds {
     name: string,
     onCloned?: (udid: string) => void,
   ): Promise<string> {
-    const result = await this.#seedTurns.take(seed.udid, () =>
-      this.#simctl.createSimulator(["clone", seed.udid, name, this.#deviceRoot], {
+    const { files, result } = await this.#seedTurns.take(seed.udid, async () => ({
+      // why: a seed's deletion waits only for its turn and then drops its file rows, so the list is read here, where the seed is still there.
+      files: seed.lineage === undefined ? [] : this.#sources.filesOf(seed.sourceId),
+      result: await this.#simctl.createSimulator(["clone", seed.udid, name, this.#deviceRoot], {
         seedUdid: seed.udid,
         source: this.#sourcesSet,
       }),
-    );
+    }));
     const udid = result.stdout.trim();
 
     if (udid === "") {
@@ -448,7 +451,7 @@ export class Seeds {
     try {
       await this.#marks.writeMark(udid);
       await this.#dropLaunchServicesDatabase(this.#deviceRoot, udid);
-      if (seed.lineage !== undefined) await this.#swapLineage(seed.sourceId, seed.lineage, udid);
+      if (seed.lineage !== undefined) await this.#swapLineage(files, seed.lineage, udid);
     } catch (error: unknown) {
       // why: a clone whose mark or database drop failed is not a device Simlock hands out, and
       // in Xcode's set an unmarked one would never be listed, reclaimed or deleted again.
@@ -717,15 +720,17 @@ export class Seeds {
     });
   }
 
-  async #swapLineage(sourceId: string, lineage: readonly string[], udid: string): Promise<void> {
+  async #swapLineage(
+    files: readonly SourceFile[],
+    lineage: readonly string[],
+    udid: string,
+  ): Promise<void> {
     const started = this.#clock.now();
     const counts = await swapCopyFiles(
       this.#filesystem,
       join(this.#deviceRoot, udid),
       // why: the copy's LaunchServices database was dropped just before, so a seed that recorded one has nothing of it left to swap.
-      this.#sources
-        .filesOf(sourceId)
-        .filter((file) => !LAUNCH_SERVICES_PATH.test(file.relativePath)),
+      files.filter((file) => !LAUNCH_SERVICES_PATH.test(file.relativePath)),
       { lineage, own: udid },
     );
     this.#logger?.debug(
