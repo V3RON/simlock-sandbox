@@ -159,7 +159,7 @@ describe("IosSimctlDriver", () => {
   });
 
   it("an iOS lease of a kind whose seed simulator is gone is granted on a new seed, made once and without a simctl call for the gone one", async () => {
-    const goneUdid = "00000000-0000-0000-0000-0000000000bb";
+    const goneUdid = "00000000-0000-0000-0000-0000000000cc";
     const copyUdid = "00000000-0000-0000-0000-000000000002";
     const cloneInvocation = sourcesSimctl("clone", seedUdid, driverData.name, deviceRoot);
     const cases = [
@@ -173,8 +173,6 @@ describe("IosSimctlDriver", () => {
       const database = await seededDatabase({ udid: seed });
       const filesystem = new MemoryFilesystem();
       await plantManagedDevice(filesystem);
-      if (seed === seedUdid) await plantSeedClone(filesystem);
-      else if (setFolder) await filesystem.mkdirp(sourcesSetPath);
       await filesystem.mkdirp(`${deviceRoot}/${copyUdid}/data`);
       const [create, boot, bootstatus, listapps, shutdown, seedClone, deleteThrowaway] =
         throwawaySeedSteps();
@@ -200,6 +198,10 @@ describe("IosSimctlDriver", () => {
         ...(twice ? clones : clones.slice(0, 1)),
       ]);
       const driver = await createDriver(runner, new FakeClock(), filesystem, database);
+      if (seed !== seedUdid) {
+        await filesystem.rm(`${sourcesSetPath}/${seed}`);
+        if (!setFolder) await filesystem.rm(sourcesSetPath);
+      }
 
       const grants = await Promise.all(
         twice ? [driver.provision(spec), driver.provision(spec)] : [driver.provision(spec)],
@@ -458,7 +460,7 @@ describe("IosSimctlDriver", () => {
       };
       const filesystem = new MemoryFilesystem();
       await plantManagedDevice(filesystem);
-      await plantSeedClone(filesystem);
+      await plantSeedClone(filesystem, isDefault ? unownedSourcesSet : sourcesSetPath);
       const clock = new FakeClock();
       const driver = await IosSimctlDriver.create({
         database: seeded ? await seededDatabase() : await memorySourceDatabase(),

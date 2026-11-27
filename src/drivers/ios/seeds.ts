@@ -523,9 +523,25 @@ export class Seeds {
 
   async #findOrMakeSeed(resolved: ResolvedIosSpec, specKey: string): Promise<ReadySeed> {
     const seed = this.#sources.findReadySeed(specKey);
-    if (seed !== undefined && !seedIsStale(seed, resolved)) return seed;
-    if (seed !== undefined) await this.#destroySeed(seed);
+    if (seed !== undefined && (await this.#isGone(seed.udid))) {
+      await this.#forgetGoneSeed(seed);
+    } else if (seed !== undefined && !seedIsStale(seed, resolved)) {
+      return seed;
+    } else if (seed !== undefined) {
+      await this.#destroySeed(seed);
+    }
     return this.#makeSeed(resolved, specKey);
+  }
+
+  /** why: a seed deleted by hand, or left in the other device set's sources set, has no folder here; `simctl --set` on a sources set that is not there fails, so the check reads the folder. */
+  async #isGone(udid: string): Promise<boolean> {
+    return !(await this.#sourceFolders()).includes(udid);
+  }
+
+  /** why: the simulator is not there, so no `simctl` call runs; the row, its files rows and its overrides folder (outside the set) are all that is left. */
+  async #forgetGoneSeed(seed: ReadySeed): Promise<void> {
+    await this.#slimBoot.removeOverrides(seed.udid);
+    this.#sources.deleteRow(seed.sourceId);
   }
 
   async #bootThrowaway(throwaway: string, sourceId: string): Promise<void> {
