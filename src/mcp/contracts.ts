@@ -32,7 +32,6 @@ export const leaseSimulatorInputSchema = leaseRequestFields.omit({
   fleetRequestId: true,
   metadata: true,
   requesterId: true,
-  requires: true,
   runId: true,
 });
 
