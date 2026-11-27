@@ -91,7 +91,7 @@ export async function awaitWithin<T>(
  * why: How long a lease waits for the catalog read behind the slim hint line. The line is a courtesy,
  * so a slow answer costs the line, never the lease.
  */
-export const SLIM_HINT_TIMEOUT_MS = 2_000;
+const SLIM_HINT_TIMEOUT_MS = 2_000;
 
 /**
  * why: The categories a slim iOS device has off, for the hint line a lease prints: the catalog's
