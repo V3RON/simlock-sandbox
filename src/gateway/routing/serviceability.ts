@@ -1,0 +1,353 @@
+import type { Platform } from "../../contract/index.js";
+import { type DeviceClass, noPhysicalMatch } from "../../core/index.js";
+import type { WorkerView } from "../worker-registry.js";
+import type { RoutableRequest } from "./pipeline.js";
+import {
+  baselineEntry,
+  baselineMismatchOf,
+  catalogOf,
+  hasPlatform,
+  listsModel,
+  matchRequest,
+  physicalMatch,
+  servesMode,
+  wantedClass,
+  withBaseline,
+} from "./request-match.js";
+import { hasCapabilities } from "./stages/has-capabilities.js";
+import { keepsExcept } from "./stages/keeps-except.js";
+import { takesRequests } from "./stages/takes-requests.js";
+
+export type RejectionCode =
+  | "NO_CAPACITY"
+  | "NO_DRIVER"
+  | "MODE_UNAVAILABLE"
+  | "UNKNOWN_MODEL"
+  | "RUNTIME_MISSING"
+  | "CAPABILITY_MISSING"
+  | "UNKNOWN_BASELINE"
+  | "BASELINE_MISMATCH"
+  | "BASELINE_STALE"
+  | "BAD_REQUEST";
+
+export interface Rejection {
+  readonly kind: "reject";
+  readonly code: RejectionCode;
+  readonly message: string;
+  readonly details?:
+    | {
+        readonly platform: Platform;
+        readonly model?: string;
+        readonly class?: DeviceClass;
+        readonly osVersion?: string;
+        readonly downloadable?: false;
+      }
+    | { readonly capabilities: readonly string[] }
+    | { readonly name: string }
+    | { readonly baseline: string; readonly field: string }
+    | { readonly baseline: string; readonly reason: string }
+    | { readonly platform: "ios"; readonly mode: "slim" | "full"; readonly served: readonly [] };
+  readonly reason: "no-worker" | "unresolvable-spec";
+}
+
+export type Assessment = { readonly kind: "route-or-wait" } | Rejection;
+
+export function assess(request: RoutableRequest, views: readonly WorkerView[]): Assessment {
+  if (request.baseline === undefined) return assessFleet(request, views);
+  const holders = baselineHolders(request, views);
+  return holders.kind === "reject" ? holders : assessFleet(request, holders.views);
+}
+
+type Holders = { readonly kind: "holders"; readonly views: readonly WorkerView[] } | Rejection;
+
+/**
+ * why: ADR 0061 §6: before the table, a request naming a baseline is checked against the workers
+ * that hold it: none holds it, none fits it, or no fitting one is fresh. The first holder in
+ * worker id order gives the message. The table then runs over the fitting, fresh holders.
+ */
+function baselineHolders(request: RoutableRequest, views: readonly WorkerView[]): Holders {
+  const name = request.baseline ?? "";
+  const holders = views
+    .filter((worker) => isKnown(worker) && baselineEntry(worker, request) !== undefined)
+    .sort((left, right) => left.id.localeCompare(right.id));
+  if (holders.length === 0) {
+    return {
+      code: "UNKNOWN_BASELINE",
+      details: { name },
+      kind: "reject",
+      message: `no worker holds a baseline named "${name}"`,
+      reason: "unresolvable-spec",
+    };
+  }
+  const mismatches = holders.map((worker) => baselineMismatchOf(worker, request));
+  const fitting = holders.filter((_worker, index) => mismatches[index] === undefined);
+  const firstMismatch = mismatches[0];
+  if (fitting.length === 0 && firstMismatch !== undefined) {
+    return {
+      code: "BASELINE_MISMATCH",
+      details: { baseline: name, field: firstMismatch.field },
+      kind: "reject",
+      message: firstMismatch.message,
+      reason: "unresolvable-spec",
+    };
+  }
+  const fresh = fitting.filter(
+    (worker) => baselineEntry(worker, request)?.staleReason === undefined,
+  );
+  if (fresh.length === 0) {
+    const first = fitting[0];
+    const reason = (first && baselineEntry(first, request)?.staleReason) ?? "";
+    return {
+      code: "BASELINE_STALE",
+      details: { baseline: name, reason },
+      kind: "reject",
+      message: `baseline ${name} is stale: ${reason}`,
+      reason: "unresolvable-spec",
+    };
+  }
+  return { kind: "holders", views: fresh };
+}
+
+function assessFleet(request: RoutableRequest, views: readonly WorkerView[]): Assessment {
+  // why: ADR 0066 §5 puts the `except` row after the model and runtime rows and before the capacity row.
+  const leading = assessLeading(request, views);
+  if (leading !== undefined) return leading;
+  const except = assessExcept(request, views);
+  if (except !== undefined) return except;
+  const serving = assessServing(request, views);
+  if (serving !== undefined) return serving;
+  const requires = request.requires;
+  if (requires === undefined || requires.length === 0 || views.some(isUnread)) {
+    return { kind: "route-or-wait" };
+  }
+  const capable = views.filter((worker) => hasCapabilities.check(worker, request) === undefined);
+  if (assessTable(request, capable).kind === "route-or-wait") return { kind: "route-or-wait" };
+  return {
+    code: "CAPABILITY_MISSING",
+    details: { capabilities: requires },
+    kind: "reject",
+    message: `No worker connected to this gateway can serve ${requires.join(", ")} for this request`,
+    reason: "unresolvable-spec",
+  };
+}
+
+/**
+ * why: ADR 0066 §5: like `requires`, the capacity row (`assessServing`) runs again over the workers
+ * that keep the `except` list. When none can serve: a known worker that keeps the names and serves the model and runtime
+ * but cannot take requests now (drained, lost its uplink) makes it `NO_CAPACITY`; with no such
+ * worker it is `BAD_REQUEST`, told whether no worker slims the names or none would give a slim device.
+ */
+function assessExcept(
+  request: RoutableRequest,
+  views: readonly WorkerView[],
+): Rejection | undefined {
+  const except = request.except;
+  // why: the subset below leaves out a worker with no catalog, which may keep the names; the request waits for its first read.
+  if (except === undefined || views.some(isUnread)) return undefined;
+  const keeping = views.filter((worker) => keepsExcept.check(worker, request) === undefined);
+  if (assessServing(request, keeping) === undefined) return undefined;
+  if (
+    keeping.some(
+      (worker) =>
+        isKnown(worker) &&
+        listsModel(worker, request) &&
+        matchRequest(worker, request) !== undefined,
+    )
+  ) {
+    return noWorker();
+  }
+  const names = except.join(", ");
+  const slimmers = views.filter((worker) =>
+    except.every((name) => catalogOf(worker, request)?.slimCategories?.includes(name) === true),
+  );
+  const message =
+    slimmers.length === 0
+      ? `no worker slims every category in except: ${names}`
+      : `no worker can keep slim categories ${names} (${whyNotSlim(request, slimmers)})`;
+  return { code: "BAD_REQUEST", kind: "reject", message, reason: "unresolvable-spec" };
+}
+
+// why: read off the workers that slim the names: either each would give a full device, or the ones that would give a slim one do not serve the model and runtime.
+function whyNotSlim(request: RoutableRequest, slimmers: readonly WorkerView[]): string {
+  const allFull = slimmers.every(
+    (worker) =>
+      (withBaseline(worker, request).mode ?? catalogOf(worker, request)?.defaultMode) !== "slim",
+  );
+  if (!allFull) return "no worker that slims them in slim mode serves this model and runtime";
+  if (request.baseline !== undefined) return `baseline "${request.baseline}" is full`;
+  if (request.mode !== undefined) return `mode is ${request.mode} on every worker that slims them`;
+  return "default mode is full on every worker that slims them";
+}
+
+function assessTable(request: RoutableRequest, views: readonly WorkerView[]): Assessment {
+  return (
+    assessLeading(request, views) ?? assessServing(request, views) ?? { kind: "route-or-wait" }
+  );
+}
+
+// why: an updating worker comes back by itself (ADR 0042 §3), so a request that only it can serve waits instead of failing.
+function takersOf(request: RoutableRequest, views: readonly WorkerView[]): WorkerView[] {
+  return views.filter((worker) => {
+    const refusal = takesRequests.check(worker, request);
+    return refusal === undefined || refusal.reason === "updating";
+  });
+}
+
+// why: the table's first rows: no worker takes requests, no driver, unknown model, missing runtime.
+function assessLeading(
+  request: RoutableRequest,
+  views: readonly WorkerView[],
+): Rejection | undefined {
+  if (takersOf(request, views).length === 0) return noWorker();
+  return views.some(isUnread) ? undefined : assessKnown(request, views);
+}
+
+// why: rows 2 to 4: what no known worker could serve, whatever the capacity.
+function assessKnown(
+  request: RoutableRequest,
+  views: readonly WorkerView[],
+): Rejection | undefined {
+  const known = views.filter(isKnown);
+  const platform = request.platform;
+  if (!known.some((worker) => hasPlatform(worker, request))) {
+    return {
+      code: "NO_DRIVER",
+      details: { platform },
+      kind: "reject",
+      message: `No driver registered for platform: ${platform}`,
+      reason: "unresolvable-spec",
+    };
+  }
+  const mode = assessMode(request, known);
+  if (mode !== undefined) return mode;
+  if (request.physical === true) return assessPhysical(request, known);
+  if (phonesOnlyEverywhere(known, request)) return phonesOnly(request);
+  if (!known.some((worker) => listsModel(worker, request))) return unknownModel(request);
+  if (!known.some((worker) => matchRequest(worker, request) !== undefined)) {
+    const osVersion = request.osVersion ?? "default";
+    return {
+      code: "RUNTIME_MISSING",
+      details: { downloadable: false, osVersion, platform },
+      kind: "reject",
+      message: `Runtime missing for ${platform} ${osVersion}`,
+      reason: "unresolvable-spec",
+    };
+  }
+  return undefined;
+}
+
+// why: a physical request is served by any known worker with an enrolled device that fits, whatever the catalog lists.
+function assessPhysical(
+  request: RoutableRequest,
+  known: readonly WorkerView[],
+): Rejection | undefined {
+  if (known.some((worker) => physicalMatch(worker, request, "enrolled"))) return undefined;
+  return {
+    ...noPhysicalMatch(request),
+    code: "UNKNOWN_MODEL",
+    kind: "reject",
+    reason: "unresolvable-spec",
+  };
+}
+
+// why: `presence` plays no part in the table: a device last read not present makes the request wait, not fail.
+// why: the capacity row: a known worker could serve, but none taking requests can.
+function assessServing(
+  request: RoutableRequest,
+  views: readonly WorkerView[],
+): Rejection | undefined {
+  const takers = takersOf(request, views);
+  const fits =
+    request.physical === true
+      ? takers.some((worker) => physicalMatch(worker, request, "enrolled"))
+      : takers.some(
+          (worker) => servesMode(worker, request) && matchRequest(worker, request) !== undefined,
+        );
+  return fits || views.some(isUnread) ? undefined : noWorker();
+}
+
+// why: ADR 0009 §4: a connected worker the gateway has not read yet (as after a gateway restart) may serve what no other can, so the request waits for its first catalog.
+function isUnread(worker: WorkerView): boolean {
+  return worker.connection === "connected" && !worker.drained && worker.catalog === undefined;
+}
+
+function isKnown(worker: WorkerView): boolean {
+  return worker.connection !== "incompatible";
+}
+
+function unknownModel(request: RoutableRequest): Rejection {
+  const { platform } = request;
+  if (request.model === undefined) {
+    const deviceClass = wantedClass(request);
+    return {
+      code: "UNKNOWN_MODEL",
+      details: { class: deviceClass, platform },
+      kind: "reject",
+      message:
+        `No ${platform} model of class ${deviceClass} is listed by any worker in the fleet; ` +
+        `name one in ${platform}.defaultModels.${deviceClass} on a worker`,
+      reason: "unresolvable-spec",
+    };
+  }
+  return {
+    code: "UNKNOWN_MODEL",
+    details: { model: request.model, platform },
+    kind: "reject",
+    message: `Unknown ${platform} model: ${request.model}`,
+    reason: "unresolvable-spec",
+  };
+}
+
+// why: ADR 0084 §3: a plain request is refused with the phones-only message only when every known worker that has the platform says `virtualDevices: false`.
+function phonesOnlyEverywhere(known: readonly WorkerView[], request: RoutableRequest): boolean {
+  return known
+    .filter((worker) => hasPlatform(worker, request))
+    .every((worker) => catalogOf(worker, request)?.virtualDevices === false);
+}
+
+// why: ADR 0084 §3 and the issue's I3 word the gateway's refusal for the fleet ("Every worker with <platform> …"), unlike the single worker's "This worker serves only…" in `VirtualDevicesOffError`.
+function phonesOnly(request: RoutableRequest): Rejection {
+  const { platform } = request;
+  return {
+    ...unknownModel(request),
+    message:
+      `Every worker with ${platform} serves only enrolled physical ${platform} devices ` +
+      `(${platform}.virtualDevices is false); ask for a physical device ` +
+      "(--physical, or physical: true)",
+  };
+}
+
+// why: ADR 0082 §4, I6: the row after `NO_DRIVER`: every known worker with the platform lists modes without the request's.
+function assessMode(request: RoutableRequest, known: readonly WorkerView[]): Rejection | undefined {
+  const withPlatform = known.filter((worker) => hasPlatform(worker, request));
+  if (withPlatform.some((worker) => servesMode(worker, request))) return undefined;
+  return modeUnavailable(request, withPlatform);
+}
+
+// why: ADR 0082 §4, I6: the mode is the request's own or, for a baseline, the first holder's; the message names the other mode as the way out.
+function modeUnavailable(request: RoutableRequest, withPlatform: readonly WorkerView[]): Rejection {
+  const [first] = withPlatform;
+  const mode = first === undefined ? undefined : withBaseline(first, request).mode;
+  if (mode === undefined) return noWorker();
+  const other = mode === "full" ? "slim" : "full";
+  const message =
+    request.baseline === undefined
+      ? `No worker serves ${mode} iOS simulators; ask for a ${other} one (--mode ${other}, or mode: "${other}")`
+      : `Baseline "${request.baseline}" is ${mode}, and no worker that holds it serves ${mode} iOS simulators`;
+  return {
+    code: "MODE_UNAVAILABLE",
+    details: { mode, platform: "ios", served: [] },
+    kind: "reject",
+    message,
+    reason: "unresolvable-spec",
+  };
+}
+
+function noWorker(): Rejection {
+  return {
+    code: "NO_CAPACITY",
+    kind: "reject",
+    message: "No worker in the fleet can currently serve this request",
+    reason: "no-worker",
+  };
+}

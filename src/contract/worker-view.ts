@@ -1,0 +1,127 @@
+/**
+ * why: The one place a worker's own reads become the fields of its worker view (ADR 0012 §1).
+ *
+ * A gateway reads `status.get`, `list.get` for devices, `catalog.get` and `config.get` over a
+ * worker's uplink; a worker answering `worker.list` about itself reads the same four from its
+ * own dispatcher. Both call this function, so the two views cannot disagree about a field. Each
+ * caller adds what only it knows: `id`, `label`, `connection`, `drained`, `lastSeenAt` and
+ * `version`.
+ *
+ * Pure: no I/O, no clock, nothing outside the contract module.
+ */
+import { z } from "zod";
+
+import type { OPERATIONS } from "./operations.js";
+import { statusDeviceSchema, type workerViewSchema } from "./schemas.js";
+
+/**
+ * How often a worker view is re-read in full, catalog and config included, when no event asks
+ * for it sooner. A gateway refreshes every view on this tick (ADR 0005 §7's backstop), and a
+ * worker answering `worker.list` about itself re-reads its catalog no more often, so an open
+ * console polling `GET /v1/workers` does not run a driver's catalog read on every poll. Both
+ * re-read the catalog at once after a component install.
+ */
+export const WORKER_VIEW_REFRESH_INTERVAL_MS = 30_000;
+
+/**
+ * The events after which a worker view's catalog is read again at once, rather than on the
+ * interval above. One list, read by a gateway's `WorkerLink` and by a worker answering
+ * `worker.list`, so both re-read on the same events (architecture rule 10). An installed
+ * component is a new catalog entry (ADR 0010 §7); a removal shows on the next interval.
+ */
+export const WORKER_VIEW_CATALOG_EVENTS = ["component.installed"] as const;
+
+// why: the events after which a gateway reads a worker's baselines again at once (ADR 0061 §6): they change what `baseline.list` answers.
+export const WORKER_VIEW_BASELINE_EVENTS = [
+  "baseline.saved",
+  "baseline.removed",
+  "baseline.stale",
+] as const;
+
+// why: a worker's `update` and `lastUpdateFailure` change on these two events (ADR 0042 §11), so a gateway reads its status again at once.
+export const WORKER_VIEW_UPDATE_EVENTS = ["daemon.update-started", "daemon.update-failed"] as const;
+
+type Output<Name extends keyof typeof OPERATIONS> = z.infer<(typeof OPERATIONS)[Name]["output"]>;
+type WorkerView = z.infer<typeof workerViewSchema>;
+
+/** The answers a view is built from. `catalog` and `config` are optional because a gateway's
+ * per-event refresh re-reads only status and devices; a field left out stays as it was.
+ * `devices` is optional because a starting worker is not asked for them. */
+export interface WorkerReads {
+  readonly status: Output<"status.get">;
+  readonly devices?: Output<"list.get">;
+  readonly catalog?: Output<"catalog.get">;
+  readonly baselines?: Output<"baseline.list">;
+  readonly config?: Output<"config.get">;
+  readonly receivedAt: number;
+}
+
+export type WorkerViewReport = Pick<WorkerView, "health" | "host"> &
+  Partial<
+    Pick<
+      WorkerView,
+      | "baselines"
+      | "capabilities"
+      | "capacity"
+      | "catalog"
+      | "devices"
+      | "downloads"
+      | "installs"
+      | "lastUpdateFailure"
+      | "latestVersion"
+      | "lease"
+      | "leases"
+      | "load"
+      | "physicalQueueDepth"
+      | "queueDepth"
+      | "update"
+      | "waiting"
+      | "warmPool"
+    >
+  >;
+
+/** why: Narrowed so `driverData` -- an opaque, driver-defined blob -- stays out of every view. */
+const viewDevicesSchema = z.array(statusDeviceSchema);
+
+export function workerViewFields(reads: WorkerReads): WorkerViewReport {
+  const { baselines, catalog, config, devices, receivedAt, status } = reads;
+  // why: a worker's ageMs is a claim; it is already capped at a day, and readAt never goes below 0.
+  const load =
+    status.load === undefined
+      ? {}
+      : (() => {
+          const { ageMs, ...parts } = status.load;
+          return { load: { readAt: Math.max(0, receivedAt - ageMs), ...parts } };
+        })();
+  // why: a starting worker has checked nothing: its view is its health, its host and its load, and every
+  // other field is absent -- never empty, which would read as "nothing is leased".
+  if (status.daemon.health === "starting")
+    return { health: "starting", host: status.host, ...load };
+  return {
+    health: status.daemon.health,
+    host: status.host,
+    ...load,
+    installs: status.installs ?? [],
+    lastUpdateFailure: status.daemon.lastUpdateFailure,
+    latestVersion: status.daemon.latestVersion,
+    update: status.daemon.update,
+    waiting: status.waiting ?? [],
+    ...(status.capabilities === undefined ? {} : { capabilities: status.capabilities }),
+    ...(status.capacity === undefined ? {} : { capacity: status.capacity }),
+    ...(status.warmPool === undefined ? {} : { warmPool: status.warmPool }),
+    ...(status.leases === undefined ? {} : { leases: status.leases }),
+    ...(status.queueDepth === undefined ? {} : { queueDepth: status.queueDepth }),
+    ...(status.physicalQueueDepth === undefined
+      ? {}
+      : { physicalQueueDepth: status.physicalQueueDepth }),
+    ...(devices === undefined ? {} : { devices: viewDevicesSchema.parse(devices) }),
+    ...(catalog === undefined ? {} : { catalog: catalog.platforms }),
+    ...(baselines === undefined ? {} : { baselines: baselines.baselines }),
+    ...(config === undefined
+      ? {}
+      : {
+          downloads: { policy: config.downloads.policy, timeoutMs: config.downloads.timeoutMs },
+          lease: { maxTtlMs: config.lease.maxTtlMs },
+        }),
+  };
+}

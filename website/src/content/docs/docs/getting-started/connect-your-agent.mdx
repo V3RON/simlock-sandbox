@@ -1,0 +1,98 @@
+---
+title: Connect your coding agent
+description: Teach a coding agent to lease devices with simlock setup, and make sure each agent session gets its own identity.
+sidebar:
+  order: 6
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+**Result:** your coding agent knows how to lease a device, use it and give it back, and each agent session has its own identity.
+
+What a requester is and why it matters: [Leases and requesters](/simlock/docs/concepts/leases).
+
+## Before you start
+
+- Simlock is installed on the machine where the agent runs, either with devices ([macOS](/simlock/docs/getting-started/macos), [Linux](/simlock/docs/getting-started/linux), [Windows](/simlock/docs/getting-started/windows)) or pointed at a farm ([Use an existing farm](/simlock/docs/getting-started/existing-farm)).
+- An agent reaches Simlock through the CLI (this page) or the MCP server ([Give your agent the MCP server](/simlock/docs/getting-started/mcp-server)). Pick one per agent session.
+
+## 1. Teach your agent to use Simlock
+
+```sh
+simlock setup
+```
+
+It installs a small `simlock` skill into Claude Code and Codex, for all your projects. Add `--project` for the current project only. The skill tells the agent to check its setup with `simlock whoami` and to read the rules with `simlock instructions`. The rules stay in Simlock, so the skill stays correct after you update.
+
+In a terminal, `setup` asks for the scope and, for each tool, whether to connect the MCP server too. In a script, answer up front: `--user` or `--project`, `--tool claude-code` or `--tool codex`, and `--mcp` or `--no-mcp`. Files it writes and the report: [`simlock setup`](/simlock/docs/reference/cli#simlock-setup).
+
+**Check:** the report has a `skill` line that says `wrote` or `replaced` for your tool, and a `machine` line for this machine's platforms:
+
+```text
+claude-code  skill  wrote      /Users/dana/.claude/skills/simlock
+machine      ios ok, android missing: android-sdk
+```
+
+A missing platform on the `machine` line does not fail `setup`.
+
+### If your tool has no skills
+
+Paste the rules into your project's `AGENTS.md` or `CLAUDE.md` instead:
+
+```sh
+simlock instructions >> AGENTS.md
+```
+
+Do this only when your tool has no skills; with both, the agent reads the rules twice. Paste them again after you update Simlock. `simlock instructions --json` prints the same text as one JSON object.
+
+## 2. Give each agent session its own identity
+
+A requester holds one lease at a time by default. Each agent session needs its own requester, the same for the whole session.
+
+| Agent tool | CLI | MCP server |
+| --- | --- | --- |
+| Claude Code | Automatic: `claude-code:<session id>` | Automatic: the same `claude-code:<session id>` |
+| Codex | Automatic: `codex:<session id>` | Automatic, but different from the CLI's: `mcp:<process id>` |
+| pi | Automatic: `pi:<session id>` | Automatic, but different from the CLI's: `mcp:<process id>` |
+| Any other tool | Set `SIMLOCK_AGENT_ID` | Automatic: `mcp:<process id>` |
+
+**With any other tool**, set `SIMLOCK_AGENT_ID` to a different value in each agent session, before it runs `simlock`:
+
+```sh
+export SIMLOCK_AGENT_ID="review-bot-7f3a"
+```
+
+Without it, every `simlock` command gets a new identity, so the one-lease limit does nothing and nobody can tell which agent holds which device.
+
+<Aside type="caution" title="Do not share one SIMLOCK_AGENT_ID">
+Do not put a fixed `SIMLOCK_AGENT_ID` in a shared shell profile or a shared MCP config. Every session would be the same requester, and the second session to ask for a device fails with `REQUESTER_ALREADY_LEASED` while the first holds one.
+</Aside>
+
+- **Sub-agents share the session's lease.** Under Claude Code, Codex and pi, every `simlock` command in one session, its sub-agents' included, uses the session's identity. For a device per sub-agent, see [Use several devices at once](/simlock/docs/using-devices/several-devices).
+- **Under Codex and pi, use the CLI or the MCP server, not both.** Codex does not pass its session ID to MCP servers, and [pi passes `PI_SESSION_ID` only to the commands its `bash` and `powershell` tools run](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/environment-variables.md#shell-tool-session-environment). So the CLI and the MCP server count as two requesters, and the session could hold two leases. To use both, set the same `SIMLOCK_AGENT_ID` for the CLI and the server.
+- **Which identity wins.** `simlock lease --agent-id <id>` wins for that one command, then `SIMLOCK_AGENT_ID`, then the session ID. An identity is at most 256 characters with no control characters; anything else fails with `BAD_REQUEST`.
+
+**Check:** ask the agent to run `simlock whoami` on a machine with devices. `Principal` shows the session's identity, such as `claude-code:<session id>`.
+
+## 3. Let the agent run `simlock lease`
+
+Most agents run one command per tool call. For them, tell the agent to add `--detach`: `simlock lease` returns once it prints the lease, and the agent renews and releases it later. An agent that can run a command in the background can leave out `--detach`; the command then renews the lease and releases it when it exits.
+
+`simlock lease` waits while the request is in the queue or a device boots, which can take a minute or more. Give the command a long timeout in your agent tool.
+
+**Check:** ask the agent to lease a device and release it. `simlock status` lists the lease under the agent's identity while it holds it.
+
+## Through a gateway
+
+On the gateway's own machine, add `--gateway` before the command: `simlock --gateway lease ...`. Agents on other machines point the CLI at the gateway's URL: see [Use an existing farm](/simlock/docs/getting-started/existing-farm).
+
+## When it fails
+
+| Error | Exit | Cause | Fix |
+| --- | --- | --- | --- |
+| `REQUESTER_ALREADY_LEASED` | 13 | This identity already holds a lease: a shared `SIMLOCK_AGENT_ID`, or a sub-agent of a session that holds one. | Give each session its own identity, or release the first lease. |
+| `BAD_REQUEST` | 2 | The identity is over 256 characters or has a control character. | Shorten or fix `SIMLOCK_AGENT_ID`. |
+| `setup` fails with `SETUP_REFUSED` | 2 | A file or symlink sits where the `simlock` skill directory goes. | Move it, then run `setup` again. |
+| `setup` fails with `SETUP_MCP_FAILED` | 1 | The tool's own `mcp add` command failed or ran longer than 30 seconds. | See [Give your agent the MCP server](/simlock/docs/getting-started/mcp-server). |
+
+More: [A lease fails or never starts](/simlock/docs/troubleshooting/lease-fails).

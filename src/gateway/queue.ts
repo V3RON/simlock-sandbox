@@ -1,0 +1,152 @@
+import type { Clock, IdGenerator } from "../ports/index.js";
+import { type LeaseRecord, type DeviceRequest, type LeaseProgress } from "../core/index.js";
+import type { Platform } from "../contract/index.js";
+import {
+  WaitQueue,
+  type LeaseRequestOptions,
+  type QueuePlace,
+  type WaiterState,
+} from "../leasing/index.js";
+
+export type { LeaseProgress } from "../core/index.js";
+export { lineOf } from "../leasing/index.js";
+export type { LeaseRequestOptions } from "../leasing/index.js";
+export { RequestCancelledError, RequesterAlreadyLeasedError } from "../leasing/index.js";
+
+/** why: `worker` is optional because this queue never grants; the coordinator stamps it later. */
+export type FleetLeaseRecord = LeaseRecord & {
+  readonly worker?: { readonly id: string; readonly label?: string };
+};
+
+/** why: `device` and `timing` are `unknown`: the gateway only relays them. */
+export interface FleetLeaseGrant {
+  readonly device: unknown;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly lease: FleetLeaseRecord;
+  readonly timing: unknown;
+}
+
+export interface FleetWaiter {
+  readonly id: string;
+  readonly request: DeviceRequest;
+  readonly options: LeaseRequestOptions;
+  readonly promise: Promise<FleetLeaseGrant>;
+  readonly state: WaiterState;
+}
+
+export interface FleetQueueOptions {
+  readonly clock: Clock;
+  readonly idGenerator: IdGenerator;
+  /** why: Reports the timeout only; it does not wake the dispatch loop for the waiters behind. */
+  readonly onTimeout?: (waiter: FleetWaiter) => void;
+  readonly onDepthChange?: ((depth: number, line: "virtual" | "physical") => void) | undefined;
+}
+
+/** why: `WaitQueue` has no fleet awareness; every waiter reaching here was minted by this queue, so the cast holds. */
+function asFleet<Value>(value: Value): Value extends undefined ? undefined : FleetWaiter {
+  return value as never;
+}
+
+export class FleetQueue {
+  readonly #queue: WaitQueue;
+  /** why: the priority the admission command answered, kept by waiter; a waiter with none has 0. */
+  readonly #priorities = new WeakMap<object, number>();
+  /** why: a run release reached this request after a worker took it, so its grant is given back at once; kept by waiter. */
+  readonly #releaseAtGrant = new WeakSet<object>();
+
+  constructor(options: FleetQueueOptions) {
+    this.#queue = new WaitQueue({
+      priorityOf: (waiter) => this.#priorities.get(waiter) ?? 0,
+      clock: options.clock,
+      idGenerator: options.idGenerator,
+      onDepthChange: options.onDepthChange,
+      ...(options.onTimeout === undefined
+        ? {}
+        : { onTimeout: (waiter) => options.onTimeout?.(asFleet(waiter)) }),
+    });
+  }
+
+  get depth(): number {
+    return this.#queue.depth;
+  }
+
+  get physicalDepth(): number {
+    return this.#queue.physicalDepth;
+  }
+
+  list(): readonly FleetWaiter[] {
+    return this.#queue.list().map((waiter) => asFleet(waiter));
+  }
+
+  places(): readonly QueuePlace[] {
+    return this.#queue.places();
+  }
+
+  pendingPlatforms(requesterId: string): readonly Platform[] {
+    return this.#queue.pendingPlatforms(requesterId);
+  }
+
+  pending(): readonly FleetWaiter[] {
+    return this.#queue.pending().map((waiter) => asFleet(waiter));
+  }
+
+  findPendingWaiter(requesterId: string, platform?: Platform): FleetWaiter | undefined {
+    return asFleet(this.#queue.findPendingWaiter(requesterId, platform));
+  }
+
+  create(
+    request: DeviceRequest,
+    options: LeaseRequestOptions,
+    id?: string,
+    priority = 0,
+  ): FleetWaiter {
+    const waiter = this.#queue.create(request, options, id);
+    this.#priorities.set(waiter, priority);
+    return asFleet(waiter);
+  }
+
+  markReleaseAtGrant(waiter: FleetWaiter): void {
+    this.#releaseAtGrant.add(waiter);
+  }
+
+  releasesAtGrant(waiter: FleetWaiter): boolean {
+    return this.#releaseAtGrant.has(waiter);
+  }
+
+  positionOf(waiter: FleetWaiter): number {
+    return this.#queue.positionOf(waiter as never);
+  }
+
+  enqueue(waiter: FleetWaiter): boolean {
+    return this.#queue.enqueue(waiter as never);
+  }
+
+  markProcessing(waiter: FleetWaiter): boolean {
+    return this.#queue.markProcessing(waiter as never);
+  }
+
+  isQueued(waiter: FleetWaiter): boolean {
+    return this.#queue.isQueued(waiter as never);
+  }
+
+  notifyProgress(waiter: FleetWaiter, progress: LeaseProgress): void {
+    this.#queue.notifyProgress(waiter as never, progress);
+  }
+
+  resolve(waiter: FleetWaiter, grant: FleetLeaseGrant): boolean {
+    return this.#queue.resolve(waiter as never, grant as never);
+  }
+
+  reject(waiter: FleetWaiter, error: Error): boolean {
+    return this.#queue.reject(waiter as never, error);
+  }
+
+  cancelAll(error: Error | ((waiter: FleetWaiter) => Error)): readonly FleetWaiter[] {
+    if (typeof error === "function") {
+      return this.#queue
+        .cancelAll((waiter) => error(asFleet(waiter)))
+        .map((waiter) => asFleet(waiter));
+    }
+    return this.#queue.cancelAll(error).map((waiter) => asFleet(waiter));
+  }
+}

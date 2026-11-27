@@ -1,0 +1,272 @@
+# How work flows
+
+The maintainer's guide to how work moves from an issue to `main`: what you
+do, what agents do, and where each step is defined. The binding rules are
+in [agent-rules/delivery.md](agent-rules/delivery.md); each skill and agent
+holds its own steps. This page links to them rather than restating them.
+
+## The model
+
+GitHub Issues is the spec and the queue. Every issue carries exactly one
+`<kind>:<state>` label, and agents act only on `bug:new` (to triage it,
+and to fix it when the fast track passes it), `bug:ready`, `task:ready`
+and `refactor:ready`. The body is the spec; a
+comment changes nothing until a spec session folds it in. A reporter's
+issue is never rewritten. After `ready`, state is read from GitHub itself
+(assignee, linked PR, closed).
+Issue `<n>` is built on branch `<kind>/<n>`.
+
+| Label             | Meaning                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `request:new`     | Inbox. Never picked up, body never edited.               |
+| `bug:new`         | An agent may triage it; the fast track may set it ready. |
+| `bug:needs-info`  | Could not reproduce. Waiting on the reporter.            |
+| `bug:ready`       | An agent may fix it.                                     |
+| `bug:blocked`     | Waiting on the maintainer to clear a blocker.            |
+| `feature:spec`    | Spec in progress, business and technical together.      |
+| `feature:planned` | Split into tasks. Never picked up itself.                |
+| `feature:blocked` | Waiting on the maintainer to clear a blocker.            |
+| `task:draft`      | Scope written; technical spec or its spec check missing. |
+| `task:ready`      | Spec checked; runs once its Depends on allow.            |
+| `task:blocked`    | Waiting on the maintainer to clear a blocker.            |
+| `refactor:new`    | A proposed refactor. Never picked up.                    |
+| `refactor:ready`  | An agent may build it; it needs no spec.                 |
+| `refactor:blocked` | Waiting on the maintainer to clear a blocker.           |
+
+## A bug
+
+1. A bug arrives as `bug:new`, and an agent may triage it from there.
+2. `triage-bug` (or `deliver` on a `bug:new` issue) reproduces it as a
+   failing test on `bug/<n>-repro` and posts one report comment (delivery
+   rule 8). If it cannot reproduce, it moves the issue to `bug:needs-info`.
+3. **Fast track** (delivery rule 17), only under `deliver`: the report
+   ends with five yes/no facts (a defect, the fix was tried, nothing
+   public added or broken, no ADR or rule changed, one fix). All `yes`:
+   `fast-track.mjs` sets `bug:ready` and `fast-track`, and the same run
+   goes on to step 5. `deliver #<n> no-fast-track` skips this.
+4. Otherwise the label stays `bug:new` and you read the report. Agree: add
+   `bug:ready`, which also accepts the shape the report proposes for a
+   gap. Disagree: reply and run `triage-bug` again; the new report
+   supersedes the old one.
+5. `deliver` builds the fix on `bug/<n>` from the repro branch, reviews it
+   and merges it. The triage test becomes the regression test. The gate
+   holds a fast-tracked fix that grew past 250 lines or 8 files, touches
+   a surface file (delivery rule 17 lists them), the protocol version or
+   an ADR, or needed a
+   `## Decision taken`: the PR stays open and ready with the reason in
+   its handoff. Merge it yourself, or remove `fast-track` from the issue,
+   re-add `bug:ready` and run `deliver` again.
+
+`gh issue list --label fast-track --state all` lists every bug that took
+the fast track. The limits are `MAX_LINES` and `MAX_FILES` at the top of
+`.agents/scripts/fast-track.mjs`, and the held paths `SURFACE_PATHS` in
+`.agents/scripts/surface-paths.mjs`.
+
+## A feature
+
+1. Create a `feature:spec` issue, or take up a `request:new` one: the spec
+   session creates the feature from it and links the two. The request
+   closes when the feature ships.
+2. Run `spec-session`. It explores first, then asks you, in rounds, the
+   decisions that are expensive to reverse, change scope or change what a
+   user sees, each with a recommended answer and an `Explain` option. It
+   takes the small ones itself and lists them. It never asks you a fact:
+   background explorers read the source for each one. Decisions that bind
+   more than one task become ADRs.
+3. It posts the feature with its design: tables of the behaviours, the
+   stored state, the interfaces between tasks and the existing code they
+   meet. `spec-checker` agents check the tables against the code, and it
+   fixes what they find. It asks you only about findings that need a
+   decision.
+4. You approve once, from a short summary: the feature, each ADR, the
+   decisions it took itself, a table of the tasks with their rows and
+   Depends on. You can leave after this.
+5. It writes the tasks, which only name the design's rows, has them
+   checked, and sets them `task:ready` and the feature `feature:planned`.
+   It comes back to you only for a finding that needs a decision. Move a
+   task back to `task:draft` to hold it.
+6. Run `deliver <feature>`. It delivers the tasks in dependency order, two
+   at a time, and merges the feature's PRs as one stack at the end.
+
+A session can stop part way: what is settled is written, the rest goes
+under Open questions, and the next session starts there.
+
+## A refactor
+
+A refactor moves or reshapes code and changes no behaviour, bugs
+included (delivery rule 18). It needs no spec session.
+
+1. Write a `refactor:new` issue from
+   [templates/refactor.md](templates/refactor.md): Why, Target shape, Out
+   of bounds, Done when. Set `refactor:ready` when you want it built.
+   The weekly `refactor` routine also opens these, from a measured target
+   only, and sets `refactor:ready` itself when rule 18's three conditions
+   hold; its PRs carry `auto-refactor`.
+2. `deliver #<n>` runs one `implementer` in `refactor` mode: pins first
+   (`*.pin.test.ts`, passing on the base, until `pnpm mutate --touched-by`
+   leaves no mutant alive), then the refactor, then the pins deleted.
+3. The review runs the code and claims lenses, no spec lens. The gate runs
+   `.agents/scripts/refactor-check.mjs`: tests unchanged, surface
+   unchanged, pins passed, mutants killed. A PR that passes merges without
+   you, whatever its size.
+
+A refactor that finds it must change behaviour stops with a handoff and
+asks for a task. `gh pr list --label auto-refactor --state merged` lists
+what the routine landed.
+
+## What `deliver` does, and when it stops
+
+`deliver` writes no code. It hands each stage to a background agent in
+`.claude/agents/` (`implementer`, `reviewer`, `hardware-verifier`) and
+reasons only over the report each returns. The implementer works
+one test at a time, each committed failing before the code that passes
+it, one fresh agent per mode (build, audit), and runs only
+the tests its change reaches; hooks and CI run every other check
+([toolchain.md](agent-rules/toolchain.md)).
+
+What you will see:
+
+- **`Assumption:` lines** in the PR body: small gaps the implementer closed
+  the conservative way. Reject one by replying.
+- **`## Decision taken` comments**: a choice a user would notice that
+  nobody made. The run takes the conservative option, notes it in the
+  issue body as pending you, and says how to reverse it. It does not stop
+  to ask.
+- **A parked issue with a `## Handoff` comment**: the run stops only for a
+  contradiction with a rule or an accepted ADR, a blocking review finding
+  still open after the last round, a slow-lane check that could not run,
+  or a gate refusal. A handoff that names a blocker moves the issue to
+  `<kind>:blocked`.
+- **One `## Delivery run` comment** at the end: merged, parked, waiting,
+  decided.
+
+What any change includes without its spec asking is listed once, in
+[always-in-scope.md](agent-rules/always-in-scope.md).
+
+## Review, hardware and merge
+
+- **Review.** Every PR leaves draft only after the independent spec, code
+  and claims reviews in [REVIEW.md](REVIEW.md). Notes go out as one
+  comment after the last round.
+- **Hardware.** A Done when line that needs a real device runs through
+  `verify-hardware` and the slow lane, one lane per machine (delivery rule
+  16). A PR whose lane could not run gets `needs-hardware` and waits for
+  you.
+- **Merge.** Agents merge only through `.agents/scripts/merge-pr.sh`
+  (delivery rule 15). A feature's PRs form one GitHub stack, its ADR PRs at
+  the bottom, and merge together, so `main` never holds half a feature.
+  The stack is kept current by `.agents/scripts/stack-sync.sh`, which
+  merges forward bottom to top and never rebases, so no human has to
+  force-push. A bug merges on its own.
+- The same reviews run on a person's PR when you ask; the agent posts the
+  findings as a comment and pushes nothing.
+
+## Automated and manual
+
+`.github/workflows/issue-state.yml` makes the mechanical transitions:
+
+- adding a state label removes the previous one;
+- an emptied Technical spec sends a `task:ready` task back to `task:draft`;
+- a reporter's reply moves `bug:needs-info` back to `bug:new`, and two
+  silent weeks close it;
+- a closed last sub-issue closes its feature as completed (reopen it if a
+  completion condition does not hold), and a completed feature closes its
+  request;
+- a closed PR, or a claim silent for three days, releases the claim;
+- a PR from `<kind>/<n>` must close `#<n>` and nothing else.
+
+One transition stays manual, one click: `bug:new` → `bug:ready`, after
+you read the triage report of a bug the fast track did not pass. Flipping a closed feature's
+ADRs to _Accepted_ (delivery rule 10) is yours too, unless delivery did it.
+
+## Your inbox
+
+`node .agents/scripts/inbox.mjs` lists everything that waits on you, each
+with the one action it needs: triage reports to read, blockers, PRs to
+review or merge, issues with no state label, work that needs a spec
+session, work `deliver` may start, and decisions delivery took that are
+still marked pending. `--save` records the list, and the next run marks
+what is new.
+
+Two scheduled tasks in T3 Code use it, so you do not have to ask. **Inbox**
+runs it every hour in one thread, labels reports that arrived with no
+label `bug:new` or `request:new`, and posts only when the list changed;
+reply there with the numbers to start, and it opens one thread per item.
+**Bug sweep** runs `deliver` every hour on the oldest `bug:new` that has
+no triage report, one bug at a time.
+
+## Watching the pipeline
+
+`node .agents/scripts/delivery-stats.mjs` prints one row per week for the
+last five: blocking findings per review raised and fixed, notes, PRs
+needing a second round, median hours to merge, rounds and tokens,
+handoffs. `--since <date>` lists PRs; `--calibration` prints the last four
+weeks' rejected findings, to read when a review's confirmation rate drops. `delivery-counters.mjs --since
+<date>` prints the per-PR counters the process review judges delivery
+changes by (CI lines sent to fix runs, stack syncs, empty builds, fix runs
+that changed nothing, tests per Tests line), and `instruction-reads.mjs`
+how often each role opens each rule, brief and manual. Change one thing in
+the pipeline at a time and compare the rows before and after.
+
+Weekly routines keep the suite and the reviews in shape: `harden-tests`,
+`audit-tests`, `garden-comments` and `refactor`
+([toolchain.md](agent-rules/toolchain.md) "Routines"). `check-upstream`
+reads every `upstream` issue's `## Waiting on upstream` links each week
+and comments when they are fixed in a release; you move the issue back to
+the label it came from.
+
+## `main` and releases
+
+`main` takes changes only through a PR whose Quality, Fallow and Console
+checks passed. It is a GitHub ruleset that binds agents and you alike.
+
+A release is cut by hand from the Release workflow
+(`.github/workflows/release.yml`): Actions → Release → Run workflow on
+`main`, choosing `feature` (the next 0.X), `patch` (the next 0.X.Y) or
+`auto` (`feature` when a commit since the last tag is a `feat` or a
+breaking change, else `patch`). There is no semantic versioning. The run
+checks that main's CI passed on the commit, builds both packages (`simlock`
+and `@simlock/e2e`, one version) on macOS so both iOS capture programs ship,
+pushes the release commit (both `package.json` files, `CHANGELOG.md`) and the
+tag `v0.X.Y`, publishes the same tarballs to npm, `@simlock/e2e` first,
+through trusted publishing with provenance (a re-run skips a package whose
+version is already on npm), creates the GitHub release with both tarballs
+attached, and deploys the website from the release commit.
+`dry_run` stops after the build. The version and changelog arithmetic is
+`node scripts/release.mjs`, tested in `src/release-script.test.ts`. Agents
+cannot start the workflow (`gh workflow run` is denied in
+`.claude/settings.json`).
+
+The website deploys with every release and by hand (Actions → Website → Run
+workflow, optionally from a commit or tag), and no longer on every push to
+`main`, so the site describes the version on npm.
+
+## Where ADRs fit
+
+A feature answers _what_ and _why_; a task answers _how_ for one PR; an ADR
+answers _how_ only for a choice that binds more than one task or is
+expensive to reverse. Its status follows the feature (delivery rule 10).
+See [adr/README.md](adr/README.md).
+
+## Moving the agent kit to another project
+
+The agents, skills, briefs, scripts, `delivery.md`, `testing.md`, the
+templates and the issue-state workflow and labels hold no fact about this
+project. To move them, copy those, then write the new project's
+`toolchain.md`, `always-in-scope.md` and its own rules, rewrite
+`worktree.sh` and `ensure-pnpm.sh` for its package manager, and change
+`tool-guard.mjs`'s list of checks and `surface-paths.mjs`'s `SURFACE_PATHS`.
+
+## Where things live
+
+| What                      | Where                                                                    |
+| ------------------------- | ------------------------------------------------------------------------ |
+| Rules                     | [agent-rules/](agent-rules/)                                             |
+| Spec templates            | [templates/](templates/)                                                 |
+| Skills (what you run)     | `.claude/skills/`                                                        |
+| Agents (stages, reviewers) | `.claude/agents/`                                                        |
+| Stage and review briefs   | `.agents/briefs/`                                                        |
+| Scripts and hooks         | `.agents/scripts/` (hooks wired in `.claude/settings.json`), `scripts/` |
+| Labels and reporter forms | `.github/labels.json`, `.github/ISSUE_TEMPLATE/`                         |
+| Issue automation          | `.github/workflows/issue-state.yml`                                      |
+| Releases                  | `.github/workflows/release.yml`                                          |

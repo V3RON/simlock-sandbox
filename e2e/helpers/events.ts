@@ -1,0 +1,68 @@
+import { cli } from "./cli.js";
+import { waitFor } from "./wait.js";
+
+export interface RecordedEvent {
+  readonly id: string;
+  readonly timestamp: number;
+  readonly event: string;
+  readonly payload: unknown;
+  readonly module: string;
+}
+
+export async function events(
+  env: NodeJS.ProcessEnv,
+  since = "1h",
+  timeout?: number,
+  cliPrefix: readonly string[] = [],
+): Promise<RecordedEvent[]> {
+  const result = await cli(
+    [...cliPrefix, "events", "--since", since],
+    env,
+    timeout === undefined ? {} : { timeout },
+  );
+  if (result.code !== 0) {
+    throw new Error(`simlock events failed (exit ${String(result.code)}): ${result.stderr}`);
+  }
+  return result.stdout
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as RecordedEvent);
+}
+
+export async function expectEvents(
+  env: NodeJS.ProcessEnv,
+  expectedNames: readonly string[],
+  options: { readonly since?: string; readonly timeout?: number } = {},
+  cliPrefix: readonly string[] = [],
+): Promise<RecordedEvent[]> {
+  let recorded: RecordedEvent[] = [];
+  await waitFor(
+    async () => {
+      recorded = await events(env, options.since, undefined, cliPrefix);
+      return containsOrderedSubsequence(
+        recorded.map((entry) => entry.event),
+        expectedNames,
+      );
+    },
+    {
+      timeout: options.timeout ?? 15_000,
+      label: () =>
+        `expected event sequence [${expectedNames.join(", ")}], last saw [${recorded
+          .map((entry) => entry.event)
+          .join(", ")}]`,
+    },
+  );
+  return recorded;
+}
+
+function containsOrderedSubsequence(
+  haystack: readonly string[],
+  needle: readonly string[],
+): boolean {
+  let index = 0;
+  for (const name of haystack) {
+    if (index >= needle.length) break;
+    if (name === needle[index]) index += 1;
+  }
+  return index === needle.length;
+}

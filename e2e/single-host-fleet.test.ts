@@ -1,0 +1,168 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+import { type TestEnv, waitFor, withDaemon, withHttpDaemon } from "./helpers/index.js";
+
+async function instanceId(env: TestEnv): Promise<string> {
+  const stored = JSON.parse(await readFile(join(env.home, "instance.json"), "utf8")) as {
+    instanceId: string;
+  };
+  return stored.instanceId;
+}
+
+interface HttpHost {
+  readonly env: TestEnv;
+  readonly baseUrl: string;
+  readonly operatorAuth: { readonly authorization: string };
+  readonly agentAuth: { readonly authorization: string };
+}
+
+async function httpHost(): Promise<HttpHost> {
+  const { env, port } = await withHttpDaemon((port) => ({
+    configOverrides: { http: { enabled: true, host: "127.0.0.1", port } },
+  }));
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const bearer = async (role: string) => {
+    const minted = await env.cli(["token", "create", "--role", role]);
+    expect(minted.code).toBe(0);
+    return { authorization: `Bearer ${(minted.json as { secret: string }).secret}` };
+  };
+  const operatorAuth = await bearer("operator");
+  const agentAuth = await bearer("agent");
+  await waitFor(
+    async () => {
+      try {
+        return (await fetch(`${baseUrl}/v1/healthz`)).ok;
+      } catch {
+        return false;
+      }
+    },
+    { label: "HTTP listener accepting connections" },
+  );
+  return { agentAuth, baseUrl, env, operatorAuth };
+}
+
+describe("a single host as a fleet of one", () => {
+  it("simlock worker list against a worker waits for the reading, then sees the worker line, its Load line and its Baselines line", async () => {
+    const env = await withDaemon({ configOverrides: { gateway: { label: "mac-mini-1" } } });
+    const id = await instanceId(env);
+
+    await waitFor(
+      async () => {
+        const read = await env.cli(["worker", "list", "--json"]);
+        const workers = (read.json as { workers?: { load?: unknown }[] }).workers;
+        return workers?.[0]?.load !== undefined;
+      },
+      { label: "the worker's first load reading" },
+    );
+    const text = await env.cli(["worker", "list"]);
+    const json = await env.cli(["worker", "list", "--json"]);
+
+    expect(text.code).toBe(0);
+    const lines = text.stdout.trim().split("\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(new RegExp(`^${id} \\(mac-mini-1\\): connected -- `));
+    expect(lines[1]).toMatch(/^ {2}Load: .*memory .*read \d+s ago$/);
+    expect(lines[2]).toBe("  Baselines: none");
+    expect(json.code).toBe(0);
+    expect(json.json).toMatchObject({
+      workers: [{ connection: "connected", drained: false, id, label: "mac-mini-1" }],
+    });
+  });
+
+  it("without a gateway on the machine, worker drain exits 2 with UNSUPPORTED_IN_WORKER_MODE and no hint", async () => {
+    const env = await withDaemon();
+    const id = await instanceId(env);
+
+    const result = await env.cli(["worker", "drain", id]);
+
+    expect(result.code).toBe(2);
+    expect(result.stdout).toBe("");
+    expect(result.error).toEqual({
+      code: "UNSUPPORTED_IN_WORKER_MODE",
+      message: "worker.drain acts on a gateway's workers, and this daemon is not a gateway",
+    });
+  });
+
+  it("GET /v1/workers on a worker answers 200 with one worker for an operator token", async () => {
+    const host = await httpHost();
+    const id = await instanceId(host.env);
+    const status = (await host.env.cli(["status", "--json"])).json as {
+      capacity: unknown;
+      host: unknown;
+    };
+
+    const response = await fetch(`${host.baseUrl}/v1/workers`, { headers: host.operatorAuth });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { workers: Record<string, unknown>[] };
+    expect(body.workers).toHaveLength(1);
+    expect(body.workers[0]).toMatchObject({
+      capacity: status.capacity,
+      connection: "connected",
+      drained: false,
+      host: status.host,
+      id,
+    });
+  });
+
+  it("GET /v1/workers on a worker answers 403 for an agent token", async () => {
+    const host = await httpHost();
+
+    const response = await fetch(`${host.baseUrl}/v1/workers`, { headers: host.agentAuth });
+
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe("FORBIDDEN");
+  });
+
+  it("GET /v1/inbox on a worker answers 200 with its items for an operator token and 403 for an agent token", async () => {
+    const host = await httpHost();
+
+    const operator = await fetch(`${host.baseUrl}/v1/inbox`, { headers: host.operatorAuth });
+    const agent = await fetch(`${host.baseUrl}/v1/inbox`, { headers: host.agentAuth });
+
+    expect(operator.status).toBe(200);
+    expect(await operator.json()).toEqual({ items: [] });
+    expect(agent.status).toBe(403);
+    expect(((await agent.json()) as { error: { code: string } }).error.code).toBe("FORBIDDEN");
+  });
+
+  it("POST /v1/workers/{id}/drain on a worker answers 501 UNSUPPORTED_IN_WORKER_MODE", async () => {
+    const host = await httpHost();
+    const id = await instanceId(host.env);
+
+    const response = await fetch(`${host.baseUrl}/v1/workers/${id}/drain`, {
+      headers: host.operatorAuth,
+      method: "POST",
+    });
+
+    expect(response.status).toBe(501);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "UNSUPPORTED_IN_WORKER_MODE",
+        message: expect.any(String),
+        operation: "worker.drain",
+      },
+    });
+  });
+
+  it("POST /v1/components/install with workers on a worker answers 501", async () => {
+    const host = await httpHost();
+    await host.env.driverLog.clear();
+
+    const response = await fetch(`${host.baseUrl}/v1/components/install`, {
+      body: JSON.stringify({ platform: "ios", version: "26.0", workers: "all" }),
+      headers: { ...host.operatorAuth, "content-type": "application/json" },
+      method: "POST",
+    });
+
+    expect(response.status).toBe(501);
+    expect(await response.json()).toMatchObject({
+      error: { code: "UNSUPPORTED_IN_WORKER_MODE", operation: "worker.install-component" },
+    });
+    const calls = await host.env.driverLog.calls();
+    expect(calls.some((call) => call.operation === "installComponent")).toBe(false);
+  });
+});

@@ -1,0 +1,247 @@
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { resolveRequesterId } from "../agent-identity/index.js";
+import type { SimlockClient } from "../client/index.js";
+import { gatewayNotPresentError } from "../contract/index.js";
+import {
+  launcherFor,
+  NodeFilesystem,
+  NodeIpcTransport,
+  NodeProcessRunner,
+  productionServiceManager,
+  resolveDaemonHome,
+  resolveDaemonSocketPath,
+  resolveSimlockHome,
+  SystemClock,
+  type Clock,
+  type DaemonFlag,
+  type ServiceManager,
+  type WebSocketClientConnector,
+} from "../ports/index.js";
+import { connectToFarm, connectToRunningDaemon, connectWithAutoLaunch } from "./connect.js";
+import { McpSession } from "./session.js";
+import { createMcpServer } from "./server.js";
+
+interface Signals {
+  on(signal: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+  off(signal: "SIGINT" | "SIGTERM", listener: () => void): unknown;
+}
+
+interface StdinLifecycle {
+  off(event: "end", listener: () => void): unknown;
+  once(event: "end", listener: () => void): unknown;
+  readonly readableEnded?: boolean;
+}
+
+export interface McpTransport {
+  close(): Promise<void>;
+  onclose?: () => void;
+}
+
+export interface McpStdioEnvironment {
+  readonly clock?: Clock;
+  readonly connect?: () => Promise<SimlockClient>;
+  /** why: The renew timer's connect (ADR 0004 §2) -- never launches a daemon. Falls back only to
+   * the non-launching default, never to `connect`, so injecting `connect` alone cannot hand
+   * the timer an auto-launching path; a test that wants both usually injects both. */
+  readonly connectForRenew?: () => Promise<SimlockClient>;
+  readonly createServer?: (session: McpSession, options: { readonly clock: Clock }) => McpServer;
+  readonly createTransport?: () => McpTransport;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly daemonFlag?: DaemonFlag;
+  readonly requesterId?: string;
+  readonly remote?: {
+    readonly url: string;
+    readonly token: string;
+    readonly allowInsecureHttp: boolean;
+  };
+  readonly webSocket?: WebSocketClientConnector;
+  readonly serviceManager?: ServiceManager;
+  readonly signals?: Signals;
+  /** why: The stdio transport currently does not surface stdin EOF as onclose. */
+  readonly stdin?: StdinLifecycle;
+}
+
+export interface McpStdioRunner {
+  readonly shutdown: () => Promise<void>;
+  readonly finished: Promise<void>;
+}
+
+export async function runMcpStdio(environment: McpStdioEnvironment = {}): Promise<void> {
+  const runner = await startMcpStdio(environment);
+  await runner.finished;
+}
+
+export async function startMcpStdio(
+  environment: McpStdioEnvironment = {},
+): Promise<McpStdioRunner> {
+  const env = environment.env ?? process.env;
+  const requesterId = environment.requesterId ?? resolveRequesterId(env, `mcp:${process.pid}`);
+  // why: One `Clock` for the whole frontend: the session's renew timer and the auto-launch retry
+  // loop must not be able to disagree about what time it is (architecture rule 9).
+  const clock = environment.clock ?? new SystemClock();
+  const remote = environment.remote;
+  const defaults =
+    remote === undefined
+      ? defaultEnvironment(requesterId, clock, environment.daemonFlag, environment.serviceManager)
+      : farmEnvironment(remote, clock, environment.webSocket);
+  const session = new McpSession({
+    clock,
+    ...(remote === undefined ? {} : { farm: { origin: remote.url, requesterId } }),
+    connect: environment.connect ?? defaults.connect,
+    // why: Never falls back to `connect`: that one may auto-launch a daemon, and ADR 0004 §2 is
+    // explicit that the renew timer must not -- an embedder supplying only `connect` gets the
+    // non-launching default rather than a timer that could undo an operator's `daemon stop`.
+    connectForRenew: environment.connectForRenew ?? defaults.connectForRenew,
+  });
+  const server = (environment.createServer ?? createMcpServer)(session, { clock });
+  const transport = (environment.createTransport ?? defaults.createTransport)();
+  const signals = environment.signals ?? process;
+  const stdin = environment.stdin ?? process.stdin;
+  let resolveFinished!: () => void;
+  const finished = new Promise<void>((resolve) => {
+    resolveFinished = resolve;
+  });
+  let shutdownPromise: Promise<void> | undefined;
+  // why: Guards synchronous re-entrancy, not just repeated calls after the fact: the SDK's
+  // own transport.close() can invoke `onclose` synchronously, inside the same call
+  // stack that reaches it via `server.close()` below -- at that point `shutdownPromise
+  // ??= ...` has not finished assigning yet (the assignment happens only after the IIFE
+  // it calls returns a promise), so a plain `??=` guard re-enters and recurses until the
+  // stack overflows. Setting this flag as the very first synchronous statement closes
+  // that window: a re-entrant call sees it immediately and returns `shutdownPromise` as
+  // it stands (possibly still `undefined` at that exact instant, which is fine -- the
+  // caller that reached us via `onclose` doesn't await the result).
+  let shuttingDown = false;
+  let serverConnectStarted = false;
+
+  const onSignal = () => {
+    void shutdown();
+  };
+  const onStdinEnd = () => {
+    void shutdown();
+  };
+  const previousTransportOnClose = transport.onclose;
+  transport.onclose = () => {
+    previousTransportOnClose?.();
+    void shutdown();
+  };
+  const shutdown = (): Promise<void> => {
+    if (shuttingDown) return shutdownPromise ?? Promise.resolve();
+    shuttingDown = true;
+    shutdownPromise = (async () => {
+      signals.off("SIGINT", onSignal);
+      signals.off("SIGTERM", onSignal);
+      stdin.off("end", onStdinEnd);
+      // why: McpServer owns its transport once connect starts; its close() closes the
+      // transport and fires onclose. Close a never-connected transport ourselves.
+      await Promise.allSettled([
+        session.close(),
+        server.close(),
+        ...(serverConnectStarted ? [] : [transport.close()]),
+      ]);
+      resolveFinished();
+    })();
+    return shutdownPromise;
+  };
+
+  signals.on("SIGINT", onSignal);
+  signals.on("SIGTERM", onSignal);
+  stdin.once("end", onStdinEnd);
+  if (stdin.readableEnded) {
+    await shutdown();
+    return { finished, shutdown };
+  }
+  try {
+    serverConnectStarted = true;
+    await server.connect(transport as never);
+  } catch (error: unknown) {
+    await shutdown();
+    throw error;
+  }
+
+  return { finished, shutdown };
+}
+
+// why: against a farm both triggers connect the same way and nothing launches, so a tool call and a renewal cannot differ in power (ADR 0081 §3).
+function farmEnvironment(
+  remote: {
+    readonly url: string;
+    readonly token: string;
+    readonly allowInsecureHttp: boolean;
+  },
+  clock: Clock,
+  webSocket: WebSocketClientConnector | undefined,
+): Required<Pick<McpStdioEnvironment, "connect" | "connectForRenew" | "createTransport">> {
+  const connect = () =>
+    connectToFarm({
+      allowInsecureHttp: remote.allowInsecureHttp,
+      clock,
+      token: remote.token,
+      url: remote.url,
+      webSocket,
+    });
+  return { connect, connectForRenew: connect, createTransport: () => new StdioServerTransport() };
+}
+
+function defaultEnvironment(
+  requesterId: string,
+  clock: Clock,
+  flag: DaemonFlag,
+  injectedServiceManager: ServiceManager | undefined,
+): Required<Pick<McpStdioEnvironment, "connect" | "connectForRenew" | "createTransport">> {
+  const root = resolveSimlockHome();
+  const filesystem = new NodeFilesystem();
+  const ipc = new NodeIpcTransport();
+  const serviceManager =
+    injectedServiceManager ??
+    productionServiceManager(process.platform, {
+      runner: new NodeProcessRunner(),
+      filesystem,
+      uid: process.getuid?.() ?? 0,
+    });
+  // why: resolved on every connect, so a gateway started after this session began is found, and
+  // a throw (an over-long `SIMLOCK_HOME`, a missing gateway) is a tool error rather than a dead
+  // server and a raw stack trace on the stdio channel an MCP client is speaking protocol over.
+  const daemonHome = async () => {
+    const home = await resolveDaemonHome({ root, flag, filesystem });
+    if (flag === "gateway" && !home.gatewayPresent) throw gatewayNotPresentError();
+    return home;
+  };
+  return {
+    // why: The tool-call trigger: auto-launches a daemon that is not running, exactly as the CLI
+    // does. ADR 0004 §2/§4: the session keeps its lease alive with its own `lease.renew` timer
+    // and releases explicitly when the agent goes away (stdin EOF -> session.close()), so it
+    // declares no daemon-initiated heartbeat -- there is none left to declare.
+    connect: async () => {
+      const { dataDirectory, role } = await daemonHome();
+      return connectWithAutoLaunch({
+        clock,
+        ipc,
+        launcher: launcherFor({
+          role,
+          root,
+          dataDirectory,
+          mainPath: join(dirname(fileURLToPath(import.meta.url)), "../daemon/main.js"),
+          serviceManager,
+          notify: (line) => process.stderr.write(`${line}\n`),
+        }),
+        principal: requesterId,
+        socketPath: resolveDaemonSocketPath(dataDirectory),
+      });
+    },
+    // why: The renew timer's trigger: connects to a daemon that is already listening and never
+    // launches one, so an operator's `simlock daemon stop` is not undone by an idle session
+    // (ADR 0004 §2).
+    connectForRenew: async () =>
+      connectToRunningDaemon({
+        ipc,
+        principal: requesterId,
+        socketPath: resolveDaemonSocketPath((await daemonHome()).dataDirectory),
+      }),
+    createTransport: () => new StdioServerTransport(),
+  };
+}

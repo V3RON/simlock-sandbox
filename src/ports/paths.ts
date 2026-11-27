@@ -1,0 +1,153 @@
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import { join, posix, resolve } from "node:path";
+
+import type { Filesystem } from "./filesystem.js";
+
+/**
+ * why: Resolves simlock's data directory (config.json, state.db, daemon.sock (a named pipe instead on Windows, so no file), daemon.log,
+ * and the device roots under `devices/`). `SIMLOCK_HOME` overrides the default
+ * `~/.simlock` -- used by tests that need an isolated data directory per daemon instance,
+ * and by anyone running multiple independent simlock installs on one machine.
+ *
+ * A relative `SIMLOCK_HOME` is resolved here, once, against the process that read it.
+ * Everything else derived from it would otherwise appear to work -- Node resolves a
+ * relative path against the cwd on every call -- while the device root derived from it
+ * would be refused `not-absolute`, silently costing a platform for a reason nobody is
+ * looking at. It also means the daemon and the CLI that auto-launched it agree on one
+ * directory even if they are standing somewhere different.
+ */
+export function resolveSimlockHome(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.SIMLOCK_HOME;
+  return configured === undefined ? join(homedir(), ".simlock") : resolve(configured);
+}
+
+/**
+ * why: The longest AF_UNIX socket path the kernel accepts, in bytes, excluding the trailing
+ * NUL: `sun_path` is 104 bytes on macOS and the BSDs and 108 on Linux. Windows has no such
+ * limit because it listens on a named pipe, not a socket file.
+ */
+function maxSocketPathLength(platform: NodeJS.Platform): number {
+  return (platform === "linux" ? 108 : 104) - 1;
+}
+
+// why: `String.raw` cannot end in a backslash (it escapes the closing backtick), so the prefix is written out.
+const PIPE_PREFIX = "\\\\.\\pipe\\";
+
+/**
+ * why: Node on Windows listens only on a named pipe, and `listen` on a file path there fails
+ * with `EACCES`. A pipe is not a file: `stat` on a live one fails with `EBUSY`, it cannot be
+ * removed, and it is gone when its server closes, so callers must not treat it as one.
+ */
+export function isPipeEndpoint(endpoint: string): boolean {
+  return endpoint.startsWith(PIPE_PREFIX);
+}
+
+/**
+ * why: Pipe names share one machine-wide namespace, so the name is derived from the data
+ * directory: two daemons with different `SIMLOCK_HOME`s never collide. Lower-cased because
+ * Windows paths are case-insensitive and one directory must keep one name.
+ */
+function windowsPipeName(dataDirectory: string): string {
+  const digest = createHash("sha256").update(dataDirectory.toLowerCase()).digest("hex");
+  return `${PIPE_PREFIX}simlock-${digest.slice(0, 16)}`;
+}
+
+export class SocketPathTooLongError extends Error {
+  constructor(
+    readonly path: string,
+    readonly maxLength: number,
+  ) {
+    super(
+      `Daemon socket path is ${Buffer.byteLength(path)} bytes, but this platform allows at most ${maxLength}: ${path}. ` +
+        `Point SIMLOCK_HOME at a shorter directory.`,
+    );
+    this.name = "SocketPathTooLongError";
+  }
+}
+
+/**
+ * why: Where the daemon listens under a data directory: `<data dir>/daemon.sock`, or a named
+ * pipe on Windows. Checked here, once, for every process that derives it: a path past the
+ * kernel's limit otherwise fails on connect as a bare `EINVAL`, which says nothing about
+ * `SIMLOCK_HOME` being the cause.
+ */
+export function resolveDaemonSocketPath(
+  dataDirectory: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform === "win32") return windowsPipeName(dataDirectory);
+  // why: past the pipe, the platform is POSIX, so the path is too, whatever host computes it.
+  const socketPath = posix.join(dataDirectory, "daemon.sock");
+  const maxLength = maxSocketPathLength(platform);
+  if (Buffer.byteLength(socketPath) > maxLength) {
+    throw new SocketPathTooLongError(socketPath, maxLength);
+  }
+  return socketPath;
+}
+
+export type DaemonRole = "worker" | "gateway";
+
+export type DaemonFlag = "gateway" | "local" | undefined;
+
+export interface DaemonHome {
+  readonly role: DaemonRole;
+  readonly dataDirectory: string;
+  readonly gatewayPresent: boolean;
+}
+
+/**
+ * why: owner-only, because every socket peer counts as the same OS user and the directory's
+ * mode is what keeps other users away from the socket and the files beside it. Whoever creates
+ * the data directory gives it, and any parent it creates on the way, this mode: a gateway made
+ * first leaves `<root>` owner-only too, which is the worker's data directory.
+ */
+export const DATA_DIRECTORY_MODE = 0o700;
+
+export function daemonDataDirectory(root: string, role: DaemonRole): string {
+  return role === "gateway" ? join(root, "gateway") : root;
+}
+
+/** why: `exists` treats only a missing path as absent; a root whose `gateway` is a file is just as absent. */
+async function existsOrAbsent(
+  filesystem: Pick<Filesystem, "exists">,
+  path: string,
+): Promise<boolean> {
+  try {
+    return await filesystem.exists(path);
+  } catch (error: unknown) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ENOTDIR"
+    ) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+// why: the one place the folder choice lives (ADR 0034); the daemon never calls it, it derives its folder from its role.
+export async function resolveDaemonHome({
+  filesystem,
+  flag,
+  root,
+}: {
+  readonly root: string;
+  readonly flag: DaemonFlag;
+  readonly filesystem: Pick<Filesystem, "exists">;
+}): Promise<DaemonHome> {
+  const gatewayFolder = daemonDataDirectory(root, "gateway");
+  const gatewayPresent =
+    (await existsOrAbsent(filesystem, join(gatewayFolder, "instance.json"))) ||
+    (await existsOrAbsent(filesystem, join(gatewayFolder, "config.json")));
+  const role: DaemonRole =
+    flag === "gateway" ||
+    (flag === undefined &&
+      gatewayPresent &&
+      !(await existsOrAbsent(filesystem, join(root, "instance.json"))))
+      ? "gateway"
+      : "worker";
+  return { role, dataDirectory: daemonDataDirectory(root, role), gatewayPresent };
+}

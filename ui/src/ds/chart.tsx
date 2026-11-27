@@ -1,0 +1,200 @@
+// why: every colour comes from the stylesheet, by class, so both themes apply and nothing sets a
+// `<style>` element.
+import "./chart.css";
+
+import type { CSSProperties } from "react";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  type TooltipContentProps,
+  XAxis,
+  YAxis,
+} from "recharts";
+import type { NameType, ValueType } from "recharts/types/component/DefaultTooltipContent";
+
+import { Panel } from "./panel";
+
+export interface MinuteCount {
+  readonly at: number;
+  readonly label: string;
+  readonly count: number | null;
+}
+
+const HEIGHT = 240;
+const MARGIN = { bottom: 0, left: 0, right: 8, top: 8 };
+const COMPACT_MARGIN = { bottom: 0, left: 0, right: 0, top: 0 };
+
+export function MinuteChart(props: {
+  readonly kind: "area" | "columns";
+  readonly title: string;
+  readonly unit: string;
+  readonly minutes: readonly MinuteCount[];
+  readonly height?: number | `${number}%`;
+  readonly tickGap?: number;
+  // why: bars alone, with no axes or grid, the last one marked: a strip that sits in a card's header.
+  readonly compact?: boolean;
+}) {
+  const { compact = false, height = HEIGHT, kind, minutes, tickGap = 24, title, unit } = props;
+  const data = [...minutes];
+  const axes = (
+    <>
+      {compact ? null : (
+        <>
+          <CartesianGrid vertical={false} />
+          <XAxis
+            dataKey="label"
+            tickLine={false}
+            minTickGap={tickGap}
+            interval="preserveStartEnd"
+          />
+          <YAxis allowDecimals={false} tickLine={false} axisLine={false} width={32} />
+        </>
+      )}
+      <Tooltip
+        cursor={kind === "area" ? true : { className: "chart-cursor" }}
+        isAnimationActive={false}
+        filterNull={false}
+        content={(content) => <MinuteTip content={content} unit={unit} />}
+      />
+    </>
+  );
+  return (
+    <div className={`chart chart-${kind}${compact ? " chart-compact" : ""}`}>
+      <ResponsiveContainer width="100%" height={height}>
+        {kind === "area" ? (
+          <AreaChart data={data} margin={MARGIN} title={title}>
+            {axes}
+            <Area
+              dataKey="count"
+              name={unit}
+              type="monotone"
+              isAnimationActive={false}
+              className="chart-series"
+              activeDot={{ className: "chart-dot", r: 4 }}
+            />
+          </AreaChart>
+        ) : (
+          <BarChart
+            data={data}
+            margin={compact ? COMPACT_MARGIN : MARGIN}
+            barCategoryGap={compact ? 2 : "10%"}
+            title={title}
+          >
+            {axes}
+            <Bar dataKey="count" name={unit} isAnimationActive={false} className="chart-series" />
+          </BarChart>
+        )}
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function MinuteTip({
+  content,
+  unit,
+}: {
+  readonly content: TooltipContentProps<ValueType, NameType>;
+  readonly unit: string;
+}) {
+  const { active, label, payload } = content;
+  const value = payload[0]?.value;
+  if (active !== true) return null;
+  return (
+    <div className="chart-tip">
+      <span className="chart-tip-label">{label}</span>{" "}
+      {value === null || value === undefined ? `${unit}: no data` : `${value} ${unit}`}
+    </div>
+  );
+}
+
+function columnOf(bucketMs: number): string {
+  if (bucketMs >= 3_600_000) return "Hour";
+  return bucketMs <= 60_000 ? "Minute" : "Time";
+}
+
+export function MinuteTable(props: {
+  readonly minutes: readonly MinuteCount[];
+  readonly heading: string;
+  readonly bucketMs?: number;
+}) {
+  const { bucketMs = 60_000, heading, minutes } = props;
+  return (
+    // why: a table grows to its rows whatever its height, so the hiding is on a wrapper.
+    <div className="visually-hidden">
+      <table className="chart-data">
+        <caption>{heading}</caption>
+        <thead>
+          <tr>
+            <th scope="col">{columnOf(bucketMs)}</th>
+            <th scope="col" className="num">
+              {heading}
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {[...minutes].reverse().map((minute) => (
+            <tr key={minute.at}>
+              <td data-label={columnOf(bucketMs)} className="mono">
+                {minute.label}
+              </td>
+              <td data-label={heading} className="num">
+                {minute.count ?? "—"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// why: the Overview and Usage draw a minute series the same way: the chart, its one-line summary
+// and the table of the same numbers, both for a reader who cannot see it; the table is not drawn.
+export function ChartPanel(props: {
+  readonly chart: {
+    readonly title: string;
+    readonly unit: string;
+    readonly heading: string;
+    readonly summary: string;
+    readonly bucketMs: number;
+    readonly points: readonly MinuteCount[];
+  };
+}) {
+  const { bucketMs, heading, points, summary, title, unit } = props.chart;
+  return (
+    <Panel title={title}>
+      <MinuteChart kind="area" title={title} unit={unit} minutes={points} />
+      <p className="chart-summary">{summary}</p>
+      <MinuteTable minutes={points} heading={heading} bucketMs={bucketMs} />
+    </Panel>
+  );
+}
+
+// why: a row of columns for a series whose numbers are printed or tabled elsewhere, so it is hidden
+// from a screen reader; each height arrives as a custom property, which the CSP allows where a style
+// attribute is not. The newest column is the accent: it is "now".
+export function Bars({
+  values,
+  label,
+}: {
+  readonly values: readonly (number | null)[];
+  readonly label: string;
+}) {
+  const top = Math.max(1, ...values.map((value) => value ?? 0));
+  return (
+    <span className="bars" aria-hidden="true" data-label={label}>
+      {values.map((value, index) => (
+        <span
+          key={index}
+          className={index === values.length - 1 ? "bar bar-now" : "bar"}
+          style={{ "--bar": `${Math.max(2, ((value ?? 0) / top) * 100)}%` } as CSSProperties}
+        />
+      ))}
+    </span>
+  );
+}

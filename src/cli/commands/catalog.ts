@@ -1,0 +1,101 @@
+import { deviceClassSchema } from "../../contract/index.js";
+import { connectDaemonClient } from "../connect.js";
+import { escapeControl as esc } from "../escape.js";
+import { commandArgs, UsageError, writeResult } from "../args.js";
+import type { CatalogGetOutput } from "../../admin/index.js";
+import type { CommandContext } from "../tree.js";
+
+const DEVICE_CLASS_ORDER: readonly string[] = deviceClassSchema.options;
+
+async function run(
+  argv: readonly string[],
+  { environment, token }: CommandContext,
+): Promise<number> {
+  const values = commandArgs(argv, {
+    help: { type: "boolean", short: "h" },
+    json: { type: "boolean" },
+    platform: { type: "string" },
+  });
+  if (values.help) {
+    environment.stdout.write("Usage: simlock catalog [--platform <ios|android>] [--json]\n");
+    return 0;
+  }
+  if (values.platform !== undefined && values.platform !== "ios" && values.platform !== "android")
+    throw new UsageError("catalog --platform must be ios or android");
+  const platform = values.platform as "ios" | "android" | undefined;
+  const client = await connectDaemonClient(environment, token);
+  try {
+    const response = await client.getCatalog(platform === undefined ? {} : { platform });
+    if (values.json) writeResult((value) => environment.stdout.write(value), response);
+    else environment.stdout.write(`${formatCatalog(response)}\n`);
+    return 0;
+  } finally {
+    await client.close();
+  }
+}
+
+function phonesOnlyLine(entry: CatalogGetOutput["platforms"][number]): string[] {
+  if (entry.virtualDevices !== false) return [];
+  return [
+    `  Virtual devices: off (${entry.platform}.virtualDevices is false); only enrolled physical devices are leased`,
+  ];
+}
+
+// why: a missing `modes` field means the entry serves both modes (a worker serving both, or the gateway merge leaving it out); a present one lists the modes served, which can be both for a split fleet.
+function modesLine(entry: CatalogGetOutput["platforms"][number]): string[] {
+  if (entry.platform !== "ios") return [];
+  return [`  Modes served: ${(entry.modes ?? ["slim", "full"]).join(", ")}`];
+}
+
+function formatCatalog(response: CatalogGetOutput): string {
+  if (response.platforms.length === 0) return "No platforms available.";
+  return response.platforms
+    .map((entry) => {
+      const defaultRuntime = entry.defaultRuntime ?? "(none)";
+      const custom = new Set(entry.customModels ?? []);
+      const modelLine = (model: string): string[] => {
+        const paired =
+          (Object.hasOwn(entry.modelRuntimes, model) ? entry.modelRuntimes[model] : undefined) ??
+          [];
+        const aliases =
+          (Object.hasOwn(entry.modelAliases, model) ? entry.modelAliases[model] : undefined) ?? [];
+        return [
+          `      ${esc(model)}${custom.has(model) ? " (custom)" : ""}: ${paired.length > 0 ? esc(paired.join(", ")) : "(no paired runtime)"}`,
+          ...(aliases.length > 0 ? [`        Other names: ${esc(aliases.join(", "))}`] : []),
+        ];
+      };
+      const classOf = (model: string): string | undefined =>
+        Object.hasOwn(entry.modelClasses, model) ? entry.modelClasses[model] : undefined;
+      const classLine = (deviceClass: string | undefined): string => {
+        if (deviceClass === undefined) return "    (no class):";
+        const model = Object.hasOwn(entry.classDefaults, deviceClass)
+          ? entry.classDefaults[deviceClass as keyof typeof entry.classDefaults]
+          : undefined;
+        return `    ${esc(deviceClass)} (default: ${esc(model ?? "none")}):`;
+      };
+      const models = [...DEVICE_CLASS_ORDER, undefined].flatMap((deviceClass) => {
+        const members = entry.models.filter((model) => classOf(model) === deviceClass);
+        return members.length === 0 ? [] : [classLine(deviceClass), ...members.flatMap(modelLine)];
+      });
+      const images = (entry.images ?? []).map(
+        (image) => `    ${esc(`${image.runtime} ${image.tag} ${image.abi}`)}`,
+      );
+      return [
+        `Platform: ${entry.platform}`,
+        ...phonesOnlyLine(entry),
+        `  Runtimes: ${entry.runtimes.length > 0 ? esc(entry.runtimes.join(", ")) : "(none)"} (default: ${esc(defaultRuntime)})`,
+        ...modesLine(entry),
+        ...(entry.defaultImageTag === undefined
+          ? []
+          : [`  Default image tag: ${esc(entry.defaultImageTag)}`]),
+        models.length > 0 ? "  Models:" : "  Models: (none)",
+        ...models,
+        ...(entry.images === undefined
+          ? []
+          : [images.length > 0 ? "  Images (runtime, tag, ABI):" : "  Images: (none)", ...images]),
+      ].join("\n");
+    })
+    .join("\n");
+}
+
+export { run };

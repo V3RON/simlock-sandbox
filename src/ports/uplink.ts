@@ -1,0 +1,337 @@
+/**
+ * why: The worker uplink, as a port (architecture rule 9; ADR 0005 §33: "the uplink is a port
+ * (`UplinkListenerFactory` on the gateway, `UplinkConnector` on the worker) with a WebSocket
+ * adapter, so tests script it in memory").
+ *
+ * Two halves of one link:
+ *
+ * - **`UplinkConnector`** (worker side) dials `gateway.url` with the join token and the
+ *   worker's instance id, and hands back a connection.
+ * - **`UplinkListenerFactory`** (gateway side) accepts an authenticated uplink and hands the
+ *   daemon that same abstract connection.
+ *
+ * What travels over it is the existing daemon protocol -- the newline-delimited JSON frames
+ * `DaemonServer` and `SimlockWire` already speak -- which is why both halves traffic in
+ * `IpcConnection` rather than a WebSocket type of their own. That is the point of ADR 0005's
+ * decision 2 ("the uplink carries the existing contract"): the worker's own `DaemonServer`
+ * accepts the uplink as one more connection, and the gateway drives it with the same typed
+ * client a supervisor process uses over a unix socket. Neither end has a second vocabulary to
+ * learn, and an operation added to the contract works over the uplink for free.
+ *
+ * The direction is deliberately inverted relative to what the names suggest: the *worker*
+ * dials (so no worker needs an inbound port -- ADR 0005 decision 1), and over the resulting
+ * connection the *gateway* is the protocol client (§5). So `UplinkConnector.connect` returns
+ * the connection a `DaemonServer` will serve, and `UplinkListenerFactory.listen`'s `accept`
+ * hands out the connection a client will drive.
+ *
+ * This module holds the port and its in-memory adapter only. The WebSocket adapters live in
+ * `./uplink-websocket.ts`, which is the one file that imports `ws` -- kept out of the ports
+ * barrel so the CLI and the MCP server, which never open an uplink, never load it.
+ */
+import { subscribeListener, type IpcConnection } from "./ipc.js";
+
+/** why: Header carrying the worker's instance identity (`instance.json`) at upgrade (ADR 0005 §3a,
+ * §4). A header rather than a query parameter so the id stays out of proxy access logs. */
+export const WORKER_ID_HEADER = "x-simlock-worker-id";
+/** why: Header carrying `gateway.label`, URI-encoded (it is free text and may be non-ASCII). */
+export const WORKER_LABEL_HEADER = "x-simlock-worker-label";
+export const UPLINK_PATH = "/v1/uplink";
+
+/**
+ * why: Derives the uplink endpoint from `gateway.url`. Resolved against the base rather than
+ * concatenated, so a gateway published under a sub-path by a reverse proxy
+ * (`wss://ci.example/simlock/`) lands on `wss://ci.example/simlock/v1/uplink` rather than at
+ * the host root. A base URL that already names the uplink path resolves to itself.
+ */
+export function resolveUplinkUrl(baseUrl: string): string {
+  if (new URL(baseUrl).pathname.endsWith(UPLINK_PATH)) return baseUrl;
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  return new URL(UPLINK_PATH.slice(1), base).toString();
+}
+
+export interface UplinkTransportConnection extends IpcConnection {
+  writeBinary(bytes: Uint8Array): Promise<void>;
+  onBinary(listener: (bytes: Uint8Array) => void): () => void;
+  readonly unsentBytes: number;
+  onSent(listener: () => void): () => void;
+}
+
+export interface MemoryTransportConnection extends UplinkTransportConnection {
+  hold(): void;
+  release(): void;
+  fail(error: Error): void;
+}
+
+export interface AcceptedUplink {
+  readonly workerId: string;
+  readonly label?: string;
+  readonly connection: UplinkTransportConnection;
+  readonly tokenId?: string;
+}
+
+export interface UplinkListener {
+  close(): Promise<void>;
+}
+
+/**
+ * why: the refusals differ in what an operator must fix (ADR 0005 §4/§25):
+ *
+ * - `accept` -- a `worker` token pinned to the worker id the dial claimed (or pinned to it now).
+ * - `unauthenticated` (`401`) -- no token, or one the gateway does not know. A revoked join
+ *   token lands here, which is what closes an uplink after `simlock token revoke`.
+ * - `forbidden` (`403`) -- a real token of the wrong role. An `agent` or `operator` token is
+ *   valid elsewhere and carries no authority here, exactly as a `worker` token carries none on
+ *   any other `/v1` route.
+ * - `worker-mismatch` (`403`) -- a `worker` token pinned to another worker id, a worker id
+ *   another token is pinned to, no worker id at all, or one outside `[A-Za-z0-9_-]{1,128}`.
+ */
+export type UplinkAuthOutcome = "accept" | "unauthenticated" | "forbidden" | "worker-mismatch";
+
+export type UplinkAuthResult =
+  | UplinkAuthOutcome
+  | { readonly outcome: "accept"; readonly tokenId: string };
+
+export function uplinkOutcome(result: UplinkAuthResult): UplinkAuthOutcome {
+  return typeof result === "string" ? result : result.outcome;
+}
+
+export function uplinkTokenId(result: UplinkAuthResult): string | undefined {
+  return typeof result === "string" ? undefined : result.tokenId;
+}
+
+export interface ClaimedUplinkIdentity {
+  readonly workerId?: string;
+  readonly label?: string;
+}
+
+export interface UplinkHandlers {
+  /**
+   * why: checked at upgrade, so anything but `accept` answers its HTTP status and destroys the
+   * socket before an unauthorized peer reaches the daemon protocol. `claimed.workerId` is checked
+   * against the worker the join token is pinned to; on a refusal it is only what the dial said.
+   */
+  authenticate(
+    credential: string | undefined,
+    claimed: ClaimedUplinkIdentity,
+  ): Promise<UplinkAuthResult>;
+  accept(uplink: AcceptedUplink): void;
+}
+
+export interface UplinkListenerFactory {
+  listen(handlers: UplinkHandlers): Promise<UplinkListener>;
+}
+
+export interface UplinkDialOptions {
+  readonly url: string;
+  readonly token: string;
+  readonly workerId: string;
+  readonly label?: string;
+  /** why: `gateway.headers`: extra upgrade headers for a sign-in proxy in front of the gateway. */
+  readonly headers?: Readonly<Record<string, string>> | undefined;
+}
+
+export interface UplinkConnector {
+  connect(options: UplinkDialOptions): Promise<UplinkTransportConnection>;
+}
+
+/**
+ * why: Why a dial failure is its own error class: the worker's reconnect supervisor backs off on
+ * *any* failure, but an operator reading the log needs to tell "the gateway is not up yet"
+ * (`unreachable`) from "the gateway refused this token" (`rejected` -- a revoked or mistyped
+ * join token, which retrying alone never fixes). ADR 0005 §4/§8: a revoked token closes the
+ * uplink and the worker keeps retrying at the cap, which is right (an operator may mint a new
+ * token at any moment) but should be obvious in the log rather than a silent loop.
+ */
+export type UplinkErrorCode = "unreachable" | "rejected" | "unknown";
+
+export class UplinkError extends Error {
+  constructor(
+    readonly code: UplinkErrorCode,
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message, { cause });
+    this.name = "UplinkError";
+  }
+}
+
+export class MemoryUplinkTransport implements UplinkListenerFactory, UplinkConnector {
+  #handlers: UplinkHandlers | undefined;
+
+  async listen(handlers: UplinkHandlers): Promise<UplinkListener> {
+    if (this.#handlers !== undefined) {
+      throw new UplinkError("unknown", "This memory uplink transport is already listening");
+    }
+    this.#handlers = handlers;
+    return {
+      close: async () => {
+        this.#handlers = undefined;
+      },
+    };
+  }
+
+  async connect(options: UplinkDialOptions): Promise<UplinkTransportConnection> {
+    const handlers = this.#handlers;
+    if (handlers === undefined) {
+      throw new UplinkError("unreachable", `No gateway is listening at ${options.url}`);
+    }
+    const result = await handlers.authenticate(options.token, {
+      workerId: options.workerId,
+      ...(options.label === undefined ? {} : { label: options.label }),
+    });
+    const outcome = uplinkOutcome(result);
+    if (outcome !== "accept") {
+      throw new UplinkError("rejected", `The gateway rejected this join token: ${outcome}`);
+    }
+    const tokenId = uplinkTokenId(result);
+    const [workerEnd, gatewayEnd] = createConnectionPair();
+    handlers.accept({
+      connection: gatewayEnd,
+      workerId: options.workerId,
+      ...(options.label === undefined ? {} : { label: options.label }),
+      ...(tokenId === undefined ? {} : { tokenId }),
+    });
+    return workerEnd;
+  }
+}
+
+export function createConnectionPair(): [MemoryTransportConnection, MemoryTransportConnection] {
+  const left = new PairedConnection();
+  const right = new PairedConnection();
+  left.pair(right);
+  right.pair(left);
+  return [left, right];
+}
+
+type PairedMessage =
+  | { readonly kind: "text"; readonly text: string }
+  | { readonly kind: "binary"; readonly bytes: Uint8Array };
+
+class PairedConnection implements MemoryTransportConnection {
+  readonly #closeListeners = new Set<() => void>();
+  readonly #dataListeners = new Set<(chunk: string) => void>();
+  /** why: Buffered until the first `onData`, exactly as the WebSocket adapter does and as a real
+   * socket does: the peer may write before this end has been handed to whoever reads it. */
+  readonly #pending: string[] = [];
+  readonly #errorListeners = new Set<(error: Error) => void>();
+  readonly #binaryListeners = new Set<(bytes: Uint8Array) => void>();
+  readonly #sentListeners = new Set<() => void>();
+  readonly #queue: Array<{ message: PairedMessage; resolve: () => void; size: number }> = [];
+  #unsent = 0;
+  #held = false;
+  #peer: PairedConnection | undefined;
+  #closed = false;
+
+  get closed(): boolean {
+    return this.#closed;
+  }
+
+  pair(peer: PairedConnection): void {
+    this.#peer = peer;
+  }
+
+  onData(listener: (chunk: string) => void): () => void {
+    const unsubscribe = subscribeListener(this.#dataListeners, listener);
+    if (this.#pending.length > 0) {
+      const buffered = this.#pending.splice(0);
+      for (const chunk of buffered) listener(chunk);
+    }
+    return unsubscribe;
+  }
+
+  onClose(listener: () => void): () => void {
+    if (this.#closed) {
+      // why: A listener attached after the close would otherwise never fire, and consumers attach
+      // `onClose` after construction -- an in-memory pair can close in between.
+      listener();
+      return () => {};
+    }
+    return subscribeListener(this.#closeListeners, listener);
+  }
+
+  onError(listener: (error: Error) => void): () => void {
+    return subscribeListener(this.#errorListeners, listener);
+  }
+
+  get unsentBytes(): number {
+    return this.#unsent;
+  }
+
+  onBinary(listener: (bytes: Uint8Array) => void): () => void {
+    return subscribeListener(this.#binaryListeners, listener);
+  }
+
+  onSent(listener: () => void): () => void {
+    return subscribeListener(this.#sentListeners, listener);
+  }
+
+  hold(): void {
+    this.#held = true;
+  }
+
+  release(): void {
+    this.#held = false;
+    while (this.#queue.length > 0) {
+      const entry = this.#queue.shift();
+      if (entry === undefined) break;
+      this.#unsent -= entry.size;
+      this.#deliver(entry.message);
+      entry.resolve();
+    }
+    this.#unsent = 0;
+    for (const listener of this.#sentListeners) listener();
+  }
+
+  fail(error: Error): void {
+    for (const listener of this.#errorListeners) listener(error);
+    void this.close();
+  }
+
+  async write(contents: string): Promise<void> {
+    await this.#send({ kind: "text", text: contents }, Buffer.byteLength(contents));
+  }
+
+  async writeBinary(bytes: Uint8Array): Promise<void> {
+    await this.#send({ kind: "binary", bytes }, bytes.length);
+  }
+
+  async #send(message: PairedMessage, size: number): Promise<void> {
+    if (this.#closed) return;
+    if (!this.#held) {
+      this.#deliver(message);
+      return;
+    }
+    this.#unsent += size;
+    await new Promise<void>((resolve) => {
+      this.#queue.push({ message, resolve, size });
+    });
+  }
+
+  #deliver(message: PairedMessage): void {
+    const peer = this.#peer;
+    if (this.#closed || peer === undefined || peer.#closed) return;
+    if (message.kind === "binary") {
+      for (const listener of peer.#binaryListeners) listener(message.bytes);
+      return;
+    }
+    if (peer.#dataListeners.size === 0) {
+      peer.#pending.push(message.text);
+      return;
+    }
+    for (const listener of peer.#dataListeners) listener(message.text);
+  }
+
+  async close(): Promise<void> {
+    this.#close();
+    const peer = this.#peer;
+    if (peer !== undefined) peer.#close();
+  }
+
+  #close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#unsent = 0;
+    for (const entry of this.#queue.splice(0)) entry.resolve();
+    for (const listener of this.#closeListeners) listener();
+  }
+}

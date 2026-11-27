@@ -1,0 +1,230 @@
+import {
+  compareVersions,
+  type OsConstraint,
+  parseOsConstraint,
+  requestedClass,
+  satisfies,
+} from "../../contract/index.js";
+import {
+  baselineMismatch,
+  findCatalogModel,
+  modelClass,
+  pairedRuntimes,
+  type DeviceClass,
+  type DeviceRequirement,
+  type FittableSpec,
+  fits,
+  fitsPhysical,
+} from "../../core/index.js";
+import type { WorkerView } from "../worker-registry.js";
+import type { RoutableRequest } from "./pipeline.js";
+
+export function matchRequest(worker: WorkerView, request: RoutableRequest): string | undefined {
+  if (request.physical === true) return undefined;
+  const narrowed = withBaseline(worker, request);
+  const catalog = catalogOf(worker, narrowed);
+  return catalog === undefined ? undefined : servingModel(catalog, narrowed);
+}
+
+type BaselineListed = NonNullable<WorkerView["baselines"]>[number];
+
+/** why: the one read of a worker's baseline by the name a request gives; `undefined` for a request naming none or a worker without it. */
+export function baselineEntry(
+  worker: WorkerView,
+  request: RoutableRequest,
+): BaselineListed | undefined {
+  if (request.baseline === undefined) return undefined;
+  return worker.baselines?.find((entry) => entry.name === request.baseline);
+}
+
+/** why: the one gateway call of the core's `baselineMismatch`: whether the worker's copy of the named baseline differs from the request, over the worker's own catalog for the model rule. */
+export function baselineMismatchOf(worker: WorkerView, request: RoutableRequest) {
+  const entry = baselineEntry(worker, request);
+  if (entry === undefined) return undefined;
+  const catalog = worker.catalog?.find((listed) => listed.platform === request.platform);
+  return baselineMismatch(entry, request, catalog ?? { modelAliases: {}, models: [] });
+}
+
+/**
+ * why: ADR 0082 §4: whether the worker serves the iOS mode the request names or a baseline gives it
+ * (`withBaseline`). A request with no mode, a physical one, another platform, or a catalog without
+ * `modes` (a worker that serves both, or one from before the field) is served.
+ */
+export function servesMode(worker: WorkerView, request: RoutableRequest): boolean {
+  if (request.physical === true) return true;
+  const { mode } = withBaseline(worker, request);
+  const modes = catalogOf(worker, request)?.modes;
+  return mode === undefined || modes === undefined || modes.includes(mode);
+}
+
+/**
+ * why: ADR 0061 §5: a request naming a baseline takes the baseline's model, exact OS, mode and
+ * image tag, so it is read as that request on a worker that holds the baseline; the class is
+ * dropped because the model is named. A request naming none, or a worker without the baseline,
+ * leaves the request as it is.
+ */
+export function withBaseline(worker: WorkerView, request: RoutableRequest): RoutableRequest {
+  const entry = baselineEntry(worker, request);
+  if (entry === undefined) return request;
+  const { class: _class, imageTag: _imageTag, ...rest } = request;
+  return {
+    ...rest,
+    mode: entry.mode,
+    model: entry.model,
+    osVersion: entry.osVersion,
+    ...(entry.imageTag === undefined ? {} : { imageTag: entry.imageTag }),
+  };
+}
+
+function servingModel(catalog: PlatformEntry, request: RoutableRequest): string | undefined {
+  return candidates(catalog, request).find((model) =>
+    pairedRuntimesOf(catalog, model, request).some((runtime) => osFits(runtime, request)),
+  );
+}
+
+export function deviceFit(
+  worker: WorkerView,
+  request: RoutableRequest,
+): ((spec: FittableSpec) => boolean) | undefined {
+  if (request.physical === true) return undefined;
+  const narrowed = withBaseline(worker, request);
+  const catalog = catalogOf(worker, narrowed);
+  if (catalog === undefined) return undefined;
+  if (servingModel(catalog, narrowed) === undefined) return undefined;
+  const defaulted = withDefaultImageTag(worker, catalog, narrowed);
+  const effective = defaulted.request;
+  const model = servingModel(defaulted.catalog, effective);
+  if (model === undefined) return undefined;
+  const entry = baselineEntry(worker, request);
+  const requirement: DeviceRequirement = {
+    imageTag: effective.imageTag,
+    osVersion: osRequirement(defaulted.catalog, model, effective),
+    platform: effective.platform,
+    target:
+      effective.model === undefined
+        ? { class: wantedClass(effective), kind: "class" }
+        : { kind: "model", model },
+    ...(entry === undefined ? {} : { baseline: { name: entry.name, version: entry.version } }),
+  };
+  return (spec) => fits(requirement, spec, (listed) => modelClass(catalog, listed));
+}
+
+/**
+ * why: ADR 0078 I4, I7: a worker resolves a tagless virtual Android request, with no baseline, as
+ * if it named the worker's default image tag when a serving model has an image of it built for the
+ * worker's CPU, else as the request came, so a ready device is warm for it with that tag only
+ * then. The catalog returned is the one the attempt reads: host-CPU images only when it took the
+ * tag; a worker that reports no host keeps them all.
+ */
+function withDefaultImageTag(
+  worker: WorkerView,
+  catalog: PlatformEntry,
+  request: RoutableRequest,
+): { readonly request: RoutableRequest; readonly catalog: PlatformEntry } {
+  const asCame = { request, catalog };
+  const { defaultImageTag } = catalog;
+  if (request.platform !== "android" || request.imageTag !== undefined) return asCame;
+  if (request.baseline !== undefined || defaultImageTag === undefined) return asCame;
+  const abi = worker.host === undefined ? undefined : hostAbiOf(worker.host.arch);
+  const hostCatalog =
+    abi === undefined
+      ? catalog
+      : { ...catalog, images: (catalog.images ?? []).filter((image) => image.abi === abi) };
+  const tagged = { ...request, imageTag: defaultImageTag };
+  return servingModel(hostCatalog, tagged) === undefined
+    ? asCame
+    : { request: tagged, catalog: hostCatalog };
+}
+
+/** why: the worker's `hostAbiFor` (src/drivers/android/index.ts:898), which the gateway cannot import: arm64 runs `arm64-v8a` images, any other CPU `x86_64`. */
+function hostAbiOf(arch: string): string {
+  return arch === "arm64" ? "arm64-v8a" : "x86_64";
+}
+
+function osRequirement(
+  catalog: PlatformEntry,
+  model: string,
+  request: RoutableRequest,
+): DeviceRequirement["osVersion"] {
+  const constraint = osConstraintOf(request);
+  if (constraint !== undefined) return constraint;
+  if (request.model === undefined) return { kind: "installed", versions: catalog.runtimes };
+  const runtimes = pairedRuntimesOf(catalog, model, request);
+  const newest = [...runtimes].sort(compareVersions).at(-1);
+  return { kind: "installed", versions: newest === undefined ? [] : [newest] };
+}
+
+function candidates(catalog: PlatformEntry, request: RoutableRequest): readonly string[] {
+  if (request.model !== undefined) {
+    const model = findCatalogModel(catalog, request.model);
+    return model === undefined ? [] : [model];
+  }
+  const wanted = wantedClass(request);
+  return catalog.models.filter((model) => modelClass(catalog, model) === wanted);
+}
+
+export function wantedClass(request: RoutableRequest): DeviceClass {
+  return requestedClass({ class: request.class });
+}
+
+/** why: The OS constraint a request names, or `undefined` for none. A string the grammar refuses can
+ * never reach here through the contract; it is read as exact, which no runtime matches. */
+function osConstraintOf(request: RoutableRequest): OsConstraint | undefined {
+  if (request.osVersion === undefined) return undefined;
+  const parsed = parseOsConstraint(request.osVersion);
+  return parsed.ok ? parsed.constraint : { kind: "exact", version: request.osVersion };
+}
+
+function osFits(runtime: string, request: RoutableRequest): boolean {
+  const constraint = osConstraintOf(request);
+  return constraint === undefined || satisfies(runtime, constraint);
+}
+
+function pairedRuntimesOf(
+  catalog: PlatformEntry,
+  model: string,
+  request: RoutableRequest,
+): readonly string[] {
+  const { imageTag } = request;
+  const runtimes = pairedRuntimes(catalog, model);
+  if (imageTag === undefined) return runtimes;
+  return runtimes.filter((runtime) =>
+    (catalog.images ?? []).some((image) => image.tag === imageTag && image.runtime === runtime),
+  );
+}
+
+// why: the one gateway read of a worker's enrolled devices: `enrolled` is any state but `deleted`, `pickable` is `ready` and not last read not present (no read yet counts as present).
+export function physicalMatch(
+  worker: WorkerView,
+  request: RoutableRequest,
+  which: "enrolled" | "pickable",
+): boolean {
+  return (worker.devices ?? []).some((device) => {
+    if (device.physical !== true || device.state === "deleted") return false;
+    if (which === "pickable" && (device.state !== "ready" || device.presence?.present === false)) {
+      return false;
+    }
+    const { spec } = device;
+    return fitsPhysical(
+      { spec, ...(device.class === undefined ? {} : { class: device.class }) },
+      request,
+    );
+  });
+}
+
+export function hasPlatform(worker: WorkerView, request: RoutableRequest): boolean {
+  return catalogOf(worker, request) !== undefined;
+}
+
+export function listsModel(worker: WorkerView, request: RoutableRequest): boolean {
+  const narrowed = withBaseline(worker, request);
+  const catalog = catalogOf(worker, narrowed);
+  return catalog !== undefined && candidates(catalog, narrowed).length > 0;
+}
+
+type PlatformEntry = NonNullable<WorkerView["catalog"]>[number];
+
+/** why: the one read of a worker's catalog entry for the request's platform. */
+export function catalogOf(worker: WorkerView, request: RoutableRequest): PlatformEntry | undefined {
+  return worker.catalog?.find((entry) => entry.platform === request.platform);
+}

@@ -1,0 +1,149 @@
+---
+title: Send alerts to Slack or a webhook
+description: Have the gateway post chosen fleet events to a Slack incoming webhook or your own signed endpoint, test a destination, and know what happens when a message is not delivered.
+sidebar:
+  order: 6
+  label: "Send alerts"
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+**Result:** when a worker drops off, a device can't be cleaned up or a disk runs low, the gateway posts a message to Slack or to your endpoint.
+
+## Before you start
+
+- Only a gateway sends alerts. A worker on its own sends none; to watch one worker, see [See what the worker is doing](/simlock/docs/worker/monitoring).
+- Admin rights on the gateway machine.
+- For Slack: a [Slack incoming webhook](https://api.slack.com/messaging/webhooks) URL. For your own endpoint: an `https://` URL and a secret you choose.
+
+## Events you can alert on
+
+| Event | When |
+| --- | --- |
+| `worker.connected` | A worker connected to the gateway. |
+| `worker.disconnected` | A worker's connection closed. The message says how many leases it held. A gateway that stops sends none for its workers. |
+| `worker.rejected` | The gateway refused a worker's connection: unknown, revoked or non-worker token, or a token another worker uses. Refusals within one second for the same reason and worker are sent as one. |
+| `worker.drain-started` | A worker was drained. |
+| `worker.drain-ended` | A drained worker takes leases again. |
+| `device.quarantine-abandoned` | A worker gave up cleaning a device after repeated failures and retired it. |
+| `device.quarantine-stranded` | A worker could neither clean up nor delete a device. It needs a person. |
+| `device.recovery-failed` | A device crashed during a lease and could not be brought back. |
+| `device.stalled-transition-detected` | A device has been booting or being cleaned far longer than expected. |
+| `disk.pressure-detected` | A worker's free disk fell below its `diskPressure.freeBytesThreshold`. |
+| `memory.pressure-changed` | A worker paused warming, paused new devices, or is no longer short of memory. |
+| `component.install-failed` | Installing a runtime or system image on a worker failed. |
+
+Each event's payload: [Events](/simlock/docs/reference/events).
+
+## Add a destination
+
+`config set` sets the whole list at once. Include every destination you want to keep.
+
+<Steps>
+
+1. Set the destinations on the gateway:
+
+   ```sh
+   simlock --gateway config set gateway.alerts.destinations '[{"name":"fleet-slack","format":"slack","url":"https://hooks.slack.com/services/YOUR/WEBHOOK/PATH","events":["worker.disconnected","device.quarantine-stranded","disk.pressure-detected"]},{"name":"ops-webhook","format":"generic","url":"https://ops.example.com/hooks/simlock","secret":"9b7f3c2e8a1d4f6b0e5c7a9d2f4b6e8c","events":["worker.disconnected","worker.rejected","device.recovery-failed"]}]'
+   ```
+
+   ```text
+   Updated gateway.alerts.destinations in /Users/alex/.simlock/gateway/config.json; takes effect on daemon restart.
+   ```
+
+2. Restart the gateway:
+
+   ```sh
+   simlock --gateway daemon stop
+   simlock --gateway daemon start
+   ```
+
+3. Send a test message to each destination:
+
+   ```sh
+   simlock --gateway alerts test fleet-slack
+   ```
+
+   ```text
+   Sent a test message to fleet-slack: HTTP 200
+   ```
+
+</Steps>
+
+**Check:** the test message arrives in Slack, or at your endpoint as event `alerts.test-sent`.
+
+The test sends one sample message at once. It isn't retried and doesn't wait behind other alerts. Add `--json` for the answer as JSON.
+
+Each destination:
+
+| Field | Rule |
+| --- | --- |
+| `name` | Lowercase letters, digits and dashes, starting with a letter, at most 32 characters. Unique. |
+| `format` | `slack`: a one-line message for a Slack incoming webhook. `generic`: the event as JSON, signed with `secret`. |
+| `url` | `https://`, or `http://` to `localhost`, `127.0.0.1` or `[::1]`. No user name or password in it. |
+| `events` | One or more events from the table above, each once. |
+| `secret` | Required and non-empty for `generic`. Not allowed for `slack`. |
+
+Up to 16 destinations. `config set` refuses a destination that breaks a rule, naming the field. A bad destination written by hand into `config.json` stops the gateway from starting.
+
+The webhook URL and the secret are kept in plain text in the gateway's `config.json`, readable only by your user. `simlock config` and the log show them as `[redacted]`; the log names a destination, never its URL or secret.
+
+## Receive generic alerts
+
+A `generic` destination gets a `POST` with the event as the JSON body:
+
+```json
+{"id":"evt_1c7e4f2a-9b3d-4e8f-a6c1-5d2b8e0f7a39","seq":0,"timestamp":1792569600000,"event":"alerts.test-sent","payload":{"destination":"ops-webhook"},"module":"alerts"}
+```
+
+The body has the fields every event has: `id`, unique per event; `timestamp` in milliseconds; `event`; `payload`. An event about a worker or its devices has `workerId` in the payload.
+
+| Header | Value |
+| --- | --- |
+| `Content-Type` | `application/json` |
+| `User-Agent` | `simlock/<version>` |
+| `X-Simlock-Event` | The event name, such as `worker.disconnected`. |
+| `X-Simlock-Delivery` | The event's `id`. Retries of one event carry the same value: use it to drop a repeat. |
+| `X-Simlock-Signature` | `sha256=` and the hex HMAC-SHA256 of the raw body, keyed with the destination's secret. |
+
+Check the signature over the raw body, before you parse it:
+
+```ts
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export function isFromSimlock(rawBody: string, signature: string, secret: string): boolean {
+  const expected = `sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+  return (
+    signature.length === expected.length &&
+    timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
+  );
+}
+```
+
+Answer with any `2xx` status to accept the message.
+
+## How delivery works
+
+The gateway sends to each destination one message at a time, oldest first. A slow receiver doesn't hold up the other destinations.
+
+- **Retries.** Each try may take up to 10 seconds. A network error, a timeout, `429` or a `5xx` is tried again after 1 second, then after 5 seconds: three tries in all. Any other non-`2xx` answer is not retried.
+- **Giving up.** After the last try the gateway drops the message and logs `Alert send gave up` with the destination's name and the status or error code.
+- **A full queue.** A destination holds up to 100 waiting messages. When it is full, a new message drops the oldest, and the gateway logs `Alert dropped: queue full`.
+- **A stop.** Waiting messages live in memory only. When the gateway stops they are lost, and it logs how many with `Alerts discarded at stop`.
+
+<Aside>
+A failed alert is only logged. It raises no event and no other alert. To find failures, search the gateway's log: `simlock --gateway daemon logs`.
+</Aside>
+
+## When it fails
+
+| Error | Exit | Cause | Fix |
+| --- | --- | --- | --- |
+| `UNKNOWN_ALERT_DESTINATION` | 12 | No destination has that name. The gateway reads its destinations at start. | Check the name; restart the gateway after a change. |
+| `ALERT_SEND_FAILED`, "fleet-slack answered HTTP 404" | 1 | The receiver answered, but not with success. | Check the URL. |
+| `ALERT_SEND_FAILED`, "fleet-slack could not be reached: ENOTFOUND" | 1 | The gateway could not connect. The code after the colon is the network error. | Check DNS and the network from the gateway. |
+| `ALERT_SEND_FAILED`, "fleet-slack did not answer within 10 s" | 1 | The receiver took longer than 10 seconds. | Make the receiver answer sooner. |
+| `UNSUPPORTED_IN_WORKER_MODE` | 2 | `simlock alerts test` reached a worker. | Add `--gateway`. |
+| The gateway doesn't start, naming `gateway.alerts.destinations` | — | A destination in `config.json` breaks a rule above. | Fix the field the message names. |
+
+Every key: [Configuration](/simlock/docs/reference/configuration#alerts).

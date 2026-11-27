@@ -1,0 +1,25 @@
+.usage-panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+  gap: var(--space-3);
+}
+
+.usage-panels > * {
+  min-width: 0;
+}
+
+.usage-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.usage-id {
+  margin-left: var(--space-2);
+}
+
+/* Tables too wide for a small cell take a whole row each, after the small panels. */
+.usage-span {
+  grid-column: 1 / -1;
+  order: 1;
+}

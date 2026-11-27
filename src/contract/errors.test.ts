@@ -1,0 +1,271 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
+import {
+  admissionDeniedError,
+  admissionFailedError,
+  CODES_WITH_DECLARED_DETAILS,
+  ERROR_TABLE,
+  fromWireError,
+  leaseEndedError,
+  isSimlockError,
+} from "./errors.js";
+
+const TABLE: Readonly<Record<string, unknown>> = ERROR_TABLE;
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+describe("SimlockError", () => {
+  it("narrows details by code", () => {
+    const error = fromWireError("REQUESTER_ALREADY_LEASED", "already leased", {
+      requesterId: "agent-1",
+      existingLeaseId: "lease_1",
+    });
+    expect(isSimlockError(error)).toBe(true);
+    if (isSimlockError(error) && error.code === "REQUESTER_ALREADY_LEASED") {
+      expect(error.details.existingLeaseId).toBe("lease_1");
+      expect(error.details.requesterId).toBe("agent-1");
+    } else {
+      throw new Error("expected REQUESTER_ALREADY_LEASED");
+    }
+  });
+
+  it("HISTORY_NOT_KEPT is domain, exit 12, HTTP 422 with oldestTs, and HISTORY_UNAVAILABLE domain, exit 1, HTTP 503 with no details", () => {
+    expect(TABLE.HISTORY_NOT_KEPT).toEqual({
+      cliExitCode: 12,
+      code: "HISTORY_NOT_KEPT",
+      httpStatus: 422,
+      kind: "domain",
+    });
+    expect(TABLE.HISTORY_UNAVAILABLE).toEqual({
+      cliExitCode: 1,
+      code: "HISTORY_UNAVAILABLE",
+      httpStatus: 503,
+      kind: "domain",
+    });
+
+    const notKept = fromWireError("HISTORY_NOT_KEPT", "not kept", { oldestTs: 42 });
+    const unavailable = fromWireError("HISTORY_UNAVAILABLE", "no history");
+
+    expect(notKept.code).toBe("HISTORY_NOT_KEPT");
+    expect(notKept).toMatchObject({ details: { oldestTs: 42 } });
+    expect(unavailable.code).toBe("HISTORY_UNAVAILABLE");
+    expect(unavailable).not.toHaveProperty("details.oldestTs");
+  });
+
+  it("wraps an unrecognized code as UNKNOWN_DAEMON_ERROR instead of throwing", () => {
+    const error = fromWireError("SOME_FUTURE_CODE", "a newer daemon said so");
+    expect(isSimlockError(error)).toBe(true);
+    expect(error.code).toBe("UNKNOWN_DAEMON_ERROR");
+    if (error.code === "UNKNOWN_DAEMON_ERROR") {
+      expect(error.details).toEqual({
+        code: "SOME_FUTURE_CODE",
+        message: "a newer daemon said so",
+      });
+    }
+  });
+
+  it.each(Object.values(ERROR_TABLE).map((entry) => [entry.code, entry.kind] as const))(
+    "maps known code %s to its table entry's kind, %s",
+    (code, kind) => {
+      const error = fromWireError(code, "from the wire");
+      expect({ code: error.code, kind: error.kind }).toEqual({ code, kind });
+    },
+  );
+
+  it("narrows LEASE_ID_TAKEN's details to the ID, and answers it with exit 13 and HTTP 409 as a domain error", () => {
+    const error = fromWireError("LEASE_ID_TAKEN", "lease ID ad-7f3a is already in use", {
+      leaseId: "ad-7f3a",
+    });
+    if (error.code !== "LEASE_ID_TAKEN") throw new Error("expected LEASE_ID_TAKEN");
+
+    expect(error.details.leaseId).toBe("ad-7f3a");
+    expect(ERROR_TABLE.LEASE_ID_TAKEN).toEqual({
+      cliExitCode: 13,
+      code: "LEASE_ID_TAKEN",
+      httpStatus: 409,
+      kind: "domain",
+    });
+  });
+
+  it("a caller refused with LEASE_ENDED sees its message with the id and the end time, HTTP 409 and CLI exit 13", () => {
+    const error = leaseEndedError("ad-7f3a", Date.UTC(2026, 10, 10, 14, 2, 11));
+
+    expect(error.message).toBe(
+      "Lease ad-7f3a ended at 2026-11-10T14:02:11.000Z; choose a new lease id",
+    );
+    expect(error.details).toEqual({
+      endedAt: Date.UTC(2026, 10, 10, 14, 2, 11),
+      leaseId: "ad-7f3a",
+    });
+    expect(ERROR_TABLE.LEASE_ENDED).toEqual({
+      cliExitCode: 13,
+      code: "LEASE_ENDED",
+      httpStatus: 409,
+      kind: "domain",
+    });
+  });
+
+  it("a caller refused by the admission policy sees the reason or the cause in the message, HTTP 403 for a refusal and 503 for no decision, CLI exit 16 for both", () => {
+    expect(admissionDeniedError("budget used").message).toBe(
+      "The gateway's admission policy refused this request: budget used",
+    );
+    expect(admissionFailedError("exited 1").message).toBe(
+      "The gateway's admission policy could not decide on this request (exited 1)",
+    );
+    expect([TABLE.ADMISSION_DENIED, TABLE.ADMISSION_FAILED]).toEqual([
+      { cliExitCode: 16, code: "ADMISSION_DENIED", httpStatus: 403, kind: "domain" },
+      { cliExitCode: 16, code: "ADMISSION_FAILED", httpStatus: 503, kind: "domain" },
+    ]);
+  });
+
+  it("answers the two baseline request codes as domain errors with HTTP 422: a mismatch with exit 2, a stale baseline with exit 12, each with its declared details", () => {
+    expect(ERROR_TABLE.BASELINE_MISMATCH).toEqual({
+      cliExitCode: 2,
+      code: "BASELINE_MISMATCH",
+      httpStatus: 422,
+      kind: "domain",
+    });
+    expect(ERROR_TABLE.BASELINE_STALE).toEqual({
+      cliExitCode: 12,
+      code: "BASELINE_STALE",
+      httpStatus: 422,
+      kind: "domain",
+    });
+    const stale = fromWireError("BASELINE_STALE", "stale", {
+      baseline: "checkout",
+      reason: "gone",
+    });
+    if (stale.code !== "BASELINE_STALE") throw new Error("expected BASELINE_STALE");
+    expect(stale.details).toEqual({ baseline: "checkout", reason: "gone" });
+  });
+
+  it("isSimlockError rejects a plain Error", () => {
+    expect(isSimlockError(new Error("boom"))).toBe(false);
+  });
+
+  it("answers the three enrollment codes as domain errors: not enrollable 12 and 422, busy 11 and 409, unknown 12 and 404, each with declared details", () => {
+    expect(ERROR_TABLE.DEVICE_NOT_ENROLLABLE).toEqual({
+      cliExitCode: 12,
+      code: "DEVICE_NOT_ENROLLABLE",
+      httpStatus: 422,
+      kind: "domain",
+    });
+    expect(ERROR_TABLE.DEVICE_BUSY).toEqual({
+      cliExitCode: 11,
+      code: "DEVICE_BUSY",
+      httpStatus: 409,
+      kind: "domain",
+    });
+    expect(ERROR_TABLE.UNKNOWN_DEVICE).toEqual({
+      cliExitCode: 12,
+      code: "UNKNOWN_DEVICE",
+      httpStatus: 404,
+      kind: "domain",
+    });
+    for (const code of ["DEVICE_NOT_ENROLLABLE", "DEVICE_BUSY", "UNKNOWN_DEVICE"] as const) {
+      expect(CODES_WITH_DECLARED_DETAILS.has(code)).toBe(true);
+    }
+  });
+});
+
+describe("CAPABILITY_MISSING", () => {
+  it("maps CAPABILITY_MISSING to HTTP 422 and CLI exit 12 as a domain error whose details name the capabilities", () => {
+    const table: Record<string, unknown> = ERROR_TABLE;
+    const error = fromWireError("CAPABILITY_MISSING", "This worker cannot serve agent-device", {
+      capabilities: ["agent-device"],
+    });
+
+    expect(table["CAPABILITY_MISSING"]).toEqual({
+      cliExitCode: 12,
+      code: "CAPABILITY_MISSING",
+      httpStatus: 422,
+      kind: "domain",
+    });
+    expect(error).toMatchObject({
+      code: "CAPABILITY_MISSING",
+      details: { capabilities: ["agent-device"] },
+      kind: "domain",
+    });
+  });
+});
+
+describe("PROVISION_FAILED", () => {
+  it("maps PROVISION_FAILED to CLI exit 1 and HTTP 500 as a domain error", () => {
+    const table: Record<string, unknown> = ERROR_TABLE;
+
+    expect(table["PROVISION_FAILED"]).toEqual({
+      cliExitCode: 1,
+      code: "PROVISION_FAILED",
+      httpStatus: 500,
+      kind: "domain",
+    });
+  });
+});
+
+describe("RELAY_TARGET_MISSING", () => {
+  it("maps RELAY_TARGET_MISSING to HTTP 503 and CLI exit 1 as a domain error whose details name the target", () => {
+    const table: Record<string, unknown> = ERROR_TABLE;
+    const error = fromWireError(
+      "RELAY_TARGET_MISSING",
+      "No module on this worker serves agent-device",
+      {
+        target: "agent-device",
+      },
+    );
+
+    expect(table["RELAY_TARGET_MISSING"]).toEqual({
+      cliExitCode: 1,
+      code: "RELAY_TARGET_MISSING",
+      httpStatus: 503,
+      kind: "domain",
+    });
+    expect(error).toMatchObject({
+      code: "RELAY_TARGET_MISSING",
+      details: { target: "agent-device" },
+      kind: "domain",
+    });
+  });
+
+  it("gives the update codes their exit code and HTTP status: DAEMON_UPDATING 1 and 503, UPDATE_RESOLVE_FAILED 1 and 502, UPDATE_UNSUPPORTED_INSTALL and UPDATE_SHARED_INSTALL 2 and 409", () => {
+    const expected = {
+      DAEMON_UPDATING: { cliExitCode: 1, httpStatus: 503 },
+      UPDATE_RESOLVE_FAILED: { cliExitCode: 1, httpStatus: 502 },
+      UPDATE_UNSUPPORTED_INSTALL: { cliExitCode: 2, httpStatus: 409 },
+      UPDATE_SHARED_INSTALL: { cliExitCode: 2, httpStatus: 409 },
+    } as const;
+    for (const [code, entry] of Object.entries(expected)) {
+      expect(ERROR_TABLE[code as keyof typeof expected]).toEqual({
+        code,
+        kind: "domain",
+        ...entry,
+      });
+    }
+  });
+});
+
+describe("the website's errors reference", () => {
+  const page = readFileSync(
+    join(REPO_ROOT, "website/src/content/docs/docs/reference/errors.mdx"),
+    "utf8",
+  );
+  const exitCodes = page.split(/^## /m).find((part) => part.startsWith("Exit codes")) ?? "";
+  const rows = [...exitCodes.matchAll(/^\| (\d+) \| ([^|]*) \|/gm)].map((match) => ({
+    exit: Number(match[1]),
+    codes: [...(match[2] ?? "").matchAll(/`([A-Z_]+)`/g)].map((code) => code[1]),
+  }));
+
+  it("lists every error code in exactly one exit-code row, the row of its CLI exit code", () => {
+    expect(rows.find((row) => row.exit === 1)?.codes).toContain("INTERNAL");
+    const misplaced = Object.values(ERROR_TABLE).flatMap(({ code, cliExitCode }) => {
+      const holding = rows.filter((row) => row.codes.includes(code)).map((row) => row.exit);
+      return holding.length === 1 && holding[0] === cliExitCode
+        ? []
+        : [`${code}: exit ${cliExitCode}, listed under ${holding.join(", ") || "no row"}`];
+    });
+
+    expect(misplaced).toEqual([]);
+  });
+});

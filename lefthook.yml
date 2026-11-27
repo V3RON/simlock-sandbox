@@ -1,0 +1,76 @@
+pre-commit:
+  parallel: true
+  commands:
+    # Formats what is staged and stages the result, so nobody runs a formatter by hand.
+    format:
+      glob: "*.{ts,tsx,js,mjs,json,md,yml,yaml}"
+      # website/ is its own package and oxfmt skips it, so a commit with only website/ files would
+      # hand oxfmt nothing and fail.
+      exclude:
+        - "docs/**"
+        - "website/**"
+      run: pnpm exec oxfmt {staged_files}
+      stage_fixed: true
+    lint:
+      glob: "*.{ts,tsx,js,mjs,mts,cts}"
+      run: pnpm exec oxlint {staged_files}
+      fail_text: "Run 'pnpm lint' to fix lint errors."
+    # Which file may import which path is a whole-graph question, so this checks every import; it takes seconds.
+    boundaries:
+      glob: "*.{ts,tsx,js,mjs,mts,cts,json}"
+      run: pnpm exec depcruise src e2e ui packages --ignore-known
+      fail_text: "An import crosses a component's index or a direction rule (architecture rule 14, ADR 0027)."
+    # A comment the commit adds or edits starts with "why:" or goes (architecture rule 17).
+    comments:
+      glob: "*.{ts,tsx,js,mjs,mts,cts,sh}"
+      run: node .agents/scripts/comment-lint.mjs --base HEAD {staged_files}
+      fail_text: "Delete the comment, or start it with 'why:' when it says why the code does something unexpected."
+    # A test line the commit adds keeps testing rules 5, 6 and 10, and a contract line bounds wire input (always-in-scope 8).
+    tests:
+      glob:
+        - "*.test.{ts,tsx}"
+        - "src/contract/*.ts"
+      run: node .agents/scripts/test-lint.mjs --base HEAD {staged_files}
+      fail_text: "Each line names the rule it breaks and what to write instead."
+    # A change can break the files that call it, so this checks the whole project; it takes seconds.
+    typecheck:
+      glob: "*.{ts,tsx,mts,cts}"
+      run: pnpm run typecheck
+
+commit-msg:
+  commands:
+    # A commit on a delivery branch names its issue, in the build brief's shapes.
+    subject:
+      run: node .agents/scripts/commit-msg-check.mjs {1}
+
+# These check the whole tree, or the whole branch against main, so they run once per push
+# rather than on every checkpoint commit.
+pre-push:
+  piped: true
+  commands:
+    # CI's own command (ci.yml, Fallow job): a push that passes here passes there.
+    fallow:
+      priority: 1
+      run: pnpm fallow --ci --format github-annotations
+      fail_text: "Fallow fails on this tree as it will in CI: fix each ::error and ::warning line (a ::notice never fails). One in a file the branch did not change means main is red: stop and report it."
+    # These tests read the repository's files rather than import code, so `pnpm test:changed`
+    # never selects them and any change can break them; together they take about a second.
+    repo-tests:
+      priority: 1
+      # why: a triage branch pushes a reproduction that fails by design (delivery rule 8); CI runs every repo test.
+      skip:
+        - ref: bug/*-repro
+        - ref: wip/*-repro
+      run: pnpm exec vitest run --project unit .repo.test.ts
+      fail_text: "A test of the repository's own files fails (a size cap, the ADR index, a doc's audience): the output names the file and the rule."
+    protocol-bump:
+      priority: 1
+      run: node .agents/scripts/protocol-bump-check.mjs --base origin/main
+      fail_text: "A contract shape change and a PROTOCOL_VERSION_RANGE bump go together (toolchain.md, Contract shapes)."
+    docs-surface:
+      priority: 1
+      run: node .agents/scripts/docs-surface-check.mjs --base origin/main
+      fail_text: "A public surface change and its website pages go together (documentation rule 9)."
+    typecheck-e2e:
+      priority: 2
+      run: pnpm run typecheck:e2e:types
