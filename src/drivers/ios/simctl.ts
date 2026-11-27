@@ -76,7 +76,7 @@ export class Simctl {
     try {
       await this.shutdown(udid, set);
     } catch {
-      // why: Boot failure cleanup must not obscure the timeout that triggered it.
+      // why: Boot failure cleanup must not obscure the timeout that triggered it, and a destroy lets `simctl delete` decide: a stuck shutdown must not stop the delete.
     }
   }
 
