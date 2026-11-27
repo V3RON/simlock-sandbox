@@ -1157,5 +1157,25 @@ describe("simlock lease: a slim iOS lease says which categories are off", () => 
       expect(JSON.parse(output.stdout).lease.id, row.name).toBe("lse_1");
       if (row.catalogCalls !== undefined) expect(catalogCalls, row.name).toBe(row.catalogCalls);
     }
+    const exported = outputCapture();
+    await runCli(
+      ["lease", "--platform", "ios", "--mode", "slim", "--detach", "--export-env"],
+      exported.environmentWith({
+        connectAdmin: async () =>
+          fakeClient({
+            requestLease: () =>
+              Promise.resolve({
+                ...grantFor({ mode: "slim" }),
+                environment: { ANDROID_SERIAL: "dev_1" },
+              }),
+            getCatalog: () => Promise.resolve(catalogOf(CATEGORIES)),
+          }),
+      }),
+    );
+    expect(exported.stdout, "--export-env writes export lines, no notice").toContain(
+      "export ANDROID_SERIAL=",
+    );
+    expect(exported.stdout).not.toContain("notice");
+    expect(slimLines(exported.stderr), "--export-env").toBe(hintLine(CATEGORIES));
   });
 });
