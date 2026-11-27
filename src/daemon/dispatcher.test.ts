@@ -751,13 +751,21 @@ describe("Dispatcher: nuke.run", () => {
     expect(registry.snapshot.leases).toHaveLength(1);
   });
 
-  it("admin can run it, releasing every lease and reporting the deleteDevices flag it ran with", async () => {
+  it("admin can run it, releasing every lease of the platform it names, or of every platform without one", async () => {
     const { dispatcher, registry } = await buildDispatcher({ includeNuke: true });
     await dispatcher.dispatch(
       "lease.request",
       { model: "iPhone 17 Pro", osVersion: "26.5", platform: "ios" },
       session({ principal: "tok_owner" }),
     );
+    expect(registry.snapshot.leases).toHaveLength(1);
+
+    const other = await dispatcher.dispatch(
+      "nuke.run",
+      { deleteDevices: false, platform: "android" },
+      session({ role: "admin" }),
+    );
+    expect(other.releasedLeaseIds).toEqual([]);
     expect(registry.snapshot.leases).toHaveLength(1);
 
     const result = await dispatcher.dispatch(
