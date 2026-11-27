@@ -25,18 +25,29 @@ describe.skipIf(process.platform !== "darwin")(
       { timeout: 600_000 },
       async () => {
         const runtimes = await simctlJson<{
-          runtimes: { identifier: string; isAvailable: boolean; platform?: string }[];
+          runtimes: {
+            identifier: string;
+            isAvailable: boolean;
+            platform?: string;
+            supportedDeviceTypes?: { identifier: string; productFamily?: string }[];
+          }[];
         }>(["list", "runtimes"]);
-        const runtime = runtimes.runtimes.find(
-          (candidate) => candidate.isAvailable && (candidate.platform ?? "iOS") === "iOS",
-        );
-        expect(runtime, "this lane needs an installed iOS runtime").toBeDefined();
-        const types = await simctlJson<{ devicetypes: { identifier: string; name: string }[] }>([
-          "list",
-          "devicetypes",
-        ]);
-        const type = types.devicetypes.find((candidate) => candidate.name.startsWith("iPhone"));
-        expect(type, "this lane needs an iPhone device type").toBeDefined();
+        // why: A runtime rejects device types it does not list ("Incompatible device"), so the type comes from the runtime's own list.
+        const pair = runtimes.runtimes
+          .filter((candidate) => candidate.isAvailable && (candidate.platform ?? "iOS") === "iOS")
+          .map((candidate) => ({
+            runtime: candidate,
+            type: candidate.supportedDeviceTypes?.find(
+              (supported) => supported.productFamily === "iPhone",
+            ),
+          }))
+          .find((candidate) => candidate.type !== undefined);
+        expect(
+          pair,
+          "this lane needs an installed iOS runtime that supports an iPhone",
+        ).toBeDefined();
+        const runtime = pair?.runtime;
+        const type = pair?.type;
 
         const home = await mkdtemp(join(tmpdir(), "simlock-e2e-destroy-"));
         const deviceSet = join(home, "set");
