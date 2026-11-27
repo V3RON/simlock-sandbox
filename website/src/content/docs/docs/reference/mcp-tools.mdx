@@ -69,6 +69,8 @@ Leases one simulator, emulator or enrolled phone for this session, and waits for
 
 The answer is the grant, the same JSON `simlock lease` prints: `device` (with `driverDeviceId`, the UDID or serial), `environment`, `lease` and `timing`.
 
+On a slim iOS lease the answer carries one more field, `hint`: one line naming the slim categories that are off on the device and the way to get them back, such as `slim: widgets, siri, … other off; pass except: ["<name>"] or mode: "full"`. It is in the structured result and in the text. The categories are the worker's slim categories (`list_devices` shows them as `slimCategories`) minus the lease's `except`. `hint` is absent on a full, Android or physical lease, when nothing is left off, and when the catalog read fails or takes more than 2 seconds.
+
 While it waits, a client that sent a progress token gets progress notifications: `Queued behind 2 other requests`, `Next in queue`, `Downloading <component> (40%)`, `Waiting for another download before downloading <component>`, `Provisioning device (~45s remaining)`, `Booting device (~20s remaining)`. Cancelling the tool call cancels the waiting request.
 
 ## lease_status
