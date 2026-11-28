@@ -103,9 +103,11 @@ async function createRoot(context: RootContext): Promise<boolean> {
     return false;
   }
 
-  await attempt(context, "its parent directory could not be created", () =>
-    filesystem.mkdirp(dirname(root)),
-  );
+  // why: a recursive mkdir of a parent that exists can still fail: Node on Windows answers EPERM
+  // for a drive root such as `D:\` (#78). The parent is only made when it is missing.
+  await attempt(context, "its parent directory could not be created", async () => {
+    if (!(await filesystem.exists(dirname(root)))) await filesystem.mkdirp(dirname(root));
+  });
 
   const staging = stagingPath(root, context.idGenerator, context.pid);
   try {
