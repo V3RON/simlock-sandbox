@@ -191,7 +191,7 @@ describe("assess", () => {
     });
   });
 
-  it("makes a request wait, not fail UNKNOWN_MODEL, NO_DRIVER or RUNTIME_MISSING, while a connected worker's catalog is not read yet", () => {
+  it("makes a request wait, not fail UNKNOWN_MODEL, NO_DRIVER or RUNTIME_MISSING, while a connected worker's catalog is not read yet, but not for a drained or disconnected one", () => {
     // why: the view `WorkerRegistry.connected` builds for a worker the gateway never read, as after a gateway restart, until the link's first full refresh.
     const unread: WorkerView = {
       connection: "connected",
@@ -209,6 +209,15 @@ describe("assess", () => {
     expect(assess({ ...REQUEST, model: "iPhone 16", osVersion: "27.0" }, views)).toEqual({
       kind: "route-or-wait",
     });
+
+    for (const gone of [
+      { ...unread, drained: true },
+      { ...unread, connection: "disconnected" as const },
+    ]) {
+      expect(rejectionOf([gone, other], { ...REQUEST, model: "iPhone 99" }).code).toBe(
+        "UNKNOWN_MODEL",
+      );
+    }
   });
 
   it("makes a request only a starting worker can serve wait, though another worker takes requests but lists no such model", () => {
