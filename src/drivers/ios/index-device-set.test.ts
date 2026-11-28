@@ -30,6 +30,7 @@ import {
   PHYSICAL_DEVICE,
   listFixture,
   prepareFull,
+  plantSeedClone,
   seedUdid,
   seededDatabase,
   simctlPassthrough,
@@ -383,6 +384,7 @@ describe("IosSimctlDriver device set", () => {
         const filesystem = new MemoryFilesystem();
         if (scoped) await plantManagedDevice(filesystem);
         else await filesystem.mkdirp(`${devicesDir}/${driverData.udid}/data`);
+        await plantSeedClone(filesystem, scoped ? sourcesSetPath : unownedSourcesSet);
         const driver = await IosSimctlDriver.create({
           database: await seededDatabase(),
           clock: new FakeClock(),

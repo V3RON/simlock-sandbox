@@ -214,8 +214,8 @@ describe("IosSimctlDriver", () => {
       });
       const driver = await createDriver(runner, new FakeClock(), filesystem, database);
       await plantManagedDevice(filesystem);
-      if (planted === "present") await plantSeedClone(filesystem);
-      if (planted === "set-without-it") await filesystem.mkdirp(sourcesSetPath);
+      if (planted === "set-without-it") await filesystem.rm(join(sourcesSetPath, seedUdid));
+      if (planted === "no-set") await filesystem.rm(sourcesSetPath);
       if (makes === 1) await plantSeedClone(filesystem, sourcesSetPath, newSeed);
       await filesystem.mkdirp(`${deviceRoot}/${copyUdid}/data`);
       await filesystem.mkdirp(`${deviceRoot}/${secondCopy}/data`);
@@ -462,7 +462,7 @@ describe("IosSimctlDriver", () => {
       };
       const filesystem = new MemoryFilesystem();
       await plantManagedDevice(filesystem);
-      await plantSeedClone(filesystem);
+      await plantSeedClone(filesystem, isDefault ? unownedSourcesSet : sourcesSetPath);
       const clock = new FakeClock();
       const driver = await IosSimctlDriver.create({
         database: seeded ? await seededDatabase() : await memorySourceDatabase(),
