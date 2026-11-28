@@ -504,7 +504,7 @@ export function reconnectWhileWaiting<T>(options: {
  * why: How long the slim hint waits for its one `catalog.get`. The hint is a courtesy after a
  * grant, so it never holds a lease's output back for longer than this.
  */
-export const SLIM_HINT_TIMEOUT_MS = 2_000;
+const SLIM_HINT_TIMEOUT_MS = 2_000;
 
 /**
  * why: The slim categories a granted iOS device has off, for the hint line both frontends print:
