@@ -45,14 +45,27 @@ describe("simctl delete after a shutdown that timed out (#98)", () => {
       const shutdown = spawn("xcrun", ["simctl", "--set", set, "shutdown", udid], {
         stdio: "ignore",
       });
+      let closed = false;
+      const closedP = new Promise<void>((resolve) =>
+        shutdown.once("close", () => {
+          closed = true;
+          resolve();
+        }),
+      );
       // why: killing in the same tick as spawn() can stop simctl before CoreSimulator hears of the shutdown; wait until the device has left "Booted" so the kill lands mid-shutdown.
       const deadline = Date.now() + 15_000;
-      while ((await deviceState(set, udid)) === "Booted") {
+      let state = await deviceState(set, udid);
+      while (state === "Booted") {
         expect(Date.now(), "the device never began shutting down").toBeLessThan(deadline);
         await new Promise((resolve) => setTimeout(resolve, 20));
+        state = await deviceState(set, udid);
       }
+      expect(state, "the shutdown finished before it could be killed mid-way").toBe(
+        "Shutting Down",
+      );
+      expect(closed, "simctl shutdown exited before the kill").toBe(false);
       shutdown.kill("SIGKILL");
-      await new Promise((resolve) => shutdown.once("close", resolve));
+      await closedP;
 
       await simctl(set, "delete", udid);
       const listed = JSON.parse(await simctl(set, "list", "devices", "-j")) as {
