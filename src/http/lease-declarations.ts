@@ -236,7 +236,7 @@ export const leaseRequestBodySchema = z
     runId: z.string().optional(),
     // why: A plain string, bounded by `refuseBadLabel` below as the one check, like `lease.request`'s: the same words on every transport.
     label: z.string().optional(),
-    // why: the operation's own field, so the names, the bound of 8 and the repeat check are worded as on every transport.
+    // why: a plain array of strings; `lease.request`'s own `refuseBadRequires` check words the refusal (names, count, repeats), as for the CLI and MCP.
     requires: leaseRequestFields.shape.requires,
     timeoutMs: z.number().int().positive().optional(),
     ttlMs: z.number().int().positive().optional(),
