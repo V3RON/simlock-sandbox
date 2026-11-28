@@ -21,6 +21,7 @@ import {
   waitForCalls,
   simctl,
   instanceId,
+  overridesFolder,
   unownedSourcesSet,
 } from "./test-slim.js";
 import {
@@ -57,6 +58,62 @@ afterEach(() => {
     expect([deviceRoot, sourcesSetPath]).toContain(call.args[2]);
   }
 });
+
+const newSeedUdid = "00000000-0000-0000-0000-0000000000cc";
+
+/** why: provisions a kind whose planted seed is present or gone, with only the calls a clone, or a make then a clone, needs scripted, and reports what the driver did and kept. */
+async function provisionWithSeed(options: {
+  readonly gone: "folder" | "none" | "set";
+  readonly provisions: number;
+}) {
+  const copies = ["00000000-0000-0000-0000-000000000002", "00000000-0000-0000-0000-000000000003"];
+  const wanted = copies.slice(0, options.provisions);
+  const seed = options.gone === "none" ? seedUdid : newSeedUdid;
+  const copyClone = sourcesSimctl("clone", seed, driverData.name, deviceRoot);
+  const filesystem = new MemoryFilesystem();
+  // why: with the set gone, the make's own `simctl clone` creates it again, so the folder is planted when that call spawns, never before the gone check.
+  const madeSeed = throwawaySeedSteps(newSeedUdid).map((step, index) =>
+    index === 5
+      ? { ...step, onSpawn: () => plantSeedClone(filesystem, sourcesSetPath, newSeedUdid) }
+      : step,
+  );
+  const runner = new ScriptedProcessRunner([
+    ...wanted.map(() => ({
+      match: listInvocation,
+      result: { code: 0, stderr: "", stdout: listFixture },
+    })),
+    ...(options.gone === "none" ? [] : madeSeed),
+    ...wanted.map((copy) => ({
+      match: copyClone,
+      result: { code: 0, stderr: "", stdout: `${copy}\n` },
+    })),
+  ]);
+  const database = await seededDatabase({ files: [{ kind: "file", relativePath: "data/x.db" }] });
+  const driver = await createDriver(runner, new FakeClock(), filesystem, database);
+  await plantManagedDevice(filesystem);
+  if (options.gone === "folder") await filesystem.rm(join(sourcesSetPath, seedUdid));
+  if (options.gone === "set") await filesystem.rm(sourcesSetPath);
+  if (options.gone === "folder") await plantSeedClone(filesystem, sourcesSetPath, newSeedUdid);
+  for (const copy of copies) await filesystem.mkdirp(`${deviceRoot}/${copy}/data`);
+  await filesystem.mkdirp(overridesFolder(seedUdid));
+
+  const granted = await Promise.all(wanted.map(() => driver.provision(spec)));
+
+  return {
+    creates: runner.calls.filter((call) => call.args[3] === "create").length,
+    goneRowKept:
+      database
+        .prepare("SELECT source_id FROM ios_source_files WHERE source_id = ?")
+        .all(`planted-${seedUdid}-${driverData.runtimeId}`).length > 0,
+    goneTouched: runner.calls.some((call) => call.args.includes(seedUdid)),
+    granted: granted.length,
+    overridesKept: await filesystem.exists(overridesFolder(seedUdid)),
+    seeds: database
+      .prepare("SELECT udid FROM ios_source_data")
+      .all()
+      .map((row) => row.udid),
+  };
+}
 
 describe("IosSimctlDriver", () => {
   it("a provision that makes a new iOS seed boots the seed within ios.full.bootTimeoutMs", async () => {
@@ -180,6 +237,24 @@ describe("IosSimctlDriver", () => {
     expect(database.prepare("SELECT udid, state FROM ios_source_data").all()).toEqual([
       { state: "ready", udid: seedUdid },
     ]);
+  });
+
+  it("an iOS lease of a kind whose seed simulator is not in the sources set is granted on a new seed made without any simctl call on the gone one, and one present is cloned", async () => {
+    const outcomes = {
+      "folder present": await provisionWithSeed({ gone: "none", provisions: 1 }),
+      "deleted by hand": await provisionWithSeed({ gone: "folder", provisions: 1 }),
+      "sources set missing": await provisionWithSeed({ gone: "set", provisions: 1 }),
+      "two provisions at once": await provisionWithSeed({ gone: "folder", provisions: 2 }),
+    };
+
+    const kept = { creates: 0, goneRowKept: true, goneTouched: true, overridesKept: true };
+    const remade = { creates: 1, goneRowKept: false, goneTouched: false, overridesKept: false };
+    expect(outcomes).toEqual({
+      "folder present": { ...kept, granted: 1, seeds: [seedUdid] },
+      "deleted by hand": { ...remade, granted: 1, seeds: [newSeedUdid] },
+      "sources set missing": { ...remade, granted: 1, seeds: [newSeedUdid] },
+      "two provisions at once": { ...remade, granted: 2, seeds: [newSeedUdid] },
+    });
   });
 
   it("two provisions at once make one seed, and the clones of one seed run one at a time", async () => {
@@ -396,7 +471,7 @@ describe("IosSimctlDriver", () => {
       };
       const filesystem = new MemoryFilesystem();
       await plantManagedDevice(filesystem);
-      await plantSeedClone(filesystem);
+      await plantSeedClone(filesystem, isDefault ? unownedSourcesSet : sourcesSetPath);
       const clock = new FakeClock();
       const driver = await IosSimctlDriver.create({
         database: seeded ? await seededDatabase() : await memorySourceDatabase(),

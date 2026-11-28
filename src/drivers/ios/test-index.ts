@@ -224,9 +224,10 @@ export async function createDriver(
   extra: Partial<IosSimctlDriverOptions> = {},
 ): Promise<IosSimctlDriver> {
   scopedRunners.push(runner);
-  return IosSimctlDriver.create({
+  const sources = database ?? (await memorySourceDatabase());
+  const driver = await IosSimctlDriver.create({
     ...extra,
-    database: database ?? (await memorySourceDatabase()),
+    database: sources,
     clock,
     driverConfig: { deviceRoot },
     filesystem,
@@ -239,6 +240,13 @@ export async function createDriver(
     processRunner: runner,
     simlockHome: "/home/.simlock",
   });
+  // why: a ready source row a test planted stands for a simulator `simctl clone` made in the sources set, which the scripted runner cannot; the folders come after the driver's start, which refuses a root holding anything unmarked, and a test of a seed deleted by hand removes its folder afterwards.
+  for (const row of sources
+    .prepare("SELECT udid FROM ios_source_data WHERE state = 'ready'")
+    .all()) {
+    if (typeof row.udid === "string") await filesystem.mkdirp(join(sourcesSetPath, row.udid));
+  }
+  return driver;
 }
 
 /** why: a LaunchServices database file and a neighbour that must stay, in the device folder `device`. */

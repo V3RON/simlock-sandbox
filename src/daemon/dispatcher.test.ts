@@ -751,6 +751,40 @@ describe("Dispatcher: nuke.run", () => {
     expect(registry.snapshot.leases).toHaveLength(1);
   });
 
+  it("a platform on the call ends only that platform's leases, and a platform that is none is BAD_REQUEST with nothing ended", async () => {
+    const android = new FakeDriver({
+      availableOsVersions: ["36"],
+      clock: new FakeClock(0),
+      platform: "android",
+    });
+    const { dispatcher, registry } = await buildDispatcher({
+      extraDrivers: [android],
+      includeNuke: true,
+    });
+    const admin = session({ role: "admin" });
+    const owner = session({ principal: "tok_owner" });
+    await dispatcher.dispatch(
+      "lease.request",
+      { model: "iPhone 17 Pro", osVersion: "26.5", platform: "ios" },
+      owner,
+    );
+    const kept = await dispatcher.dispatch(
+      "lease.request",
+      { model: "Pixel 8", osVersion: "36", platform: "android" },
+      session({ principal: "tok_other" }),
+    );
+
+    await expect(
+      dispatcher.dispatch("nuke.run", { platform: "windows" } as never, admin),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(registry.snapshot.leases).toHaveLength(2);
+
+    const result = await dispatcher.dispatch("nuke.run", { platform: "ios" }, admin);
+
+    expect(result.releasedLeaseIds).toHaveLength(1);
+    expect(registry.snapshot.leases.map((lease) => lease.id)).toEqual([kept.lease.id]);
+  });
+
   it("admin can run it, releasing every lease and reporting the deleteDevices flag it ran with", async () => {
     const { dispatcher, registry } = await buildDispatcher({ includeNuke: true });
     await dispatcher.dispatch(

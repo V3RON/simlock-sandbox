@@ -45,7 +45,7 @@ Learned kinds:
 - The catalog check forgets a kind whose model, OS, image tag, iOS mode (`ios.modes`) or driver is gone, or whose baseline is removed or stale. `LEARNED_FAILURES_LIMIT` (`converger.ts`) failed boots in a row forget it too.
 - A kind whose platform has no catalog answer yet (read pending, failed or timed out) is kept and planned for nothing that pass.
 - `forgetKinds` (ADR 0050) drops a kind's failed-boot count unless a configured target shares its spec. The devices the kind kept are left to the reaper's idle rules.
-- The learned kinds are the pool's own `state.db` tables (`warmPoolOwner`), kept across restarts and cleared by nuke. Targets are config.
+- The learned kinds are the pool's own `state.db` tables (`warmPoolOwner`), kept across restarts and cleared by nuke (one platform's, when nuke names one). Targets are config.
 
 What others read:
 

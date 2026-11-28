@@ -195,8 +195,8 @@ export function createCore(options: CoreOptions): Core {
     leases: {
       beginMaintenance: () => port("leaseMaintenance").leases.beginMaintenance(),
       endMaintenance: () => port("leaseMaintenance").leases.endMaintenance(),
-      releaseAllDuringMaintenance: (reason: "killed") =>
-        port("leaseMaintenance").leases.releaseAllDuringMaintenance(reason),
+      releaseAllDuringMaintenance: (reason: "killed", platform?: Platform) =>
+        port("leaseMaintenance").leases.releaseAllDuringMaintenance(reason, platform),
     },
   };
 
@@ -386,14 +386,14 @@ export function createCore(options: CoreOptions): Core {
       },
       endMaintenance: async () => leaseMaintenance.acquisition.endMaintenance(),
     },
-    baselines: { removeAll: () => baselines.removeAll() },
+    baselines: { removeAll: (platform?: Platform) => baselines.removeAll(platform) },
     devices: deviceLifecycle,
     drivers: options.drivers,
     leases: leaseMaintenance.leases,
     ...(options.logger === undefined ? {} : { logger: options.logger }),
     registry,
     seedSettler,
-    warmPool: { forget: () => warmPool.forget() },
+    warmPool: { forget: (platform?: Platform) => warmPool.forget(platform) },
   });
   const doctor = new Doctor({
     baselines,

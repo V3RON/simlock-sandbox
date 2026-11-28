@@ -34,6 +34,7 @@ import {
   plantLaunchServices,
   prepareFull,
   scopedRunners,
+  plantSeedClone,
   seedUdid,
   seededDatabase,
   sourcesSimctl,
@@ -226,6 +227,7 @@ describe("IosSimctlDriver", () => {
   ])("a provision $name", async ({ seedHas, failing }) => {
     const filesystem = new FaultyFilesystem();
     await plantManagedDevice(filesystem);
+    await plantSeedClone(filesystem);
     if (seedHas) {
       await filesystem.mkdirp(overridesFolder(seedUdid));
       await filesystem.writeFileAtomic(overridesPath(seedUdid), overridesPlist({ "a.b": true }));

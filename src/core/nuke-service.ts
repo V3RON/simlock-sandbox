@@ -1,4 +1,4 @@
-import type { LeaseRecord, VirtualDevice } from "./domain.js";
+import type { LeaseRecord, Platform, VirtualDevice } from "./domain.js";
 import type { Driver } from "./driver.js";
 import { type Logger, NoopLogger } from "../ports/index.js";
 import type { NukeExecutor } from "./core-ports.js";
@@ -7,7 +7,7 @@ import { stableError } from "./stable-error.js";
 
 export interface LeaseMaintenance {
   beginMaintenance(): Promise<void>;
-  releaseAllDuringMaintenance(reason: "killed"): Promise<readonly string[]>;
+  releaseAllDuringMaintenance(reason: "killed", platform?: Platform): Promise<readonly string[]>;
   endMaintenance(): Promise<void>;
 }
 
@@ -45,9 +45,11 @@ export interface NukeServiceOptions {
   readonly devices: NukeDeviceLifecycle;
   readonly acquisition: AcquisitionMaintenance;
   readonly leases: LeaseMaintenance;
-  /** why: nuke --delete-devices removes every baseline and answers their names. */
+  /** why: nuke --delete-devices removes every baseline of the platform (or of both) and answers their names. */
   readonly baselines: {
-    removeAll(): Promise<{ readonly failure?: unknown; readonly names: readonly string[] }>;
+    removeAll(
+      platform?: Platform,
+    ): Promise<{ readonly failure?: unknown; readonly names: readonly string[] }>;
   };
   readonly registry: NukeRegistryView;
   /** why: nuke --delete-devices also deletes the seeds the drivers keep; it names no other source (ADR 0061 §1). */
@@ -56,7 +58,7 @@ export interface NukeServiceOptions {
   /** why: a nuke deletes seeds, so no settle runs or swaps a seed while it does (ADR 0090 §2). */
   readonly seedSettler: Pick<SeedSettler, "holdWhile">;
   /** why: nuke starts the warm pool over, so the kinds it learned are not booted back. */
-  readonly warmPool: { forget(): void };
+  readonly warmPool: { forget(platform?: Platform): void };
 }
 
 /**
@@ -74,7 +76,7 @@ export class NukeService implements NukeExecutor {
     this.#logger = options.logger?.child("nuke") ?? new NoopLogger();
   }
 
-  async nuke(deleteDevices: boolean): Promise<NukeReport> {
+  async nuke(deleteDevices: boolean, platform?: Platform): Promise<NukeReport> {
     let release!: () => void;
     const previous = this.#tail;
     this.#tail = new Promise<void>((resolve) => {
@@ -82,21 +84,24 @@ export class NukeService implements NukeExecutor {
     });
     await previous;
     try {
-      return await this.options.seedSettler.holdWhile(() => this.#runNuke(deleteDevices));
+      return await this.options.seedSettler.holdWhile(() => this.#runNuke(deleteDevices, platform));
     } finally {
       release();
     }
   }
 
-  async #runNuke(deleteDevices: boolean): Promise<NukeReport> {
+  async #runNuke(deleteDevices: boolean, platform?: Platform): Promise<NukeReport> {
     await this.options.acquisition.beginMaintenance();
     let releaseMaintenanceStarted = false;
     try {
       await this.options.leases.beginMaintenance();
       releaseMaintenanceStarted = true;
-      const releasedLeaseIds = await this.options.leases.releaseAllDuringMaintenance("killed");
+      const releasedLeaseIds = await this.options.leases.releaseAllDuringMaintenance(
+        "killed",
+        platform,
+      );
       try {
-        this.options.warmPool.forget();
+        this.options.warmPool.forget(platform);
       } catch (error: unknown) {
         this.#logger.error("nuke could not clear the warm pool's record", {
           error: stableError(error),
@@ -104,6 +109,7 @@ export class NukeService implements NukeExecutor {
       }
 
       for (const device of this.options.registry.snapshot.virtualDevices) {
+        if (platform !== undefined && device.spec.platform !== platform) continue;
         try {
           await this.#resetDevice(device, deleteDevices);
         } catch (error: unknown) {
@@ -115,8 +121,8 @@ export class NukeService implements NukeExecutor {
         }
       }
 
-      if (deleteDevices) await this.#destroySeeds();
-      const removedBaselines = deleteDevices ? await this.#removeBaselines() : [];
+      if (deleteDevices) await this.#destroySeeds(platform);
+      const removedBaselines = deleteDevices ? await this.#removeBaselines(platform) : [];
 
       return { releasedLeaseIds, removedBaselines };
     } finally {
@@ -129,8 +135,8 @@ export class NukeService implements NukeExecutor {
   }
 
   /** why: a baseline source that will not delete must not fail the reset; its row is already gone, so every name is reported, and `doctor` lists the source that stayed. */
-  async #removeBaselines(): Promise<readonly string[]> {
-    const { failure, names } = await this.options.baselines.removeAll();
+  async #removeBaselines(platform?: Platform): Promise<readonly string[]> {
+    const { failure, names } = await this.options.baselines.removeAll(platform);
     if (failure !== undefined) {
       this.#logger.error("nuke could not remove every baseline", { error: stableError(failure) });
     }
@@ -138,8 +144,9 @@ export class NukeService implements NukeExecutor {
   }
 
   /** why: one unreadable or stuck seed must not stop the rest of the reset; the seed stays and `doctor` lists it. */
-  async #destroySeeds(): Promise<void> {
+  async #destroySeeds(platform?: Platform): Promise<void> {
     for (const driver of this.options.drivers) {
+      if (platform !== undefined && driver.platform !== platform) continue;
       try {
         for (const source of await driver.listSources()) {
           if (source.kind !== "seed" || source.orphan === true) continue;
