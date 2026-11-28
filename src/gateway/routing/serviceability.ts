@@ -198,7 +198,14 @@ function assessLeading(
   if (takersOf(request, views).length === 0) return noWorker();
 
   if (views.some(isUnread)) return undefined;
-  const known = views.filter(isKnown);
+  return assessKnown(request, views.filter(isKnown));
+}
+
+// why: the rows over the known workers' catalogs: driver, mode, model, runtime.
+function assessKnown(
+  request: RoutableRequest,
+  known: readonly WorkerView[],
+): Rejection | undefined {
   const platform = request.platform;
   if (!known.some((worker) => hasPlatform(worker, request))) {
     return {
