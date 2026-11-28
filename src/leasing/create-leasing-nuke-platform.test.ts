@@ -125,4 +125,58 @@ describe("createLeasing: a platform nuke", () => {
       { payload: { reason: "killed" } },
     ]);
   });
+
+  it("with --delete-devices deletes only that platform's seeds and baselines, keeps every orphan, and deletes nothing without it", async () => {
+    for (const platform of ["ios", "android"] as const satisfies readonly Platform[]) {
+      const other: Platform = platform === "ios" ? "android" : "ios";
+      for (const deleteDevices of [true, false]) {
+        const label = `${platform} ${deleteDevices ? "with" : "without"} --delete-devices`;
+        const { drivers, harness } = await bothPlatforms();
+        const asks = { android: androidRequest, ios: request };
+        for (const each of [platform, other] as const) {
+          const lease = await harness.engine.request(asks[each], {
+            ownerId: each,
+            requesterId: each,
+          });
+          await harness.engine.core.baselines.save({
+            leaseId: lease.lease.id,
+            name: `${each}-checkout`,
+            requesterId: each,
+          });
+          drivers[each].setSources([
+            ...(await drivers[each].listSources()),
+            { id: `${each}-seed`, kind: "seed", model: "m", osVersion: "1" },
+            { id: `${each}-orphan`, kind: "seed", model: "m", orphan: true, osVersion: "1" },
+          ]);
+        }
+        const sources = async (each: Platform) =>
+          (await drivers[each].listSources()).map((source) => source.id).sort();
+        const before = { [other]: await sources(other), [platform]: await sources(platform) };
+
+        const report = await harness.engine.nuke(deleteDevices, platform);
+
+        expect(report.removedBaselines, label).toEqual(
+          deleteDevices ? [`${platform}-checkout`] : [],
+        );
+        expect(
+          (await harness.engine.core.baselines.list()).map((entry) => entry.name).sort(),
+          label,
+        ).toEqual(deleteDevices ? [`${other}-checkout`] : [`android-checkout`, `ios-checkout`]);
+        expect(
+          harness.bus
+            .replay()
+            .filter((event) => event.event === "baseline.removed")
+            .map((event) => event.payload),
+          label,
+        ).toEqual(deleteDevices ? [expect.objectContaining({ reason: "nuke" })] : []);
+        expect(await sources(other), label).toEqual(before[other]);
+        const after = await sources(platform);
+        expect(after, label).toEqual(
+          deleteDevices
+            ? before[platform]?.filter((id) => id === `${platform}-orphan`)
+            : before[platform],
+        );
+      }
+    }
+  });
 });

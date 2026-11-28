@@ -47,7 +47,9 @@ export interface NukeServiceOptions {
   readonly leases: LeaseMaintenance;
   /** why: nuke --delete-devices removes every baseline and answers their names. */
   readonly baselines: {
-    removeAll(): Promise<{ readonly failure?: unknown; readonly names: readonly string[] }>;
+    removeAll(
+      platform?: Platform,
+    ): Promise<{ readonly failure?: unknown; readonly names: readonly string[] }>;
   };
   readonly registry: NukeRegistryView;
   /** why: nuke --delete-devices also deletes the seeds the drivers keep; it names no other source (ADR 0061 §1). */
