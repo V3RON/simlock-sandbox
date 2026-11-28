@@ -35,6 +35,7 @@ Seeds (ADR 0061):
 - A settle (ADR 0090) swaps a ready quick seed for its idle copy; a simulator it cannot delete keeps a `making` row for the next start's sweep.
 - A `clone` or `create` waits `ios.simulator.createTimeoutMs`. At the limit it fails but `simctl` runs on: the UDID it later prints is deleted, the seed's deletion waits for it, and 5 silent minutes more kills and logs it.
 - A `making` row of another process is swept at the first `listSources`, with its throwaway; one of this process, once older than any make takes, at the next make of its kind, never a settle's (`settle_of`).
+- A ready seed whose UDID folder is not in the sources set this process uses (deleted by hand, or left in the other device set) is gone: at the next provision of its kind its row, files rows and overrides folder are dropped with no `simctl` call, and a new seed is made. `listSources` gives such a seed, or a baseline, a `staleReason`; only a folder that is not there counts, never one that cannot be read.
 - A seed `simctl delete` calls `Invalid device` is gone: its row is dropped. `removeComponent` deletes the runtime's seeds first, then its settle rows.
 
 Physical, passthrough, screen:

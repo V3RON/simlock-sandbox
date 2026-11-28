@@ -168,6 +168,20 @@ Nuke Simlock-managed devices? [y/N] y
 
 In a script, pass `--yes`. Without a terminal and without `--yes`, the command stops with `nuke requires confirmation or --yes`.
 
+### Reset one platform
+
+`--platform ios` or `--platform android` resets that platform only. Its leases end, its simulators or emulators are shut down (and deleted with `--delete-devices`, together with its seeds and baselines), and the warm pool forgets its learned kinds. The other platform's held leases, devices, seeds, baselines and learned kinds stay as they are.
+
+```sh
+simlock nuke --delete-devices --platform ios
+```
+
+```text
+Nuke Simlock-managed ios devices? [y/N] y
+```
+
+A nuke still closes the queue for the whole machine while it runs: every waiting or booting request of both platforms is cancelled with the refusal reason `killed`, and the agent asks again afterwards. Releases and renewals of the other platform wait until the nuke ends. Its held leases stay.
+
 ## When it fails
 
 | What you see | Cause | Fix |
