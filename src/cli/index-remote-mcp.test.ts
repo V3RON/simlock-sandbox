@@ -326,7 +326,6 @@ async function queuedRequestIsReattachedAfterADrop(): Promise<void> {
   await vi.waitFor(() => expect(meets.exitCode()).toBe(0));
 }
 
-// why: a tool call's connect goes through the typed client, which checks the farm URL again, so it must carry the opt-in `simlock mcp` took.
 // why: after a reattach the grant came on the new connection, so the slim hint's catalog read goes to that one: the first is closed.
 async function aReattachedSlimGrantStillAnswersWithItsHint(): Promise<void> {
   let asked = 0;
@@ -363,6 +362,7 @@ async function aReattachedSlimGrantStillAnswersWithItsHint(): Promise<void> {
   await vi.waitFor(() => expect(served.exitCode()).toBe(0));
 }
 
+// why: a tool call's connect goes through the typed client, which checks the farm URL again, so it must carry the opt-in `simlock mcp` took.
 async function toolCallsReachAnHttpFarmByTheOptIn(): Promise<void> {
   const insecure = await serveRemoteMcp({
     ...ENV,

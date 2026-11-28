@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import type { LeaseGrant } from "../client/index.js";
+import type { SimlockAdminClient } from "../simlock-client/client.js";
 import { runCli } from "./index.js";
 import type { CliEnvironment } from "./types.js";
 import { FakeClock } from "../ports/index.js";
@@ -83,6 +84,8 @@ interface Case {
   readonly catalog?: (clock: FakeClock) => Promise<ReturnType<typeof iosCatalog>>;
   /** why: the default run holds the lease until a signal, which these cases send once the hint had its time. */
   readonly held?: true;
+  /** why: the connection drops while the hint's catalog read is out, which a detached lease holds nothing for. */
+  readonly dropsDuringHint?: true;
   readonly line?: readonly string[];
   readonly catalogCalls?: number;
 }
@@ -126,6 +129,13 @@ const CASES: readonly Case[] = [
   { name: "held (no --detach)", held: true, line: [lineOf(CATEGORIES)] },
   { name: "held, catalog.get unanswered", held: true, catalog: () => new Promise(() => {}) },
   { name: "--detach", args: ["--detach"], line: [lineOf(CATEGORIES)] },
+  {
+    name: "--detach, the connection drops during the catalog read",
+    args: ["--detach"],
+    dropsDuringHint: true,
+    catalog: answersAfter(1_000),
+    line: [lineOf(CATEGORIES)],
+  },
   { name: "--export-env", args: ["--export-env", "--detach"], line: [lineOf(CATEGORIES)] },
 ];
 
@@ -142,10 +152,19 @@ async function runCase(testCase: Case): Promise<Ran> {
   const clock = new FakeClock(0);
   let catalogCalls = 0;
   const grant = grantOf(testCase.device ?? {});
+  const lostHandlers: ((error: { code: string; message: string }) => void)[] = [];
   const client = fakeClient({
     requestLease: () => Promise.resolve(grant),
+    onConnectionLost: ((handler: (typeof lostHandlers)[number]) => {
+      lostHandlers.push(handler);
+      return () => {};
+    }) as SimlockAdminClient["onConnectionLost"],
     getCatalog: () => {
       catalogCalls += 1;
+      if (testCase.dropsDuringHint === true) {
+        for (const handler of lostHandlers)
+          handler({ code: "DAEMON_CONNECTION_LOST", message: "gone" });
+      }
       return (testCase.catalog ?? ALL)(clock);
     },
   });
@@ -200,6 +219,9 @@ describe("simlock lease: the slim hint line", () => {
       const ran = await runCase(testCase);
       expect(slimNotices(ran, where), where).toEqual(testCase.line ?? []);
       expect(ran.code, where).toBe(0);
+      expect(ran.stderr, `${where}: a detached lease reports no lost connection`).not.toContain(
+        "DAEMON_CONNECTION_LOST",
+      );
       expect(ran.catalogCalls, where).toBe(testCase.catalogCalls ?? 1);
       if (testCase.args?.includes("--export-env") === true) {
         expect(ran.stdout, where).toMatch(/^export /m);
