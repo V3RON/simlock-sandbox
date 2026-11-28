@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   awaitWithin,
   RELEASE_TIMEOUT_MS,
+  slimCategoriesOff,
   startLeaseRenewal,
   startReconnect,
   UNREACHABLE_GIVE_UP_MS,
@@ -20,6 +21,7 @@ import { checkedFarmOrigin, connectDaemonClient } from "../connect.js";
 import { commandArgs, requiredPositional, UsageError, withHelpHint, writeResult } from "../args.js";
 import { parseDuration } from "../duration.js";
 import { checkedRunId } from "./run-id.js";
+import { escapeControl } from "../escape.js";
 import { writeError } from "../errors.js";
 import { reconnectToFarm } from "../remote-reconnect.js";
 import { waitForTermination } from "../termination.js";
@@ -198,6 +200,7 @@ async function runLease(
     const offConnectionLost = target.onConnectionLost((error) => {
       // why: before the grant the request's own rejection starts the reconnect, which sends it again.
       if (farmOrigin !== undefined && ourLeaseId === undefined) return;
+      if (detached && ourLeaseId !== undefined) return;
       if (onDropped === undefined) {
         endHoldingLease("DAEMON_CONNECTION_LOST", "lost the daemon connection");
       } else if (error.code === "UNAUTHENTICATED") {
@@ -394,7 +397,19 @@ async function runLease(
     const result = { ...grant, role: client.role };
     if (values["export-env"] === true) writeExportEnv(environment, result);
     else writeResult((value) => environment.stdout.write(value), result);
-    if (termination === undefined) return 0;
+    // why: the hint's catalog read goes after the drop handling below is set up, so a farm that drops during it is ridden out like any other drop; a detached lease holds nothing, so a drop then is not reported.
+    const writeSlimHint = async (): Promise<void> => {
+      const slimOff = await slimCategoriesOff(client, grant.device, environment.clock);
+      if (slimOff.length === 0) return;
+      const names = slimOff.map((name) => escapeControl(name)).join(", ");
+      environment.stderr.write(
+        `${JSON.stringify({ notice: `slim: ${names} off; use --except <name> or --mode full` })}\n`,
+      );
+    };
+    if (termination === undefined) {
+      await writeSlimHint();
+      return 0;
+    }
     if (connectionLost) return ERROR_TABLE.DAEMON_CONNECTION_LOST.cliExitCode;
     const grantedLease = grant.lease;
     const beginRenewal = (ttlMs: number, ttlDeadline: number): void => {
@@ -473,6 +488,8 @@ async function runLease(
       };
     }
     beginRenewal(grant.lease.ttlMs, grant.lease.ttlDeadline);
+    await writeSlimHint();
+    if (connectionLost) return ERROR_TABLE.DAEMON_CONNECTION_LOST.cliExitCode;
     await Promise.race([termination.settled, leaseLostSignal, connectionLostSignal]);
     if (leaseLost) return LEASE_LOST_EXIT_CODE;
     if (connectionLost) return ERROR_TABLE.DAEMON_CONNECTION_LOST.cliExitCode;

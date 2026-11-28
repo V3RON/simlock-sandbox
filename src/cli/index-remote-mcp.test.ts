@@ -326,6 +326,42 @@ async function queuedRequestIsReattachedAfterADrop(): Promise<void> {
   await vi.waitFor(() => expect(meets.exitCode()).toBe(0));
 }
 
+// why: after a reattach the grant came on the new connection, so the slim hint's catalog read goes to that one: the first is closed.
+async function aReattachedSlimGrantStillAnswersWithItsHint(): Promise<void> {
+  let asked = 0;
+  const served = await serveRemoteMcp(ENV, {
+    "catalog.get": () => ({
+      platforms: [
+        {
+          platform: "ios",
+          defaultRuntime: "26.5",
+          modelAliases: {},
+          classDefaults: {},
+          modelClasses: {},
+          modelRuntimes: {},
+          models: [],
+          runtimes: [],
+          slimCategories: ["siri", "store"],
+        },
+      ],
+    }),
+    "lease.request": () =>
+      ++asked === 1
+        ? NO_REPLY
+        : { ...detachedGrant, device: { ...detachedGrant.device, mode: "slim" } },
+  });
+  const granted = served.tool("lease_simulator", { ...lease, mode: "slim" });
+  await vi.waitFor(() => expect(leaseRequestsOf(served)).toHaveLength(1));
+  served.farm.connections[0]?.peer.dropped(1006, "");
+  await vi.waitFor(() => expect(served.messages()).toHaveLength(1));
+  served.clock.advance(1_000);
+  expect((await granted).hint).toBe(
+    'slim: siri, store off; pass except: ["<name>"] or mode: "full"',
+  );
+  served.stdin.end();
+  await vi.waitFor(() => expect(served.exitCode()).toBe(0));
+}
+
 // why: a tool call's connect goes through the typed client, which checks the farm URL again, so it must carry the opt-in `simlock mcp` took.
 async function toolCallsReachAnHttpFarmByTheOptIn(): Promise<void> {
   const insecure = await serveRemoteMcp({
@@ -350,5 +386,6 @@ describe("CLI: simlock mcp against a farm", () => {
     await endsWithoutALease();
     await endingTheSessionStopsTheReconnect();
     await queuedRequestIsReattachedAfterADrop();
+    await aReattachedSlimGrantStillAnswersWithItsHint();
   });
 });
