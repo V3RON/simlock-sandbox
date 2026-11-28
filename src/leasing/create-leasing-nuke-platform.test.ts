@@ -12,11 +12,22 @@ import {
 
 type Platform = "android" | "ios";
 
-async function bothPlatforms() {
+async function bothPlatforms(options: Parameters<typeof createHarness>[0] = {}) {
   const clock = new FakeClock(1_000);
-  const ios = new FakeDriver({ availableOsVersions: ["26.5"], clock, platform: "ios" });
-  const android = new FakeDriver({ availableOsVersions: ["36"], clock, platform: "android" });
+  const ios = new FakeDriver({
+    availableOsVersions: ["26.5"],
+    clock,
+    knownModels: [request.model],
+    platform: "ios",
+  });
+  const android = new FakeDriver({
+    availableOsVersions: ["36"],
+    clock,
+    knownModels: [androidRequest.model],
+    platform: "android",
+  });
   const harness = await createHarness({
+    ...options,
     driver: ios,
     drivers: [ios, android],
     limits: {
@@ -177,6 +188,55 @@ describe("createLeasing: a platform nuke", () => {
             : before[platform],
         );
       }
+    }
+  });
+
+  it("forgets only that platform's learned kinds, an iOS baseline kind included, and every kind without a platform", async () => {
+    for (const platform of [undefined, "ios", "android"] as const) {
+      const { harness } = await bothPlatforms({
+        startPool: true,
+        warmPool: { baselineLearnAfter: 1 },
+      });
+      harness.bus.emit("daemon.started", { configSnapshot: {}, version: "test" }, "test");
+      const learn = async (asked: Parameters<typeof harness.engine.request>[0], who: string) => {
+        const grant = await harness.engine.request(asked, { ownerId: who, requesterId: who });
+        await harness.engine.release(grant.lease.id, "explicit");
+        await flush();
+      };
+      await learn(request, "plain");
+      await learn(androidRequest, "android");
+      const saver = await harness.engine.request(request, {
+        ownerId: "saver",
+        requesterId: "saver",
+      });
+      await harness.engine.core.baselines.save({
+        leaseId: saver.lease.id,
+        name: "checkout",
+        requesterId: "saver",
+      });
+      await learn({ baseline: "checkout", platform: "ios" }, "based");
+      await harness.engine.core.passWarmPool();
+      const learned = () =>
+        harness.engine
+          .figures()
+          .targets.filter((target) => target.origin === "learned")
+          .map(
+            (target) =>
+              `${target.platform}:${target.baseline === undefined ? "plain" : "baseline"}`,
+          )
+          .sort();
+      expect(learned()).toEqual(["android:plain", "ios:baseline", "ios:plain"]);
+
+      await harness.engine.nuke(false, platform);
+      await harness.engine.core.passWarmPool();
+
+      expect(learned(), String(platform)).toEqual(
+        platform === undefined
+          ? []
+          : platform === "ios"
+            ? ["android:plain"]
+            : ["ios:baseline", "ios:plain"],
+      );
     }
   });
 });
