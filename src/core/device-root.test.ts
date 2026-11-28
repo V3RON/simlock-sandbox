@@ -265,6 +265,14 @@ describe("ensureOwnedRoot", () => {
     await expect(refusal(filesystem)).resolves.toBe("non-empty-unowned-root");
   });
 
+  it("creates a root under an existing parent that refuses a recursive mkdir with EPERM", async () => {
+    const filesystem = new ParentRefusingFilesystem(uid);
+    await filesystem.mkdirp(join(parent, "other"));
+
+    await expect(ensure(filesystem)).resolves.toBe(root);
+    await expect(filesystem.exists(markerPath)).resolves.toBe(true);
+  });
+
   it("refuses a path occupied by something that is not a directory", async () => {
     const filesystem = createFilesystem();
     await filesystem.mkdirp(parent);
@@ -498,6 +506,24 @@ class SwappedRootFilesystem extends MemoryFilesystem {
 class UmaskedFilesystem extends MemoryFilesystem {
   async mkdir(path: string, options: { readonly mode?: number } = {}): Promise<void> {
     await super.mkdir(path, { mode: (options.mode ?? 0o777) & ~0o277 });
+  }
+}
+
+/** why: Node on Windows rejects a recursive mkdir of an existing drive root with EPERM (#78); the parent here stands for one. */
+class ParentRefusingFilesystem extends MemoryFilesystem {
+  constructor(owner: number) {
+    super(undefined, owner);
+  }
+
+  async mkdirp(path: string, options?: Parameters<MemoryFilesystem["mkdirp"]>[1]): Promise<void> {
+    if (path === parent && (await this.exists(path))) {
+      const error: NodeJS.ErrnoException = new Error(
+        `EPERM: operation not permitted, mkdir '${path}'`,
+      );
+      error.code = "EPERM";
+      throw error;
+    }
+    return super.mkdirp(path, options);
   }
 }
 
