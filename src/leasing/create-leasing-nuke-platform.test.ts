@@ -79,6 +79,12 @@ describe("createLeasing: a platform nuke", () => {
         "full",
         drivers[other],
       );
+      const idle = await seedReady(
+        harness,
+        other === "ios" ? { ...request, physical: false } : { ...androidRequest, physical: false },
+        "full",
+        drivers[other],
+      );
       harness.bus.subscribe("device.deleted", (event) => {
         if (event.payload.deviceId !== leases[platform].device.id) return;
         void harness.decisions.run(() => harness.registry.markDeviceMissing(spare.id, "elsewhere"));
@@ -96,6 +102,7 @@ describe("createLeasing: a platform nuke", () => {
       expect(report.deletedDevices, platform).toEqual([leases[platform].device.id]);
       expect(state(leases[platform].device.id), platform).toBe("deleted");
       expect(state(leases[other].device.id), platform).toBe("leased");
+      expect(state(idle.id), platform).toBe("ready");
       expect(
         harness.registry.snapshot.leases.map((lease) => lease.id),
         platform,

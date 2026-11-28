@@ -819,8 +819,10 @@ function seedIsStale(seed: ReadySeed, resolved: ResolvedIosSpec): boolean {
   return seed.runtimeBuild !== undefined && current !== undefined && seed.runtimeBuild !== current;
 }
 
-/** why: the phrase reads after "is stale:" in `doctor`, and is what a person acts on, so it names the runtime or device type by id. */
-/** why: `present` is the UDIDs in the sources set; a caller that did not read the set passes none, and no source is judged gone. */
+/**
+ * why: the phrase reads after "is stale:" in `doctor`, and is what a person acts on, so it names the runtime or device type by id.
+ * `present` is the UDIDs in the sources set; a caller that did not read the set passes none, and no source is judged gone.
+ */
 function sourceStaleReason(
   row: SourceRow,
   catalog: SimctlCatalog,
