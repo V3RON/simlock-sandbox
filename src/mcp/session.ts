@@ -16,6 +16,7 @@ import {
   awaitWithin,
   reconnectWhileWaiting,
   RELEASE_TIMEOUT_MS,
+  slimCategoriesOff,
   startLeaseRenewal,
   startReconnect,
   UNREACHABLE_GIVE_UP_MS,
@@ -177,14 +178,16 @@ export class McpSession {
     this.#farm = options.farm;
   }
 
-  lease(
+  async lease(
     input: LeaseSimulatorInput,
     signal?: AbortSignal,
     onProgress?: (progress: LeaseProgressNotice) => void,
   ): Promise<LeaseSimulatorOutput> {
-    return this.#mutate(async () => {
+    let leasedWith: SimlockClient | undefined;
+    const grant = await this.#mutate(async () => {
       this.#throwIfClosed();
       const client = await this.#clientForUse();
+      leasedWith = client;
       const request: LeaseRequestInput =
         this.#farm === undefined
           ? { ...input }
@@ -206,6 +209,13 @@ export class McpSession {
       this.#startRenewal(grant.lease);
       return grant;
     });
+    if (leasedWith === undefined) return grant;
+    const off = await slimCategoriesOff(leasedWith, grant.device, this.#clock);
+    if (off.length === 0) return grant;
+    return {
+      ...grant,
+      hint: `slim: ${off.join(", ")} off; pass except: ["<name>"] or mode: "full"`,
+    };
   }
 
   /**

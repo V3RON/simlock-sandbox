@@ -65,7 +65,7 @@ const CASES: readonly Case[] = [
   {
     name: "Android",
     device: {
-      mode: undefined,
+      mode: "full",
       spec: { model: "Pixel 8", osVersion: "35", physical: false, platform: "android" },
     } as Partial<LeaseGrant["device"]>,
     catalogCalls: 0,
