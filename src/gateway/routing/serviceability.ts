@@ -264,9 +264,14 @@ function assessServing(
   return fits || views.some(isUnread) ? undefined : noWorker();
 }
 
-// why: a connected worker whose first catalog read has not landed (as after a gateway restart) comes by itself, so a request waits for it like for an updating worker (ADR 0009 §4).
+// why: a connected worker whose first catalog read has not landed (as after a gateway restart) comes by itself, so a request waits for it like for an updating worker, until that read fails or times out (ADR 0009 §4).
 function isUnread(worker: WorkerView): boolean {
-  return worker.connection === "connected" && !worker.drained && worker.catalog === undefined;
+  return (
+    worker.connection === "connected" &&
+    !worker.drained &&
+    worker.catalog === undefined &&
+    worker.catalogReadFailed !== true
+  );
 }
 
 function isKnown(worker: WorkerView): boolean {

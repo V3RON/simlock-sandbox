@@ -205,6 +205,32 @@ describe("GatewayService", () => {
     await harness.service.stop();
   });
 
+  it("marks a worker whose first catalog read times out so routing stops waiting for it, and clears the mark when a later read lands (ADR 0009 §4)", async () => {
+    const harness = fleet({ refreshIntervalMs: 10_000_000 });
+    await harness.service.start();
+    const worker = new ScriptedWorkerClient();
+    worker.hangingCalls.add("catalog.get");
+    await harness.join("wrk_1", worker);
+    await vi.waitFor(() => expect(worker.calls).toContain("catalog.get"));
+    expect(harness.service.workers.routingViews()[0]?.catalogReadFailed).toBeUndefined();
+
+    harness.clock.advance(WORKER_CALL_TIMEOUT_MS);
+
+    await vi.waitFor(() =>
+      expect(harness.service.workers.routingViews()[0]?.catalogReadFailed).toBe(true),
+    );
+
+    worker.hangingCalls.delete("catalog.get");
+    worker.pushEvent({ event: "lease.granted" });
+
+    await vi.waitFor(() =>
+      expect(harness.service.workers.routingViews()[0]?.catalogReadFailed).toBeUndefined(),
+    );
+    expect(harness.service.workers.view("wrk_1")?.catalog).toBeDefined();
+
+    await harness.service.stop();
+  });
+
   it("does not close the link when status.get keeps answering but the dispatcher is busy (C-1)", async () => {
     // why: A refreshIntervalMs far outside this test's clock advances: `#runTick` only reschedules
     // its own timer once a refresh settles (`service.ts`'s `.finally(() => this.#scheduleTick())`),

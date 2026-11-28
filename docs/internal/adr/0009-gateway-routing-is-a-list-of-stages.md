@@ -133,9 +133,13 @@ again and a waiting request that has moved to rows 1 to 5 is rejected.
 
 A worker connecting for the first time, whose catalog has not arrived yet,
 neither takes requests nor is known. Alone, it gives row 1, never a false
-`UNKNOWN_MODEL`. While one is connected and not drained, rows 2 to 5 do not
-reject: the catalog is on its way, so the request waits, as for an updating
-worker. Row 1 is unchanged. The view records when the catalog was read in the current
+`UNKNOWN_MODEL`. While one is connected and not drained, the driver, mode,
+model, runtime and capacity rows do not reject: the catalog is on its way, so
+the request waits, as for an updating worker. It waits only until that
+worker's first catalog read of the session fails or times out (the refresh
+timeout); then the table judges the request on the other workers. The
+`requires` and `except` rows are not held: they keep rejecting at once while
+a worker is unread. Row 1 is unchanged. The view records when the catalog was read in the current
 session, so "not read yet" and "read and empty" can be told apart.
 
 ### 5. Refusals
