@@ -32,6 +32,7 @@
  *   and neither can extend a lease the daemon did not.
  */
 import { isSimlockError, SimlockError, type AnySimlockError } from "../contract/index.js";
+import type { LeaseGrant, SimlockClient } from "../client/index.js";
 import type { Clock, TimerHandle } from "../ports/index.js";
 
 const RENEW_DIVISOR = 3;
@@ -497,4 +498,36 @@ export function reconnectWhileWaiting<T>(options: {
       { once: true },
     );
   });
+}
+
+/**
+ * why: How long the slim hint waits for its one `catalog.get`. The hint is a courtesy after a
+ * grant, so it never holds a lease's output back for longer than this.
+ */
+export const SLIM_HINT_TIMEOUT_MS = 2_000;
+
+/**
+ * why: The slim categories a granted iOS device has off, for the hint line both frontends print:
+ * the catalog's iOS `slimCategories` in its order, minus the grant's `except`. It answers `[]`
+ * instead of throwing, because a hint must never fail or slow a lease.
+ */
+export async function slimCategoriesOff(
+  client: Pick<SimlockClient, "getCatalog">,
+  device: Pick<LeaseGrant["device"], "mode" | "except">,
+  clock: Clock,
+): Promise<readonly string[]> {
+  if (device.mode !== "slim") return [];
+  try {
+    const catalog = await awaitWithin(
+      clock,
+      SLIM_HINT_TIMEOUT_MS,
+      client.getCatalog({ platform: "ios" }),
+      "catalog read timed out",
+    );
+    const kept = new Set(device.except ?? []);
+    const ios = catalog.platforms.find((entry) => entry.platform === "ios");
+    return (ios?.slimCategories ?? []).filter((name) => !kept.has(name));
+  } catch {
+    return [];
+  }
 }
