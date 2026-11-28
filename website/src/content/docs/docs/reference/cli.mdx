@@ -156,6 +156,14 @@ Without `--detach`, the command renews the lease every third of its TTL and rele
 - 14 when the daemon ended the lease first (TTL expiry, an operator's `release`, or a device that could not be recovered). A `lease-lost` line on stderr says why.
 - 1 with `DAEMON_CONNECTION_LOST` when the connection to the daemon on this machine dropped. The lease is not released and stays yours until its deadline; the stderr line names it. With `--url` the command reconnects instead, as [Remote mode](#remote-mode) says.
 
+On a slim iOS simulator, one more line follows the grant on stderr: a `notice` naming the slim categories the worker turns off that the lease did not keep with `--except`, and the way out. It never changes the exit code, and a lease does not wait for it for more than 2 seconds.
+
+```json
+{"notice":"slim: widgets, siri, search, icloud, pim, web, family, health, photos, apps, messaging, connectivity, telemetry, mdm, other off; use --except <name> or --mode full"}
+```
+
+The line is absent on a `full` device (including a slim request that got `full`), on Android and on a physical device, when `--except` covers every category the worker turns off, when the worker turns none off, and when the catalog read fails or takes over 2 seconds. Through a gateway it names the categories any of its workers turns off.
+
 ### simlock lease renew
 
 Push a lease's deadline out. Use it for a lease taken with `--detach`. Renewing a lease taken under a different [requester identity](#requester-identity) needs the admin role.
