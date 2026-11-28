@@ -22,6 +22,9 @@ export class Nuke {
   }> {
     const before = this.options.registry.snapshot.devices
       .filter((device) => device.state !== "deleted")
+      .filter(
+        (device) => options.platform === undefined || device.spec.platform === options.platform,
+      )
       .map((device) => device.id);
     const { releasedLeaseIds, removedBaselines } = await this.options.executor.nuke(
       options.deleteDevices,

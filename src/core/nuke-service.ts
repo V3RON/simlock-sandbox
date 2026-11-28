@@ -7,7 +7,7 @@ import { stableError } from "./stable-error.js";
 
 export interface LeaseMaintenance {
   beginMaintenance(): Promise<void>;
-  releaseAllDuringMaintenance(reason: "killed"): Promise<readonly string[]>;
+  releaseAllDuringMaintenance(reason: "killed", platform?: Platform): Promise<readonly string[]>;
   endMaintenance(): Promise<void>;
 }
 
@@ -74,7 +74,7 @@ export class NukeService implements NukeExecutor {
     this.#logger = options.logger?.child("nuke") ?? new NoopLogger();
   }
 
-  async nuke(deleteDevices: boolean, _platform?: Platform): Promise<NukeReport> {
+  async nuke(deleteDevices: boolean, platform?: Platform): Promise<NukeReport> {
     let release!: () => void;
     const previous = this.#tail;
     this.#tail = new Promise<void>((resolve) => {
@@ -82,19 +82,22 @@ export class NukeService implements NukeExecutor {
     });
     await previous;
     try {
-      return await this.options.seedSettler.holdWhile(() => this.#runNuke(deleteDevices));
+      return await this.options.seedSettler.holdWhile(() => this.#runNuke(deleteDevices, platform));
     } finally {
       release();
     }
   }
 
-  async #runNuke(deleteDevices: boolean): Promise<NukeReport> {
+  async #runNuke(deleteDevices: boolean, platform?: Platform): Promise<NukeReport> {
     await this.options.acquisition.beginMaintenance();
     let releaseMaintenanceStarted = false;
     try {
       await this.options.leases.beginMaintenance();
       releaseMaintenanceStarted = true;
-      const releasedLeaseIds = await this.options.leases.releaseAllDuringMaintenance("killed");
+      const releasedLeaseIds = await this.options.leases.releaseAllDuringMaintenance(
+        "killed",
+        platform,
+      );
       try {
         this.options.warmPool.forget();
       } catch (error: unknown) {
@@ -104,6 +107,7 @@ export class NukeService implements NukeExecutor {
       }
 
       for (const device of this.options.registry.snapshot.virtualDevices) {
+        if (platform !== undefined && device.spec.platform !== platform) continue;
         try {
           await this.#resetDevice(device, deleteDevices);
         } catch (error: unknown) {
