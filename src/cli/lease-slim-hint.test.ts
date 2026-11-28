@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import { describe, expect, it, vi } from "vitest";
 import type { LeaseGrant } from "../client/index.js";
 import { runCli } from "./index.js";
+import type { CliEnvironment } from "./types.js";
 import { FakeClock } from "../ports/index.js";
 import { fakeClient, outputCapture, settle } from "./test-index.js";
 
@@ -78,12 +80,20 @@ interface Case {
   readonly name: string;
   readonly args?: readonly string[];
   readonly device?: Partial<LeaseGrant["device"]>;
-  readonly catalog?: () => Promise<ReturnType<typeof iosCatalog>>;
+  readonly catalog?: (clock: FakeClock) => Promise<ReturnType<typeof iosCatalog>>;
+  /** why: the default run holds the lease until a signal, which these cases send once the hint had its time. */
+  readonly held?: true;
   readonly line?: readonly string[];
   readonly catalogCalls?: number;
 }
 
 const ALL = (): Promise<ReturnType<typeof iosCatalog>> => Promise.resolve(iosCatalog(CATEGORIES));
+const answersAfter =
+  (delayMs: number) =>
+  (clock: FakeClock): Promise<ReturnType<typeof iosCatalog>> =>
+    new Promise((resolve) => {
+      clock.setTimer(delayMs, () => resolve(iosCatalog(CATEGORIES)));
+    });
 const lineOf = (names: readonly string[]) =>
   `slim: ${names.join(", ")} off; use --except <name> or --mode full`;
 
@@ -107,6 +117,14 @@ const CASES: readonly Case[] = [
   { name: "physical", device: { physical: true, mode: undefined }, catalogCalls: 0 },
   { name: "catalog.get rejects", catalog: () => Promise.reject(new Error("daemon went away")) },
   { name: "catalog.get unanswered", catalog: () => new Promise(() => {}) },
+  {
+    name: "catalog.get answers inside the 2 s bound",
+    catalog: answersAfter(1_500),
+    line: [lineOf(CATEGORIES)],
+  },
+  { name: "catalog.get answers after the 2 s bound", catalog: answersAfter(2_500) },
+  { name: "held (no --detach)", held: true, line: [lineOf(CATEGORIES)] },
+  { name: "held, catalog.get unanswered", held: true, catalog: () => new Promise(() => {}) },
   { name: "--detach", args: ["--detach"], line: [lineOf(CATEGORIES)] },
   { name: "--export-env", args: ["--export-env", "--detach"], line: [lineOf(CATEGORIES)] },
 ];
@@ -122,17 +140,35 @@ describe("simlock lease: the slim hint line", () => {
         requestLease: () => Promise.resolve(grant),
         getCatalog: () => {
           catalogCalls += 1;
-          return (testCase.catalog ?? ALL)();
+          return (testCase.catalog ?? ALL)(clock);
         },
       });
       let code: number | undefined;
+      const signals = new EventEmitter();
       const running = runCli(
-        ["lease", "--platform", "ios", "--mode", "slim", "--detach", ...(testCase.args ?? [])],
-        output.environmentWith({ clock, connectAdmin: async () => client }),
+        [
+          "lease",
+          "--platform",
+          "ios",
+          "--mode",
+          "slim",
+          ...(testCase.held === true ? [] : ["--detach"]),
+          ...(testCase.args ?? []),
+        ],
+        output.environmentWith({
+          clock,
+          connectAdmin: async () => client,
+          signals: signals as unknown as CliEnvironment["signals"],
+        }),
       ).then((exit) => (code = exit));
+      // why: the command module loads lazily, so the fake clock starts only once the grant is out.
+      await vi.waitFor(() =>
+        expect(output.stdout, `case ${testCase.name}: no grant written`).not.toBe(""),
+      );
       for (let tick = 0; tick < 10 && code === undefined; tick += 1) {
         await settle();
         clock.advance(500);
+        if (testCase.held === true && tick === 6) signals.emit("SIGINT");
       }
       const where = `case ${testCase.name}`;
       expect(code, `${where}: the command had not finished by 5 s on the fake clock`).toBeDefined();

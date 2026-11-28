@@ -192,7 +192,9 @@ export class McpSession {
         this.#farm === undefined
           ? { ...input }
           : { ...input, idempotencyKey: randomUUID(), requesterId: this.#farm.requesterId };
-      const grant = await this.#requestWithReattach(client, request, signal, onProgress);
+      const requested = await this.#requestWithReattach(client, request, signal, onProgress);
+      const grant = requested.grant;
+      leasedWith = requested.client;
       if (this.#closed) {
         // why: The session ended while the daemon was provisioning. `close()` does not queue behind
         // `#mutations`, so it has already stopped renewing: arming a timer now would leave a
@@ -229,14 +231,15 @@ export class McpSession {
     request: LeaseRequestInput,
     signal: AbortSignal | undefined,
     onProgress: ((progress: LeaseProgressNotice) => void) | undefined,
-  ): Promise<LeaseGrant> {
+  ): Promise<{ readonly grant: LeaseGrant; readonly client: SimlockClient }> {
     let client = first;
     for (;;) {
       try {
-        return await client.requestLease(request, {
+        const grant = await client.requestLease(request, {
           ...(onProgress === undefined ? {} : { onProgress }),
           ...(signal === undefined ? {} : { signal }),
         });
+        return { grant, client };
       } catch (error: unknown) {
         const farm = this.#farm;
         if (farm === undefined || !isSimlockError(error) || error.code !== "DAEMON_CONNECTION_LOST")

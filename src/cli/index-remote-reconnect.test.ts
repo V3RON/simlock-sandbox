@@ -394,6 +394,32 @@ async function rideOutADropBeforeTheDeadline(): Promise<void> {
   expect(closedConnections(held), "every connection is closed at the end").toBe(true);
 }
 
+// why: the slim hint reads the catalog right after the grant; a drop during that read is the held lease's drop, ridden out, not a lost connection.
+async function aDropDuringTheSlimHintReadIsRiddenOut(): Promise<void> {
+  const held = holdRemoteLease(
+    (clock) => ({
+      "catalog.get": () => NO_REPLY,
+      "lease.renew": () => ({ ...detachedGrant.lease, ttlDeadline: clock.now() + 60_000 }),
+      "lease.request": () => ({
+        ...detachedGrant,
+        device: { ...detachedGrant.device, mode: "slim" },
+      }),
+    }),
+    ["--mode", "slim"],
+  );
+  await vi.waitFor(() =>
+    expect(held.farm.requestTypes()).toEqual(["lease.request", "catalog.get"]),
+  );
+  held.farm.connections[0]?.peer.dropped(1006, "");
+  await vi.waitFor(() => expect(held.stderr()).toContain("to keep lease lse_env"));
+  held.clock.advance(1_000);
+  await vi.waitFor(() => expect(held.stderr()).toContain("reconnected"));
+  held.signals.emit("SIGINT");
+  expect(await ends(held)).toBe(0);
+  expect(held.stderr()).not.toContain("DAEMON_CONNECTION_LOST");
+  expect(held.farm.requestTypes().at(-1)).toBe("lease.release");
+}
+
 async function neverBackBeforeTheDeadline(): Promise<void> {
   const held = holdRemoteLease();
   await vi.waitFor(() => expect(held.farm.requestTypes()).toEqual(["lease.request"]));
@@ -416,6 +442,7 @@ async function neverBackBeforeTheDeadline(): Promise<void> {
 describe("CLI: a held remote lease across a network drop", () => {
   it("a held remote lease rides out a network drop: it reconnects, renews and holds on until its deadline, ends by what the farm answers, and a queued request asks again", async () => {
     await rideOutADropBeforeTheDeadline();
+    await aDropDuringTheSlimHintReadIsRiddenOut();
     await neverBackBeforeTheDeadline();
     await aHeldLeaseOnAnHttpFarmReconnects();
     await reconnectAnswersDecideTheEnd();
