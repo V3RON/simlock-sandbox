@@ -409,6 +409,8 @@ When the daemon has seen a newer Simlock version on npm, the `Simlock:` line say
 
 While an update runs, the line below `CLI:` reads `Updating to <version>: waiting for 2 leases` (then `installing`, `restarting`). After an update that failed, `Last update failed (<stage>): <message>` stays until the next update starts or the daemon restarts without one.
 
+A worker's own status ends with its capabilities, tags included, as `-- <name> <state>` after the queue depth, such as `Queue depth: 0 -- bank-network available`; `simlock worker list` prints them the same way on a gateway. `--json` carries them as `capabilities`.
+
 A lease that carries a run id (`simlock lease --run`) shows it on its line: `Lease <id>: <requester> on <worker>, run <run id> since …`. `--json` carries it as the lease's `runId`.
 
 A lease that carries a label (`simlock lease --label`) shows it after the run id: `Lease <id>: <requester> on <worker>, run <run id>, label <label> since …`. `--json` carries it as the lease's `label`.

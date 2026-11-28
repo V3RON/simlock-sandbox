@@ -38,17 +38,22 @@ export function formatWorkers(
           : ` protocol ${worker.protocol.worker.min}-${worker.protocol.worker.max}` +
             ` vs gateway ${worker.protocol.gateway.min}-${worker.protocol.gateway.max}`;
       const host = worker.host === undefined ? "" : ` -- ${formatHost(worker.host)}`;
-      const capabilities = (worker.capabilities ?? [])
-        .map((entry) =>
-          entry.state === "unavailable"
-            ? ` -- ${esc(entry.name)} unavailable: ${esc(entry.reason ?? "unknown")}`
-            : ` -- ${esc(entry.name)} ${esc(entry.state)}`,
-        )
-        .join("");
+      const capabilities = formatCapabilities(worker.capabilities);
       const memory = memoryStep(worker);
       return `${label}: ${state} -- ${capacity}, ${leaseCount(worker)}${skew}${workerVersion(worker)}${host}${capabilities}${memory}${load}${workerBaselinesLine(worker)}${installs}`;
     })
     .join("\n");
+}
+
+/** why: a worker's capability entries read the same in `simlock worker list` and in its own `simlock status`. */
+function formatCapabilities(capabilities: StatusGetOutput["capabilities"]): string {
+  return (capabilities ?? [])
+    .map((entry) =>
+      entry.state === "unavailable"
+        ? ` -- ${esc(entry.name)} unavailable: ${esc(entry.reason ?? "unknown")}`
+        : ` -- ${esc(entry.name)} ${esc(entry.state)}`,
+    )
+    .join("");
 }
 
 function memoryStep(worker: WorkerView): string {
@@ -334,7 +339,7 @@ export function formatStatus(status: StatusGetOutput, now: number, cliVersion?: 
     ...deviceLines,
     ...leaseLines,
     ...(installs ?? []).map((install) => formatInstall(install, now)),
-    `Queue depth: ${queueDepth}`,
+    `Queue depth: ${queueDepth}${formatCapabilities(status.capabilities)}`,
   ].join("\n");
 }
 

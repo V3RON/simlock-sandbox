@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import { FakeClock } from "../ports/index.js";
 import { fromWireError, SimlockError } from "../contract/index.js";
 import type { SimlockAdminClient } from "../simlock-client/client.js";
+import type { StatusGetOutput } from "../admin/index.js";
 import { runCli, type CliEnvironment } from "./index.js";
 import {
+  EMPTY_STATUS,
   PACKAGE_VERSION,
   fakeClient,
   outputCapture,
@@ -389,6 +391,28 @@ describe("simlock update and simlock status", () => {
     ] as const) {
       expect((await statusLines({ version, latestVersion }))[1]).toBe(line);
     }
+  });
+});
+
+describe("simlock status capabilities", () => {
+  it("ends a worker's own status with its capabilities as `-- <name> <state>`, and adds nothing when it has none", async () => {
+    const run = async (capabilities: StatusGetOutput["capabilities"]) => {
+      const output = outputCapture();
+      await runCli(
+        ["status"],
+        output.environmentWith({
+          connectAdmin: async () =>
+            fakeClient({
+              getStatus: () => Promise.resolve({ ...EMPTY_STATUS, capabilities }),
+            }),
+        }),
+      );
+      return output.stdout.trimEnd().split("\n").at(-1);
+    };
+    expect(await run([{ name: "bank-network", state: "available" }])).toBe(
+      "Queue depth: 0 -- bank-network available",
+    );
+    expect(await run([])).toBe("Queue depth: 0");
   });
 });
 
