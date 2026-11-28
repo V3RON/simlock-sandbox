@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -14,6 +14,11 @@ import {
   type ServiceState,
   TaskSchedulerServiceManager,
 } from "./index.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, mkdir: vi.fn(actual.mkdir) };
+});
 
 describe("NodeDaemonLauncher", () => {
   it("rejects asynchronous spawn failures", async () => {
@@ -138,6 +143,53 @@ describe("NodeDaemonLauncher", () => {
       expect(await readdir(directory)).toEqual(["daemon.log"]);
     } finally {
       await rm(directory, { force: true, recursive: true });
+    }
+  });
+});
+
+describe("NodeDaemonLauncher with SIMLOCK_HOME directly under a drive root (#97)", () => {
+  it("launches the daemon into a new and an existing home whose existing parent refuses mkdir with EPERM", async () => {
+    // why: Node on Windows refuses `mkdir` of a drive root with EPERM even with `recursive: true`,
+    // though the drive exists (Node's `fs.mkdir` docs). This host has no such root, so an existing
+    // directory stands for `D:\` and refuses the same way; every other mkdir is the real one.
+    const driveRoot = await mkdtemp(join(tmpdir(), "simlock-drive-"));
+    const real = vi.mocked(mkdir).getMockImplementation() as typeof mkdir;
+    vi.mocked(mkdir).mockImplementation((async (path: string, options?: never) => {
+      if (path === driveRoot)
+        throw Object.assign(new Error(`EPERM: operation not permitted, mkdir '${path}'`), {
+          code: "EPERM",
+          path,
+          syscall: "mkdir",
+        });
+      return real(path, options);
+    }) as typeof mkdir);
+    try {
+      const outcomes: Record<string, string> = {};
+      for (const [name, existing] of [
+        ["new", false],
+        ["existing", true],
+      ] as const) {
+        const home = join(driveRoot, name);
+        if (existing) await real(home);
+        const logPath = join(home, "gateway", "daemon.log");
+        try {
+          await new NodeDaemonLauncher({
+            args: ["-e", "console.log('started')"],
+            command: process.execPath,
+            logPath,
+            simlockHome: home,
+          }).launch();
+        } catch (error: unknown) {
+          outcomes[name] = String((error as { code?: unknown }).code);
+          continue;
+        }
+        await expect.poll(async () => (await readFile(logPath, "utf8")).trim()).toBe("started");
+        outcomes[name] = (await stat(home)).isDirectory() ? "started" : "no home";
+      }
+      expect(outcomes).toEqual({ new: "started", existing: "started" });
+    } finally {
+      vi.mocked(mkdir).mockImplementation(real);
+      await rm(driveRoot, { force: true, recursive: true });
     }
   });
 });
