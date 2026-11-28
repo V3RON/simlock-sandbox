@@ -70,24 +70,30 @@ async function provisionWithSeed(options: {
   const wanted = copies.slice(0, options.provisions);
   const seed = options.gone === "none" ? seedUdid : newSeedUdid;
   const copyClone = sourcesSimctl("clone", seed, driverData.name, deviceRoot);
+  const filesystem = new MemoryFilesystem();
+  // why: with the set gone, the make's own `simctl clone` creates it again, so the folder is planted when that call spawns, never before the gone check.
+  const madeSeed = throwawaySeedSteps(newSeedUdid).map((step, index) =>
+    index === 5
+      ? { ...step, onSpawn: () => plantSeedClone(filesystem, sourcesSetPath, newSeedUdid) }
+      : step,
+  );
   const runner = new ScriptedProcessRunner([
     ...wanted.map(() => ({
       match: listInvocation,
       result: { code: 0, stderr: "", stdout: listFixture },
     })),
-    ...(options.gone === "none" ? [] : throwawaySeedSteps(newSeedUdid)),
+    ...(options.gone === "none" ? [] : madeSeed),
     ...wanted.map((copy) => ({
       match: copyClone,
       result: { code: 0, stderr: "", stdout: `${copy}\n` },
     })),
   ]);
-  const filesystem = new MemoryFilesystem();
   const database = await seededDatabase({ files: [{ kind: "file", relativePath: "data/x.db" }] });
   const driver = await createDriver(runner, new FakeClock(), filesystem, database);
   await plantManagedDevice(filesystem);
   if (options.gone === "folder") await filesystem.rm(join(sourcesSetPath, seedUdid));
   if (options.gone === "set") await filesystem.rm(sourcesSetPath);
-  if (options.gone !== "none") await plantSeedClone(filesystem, sourcesSetPath, newSeedUdid);
+  if (options.gone === "folder") await plantSeedClone(filesystem, sourcesSetPath, newSeedUdid);
   for (const copy of copies) await filesystem.mkdirp(`${deviceRoot}/${copy}/data`);
   await filesystem.mkdirp(overridesFolder(seedUdid));
 
