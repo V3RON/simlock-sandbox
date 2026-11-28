@@ -157,7 +157,7 @@ describe("MCP server (smoke)", () => {
     }
   });
 
-  it("the lease tool's input schema in tools/list lists noWait and physical, and has no fleetRequestId, no metadata, no requires and no runId, and a call naming runId is refused", async () => {
+  it("the lease tool's input schema in tools/list lists noWait and physical, and has no fleetRequestId, no metadata and no runId, and a call naming runId is refused", async () => {
     const client = new FakeSimlockClient();
     client.requestLeaseImpl = () => Promise.resolve(sampleGrant());
     const { mcpClient, close } = await connectedServer(client);
@@ -169,7 +169,6 @@ describe("MCP server (smoke)", () => {
       expect(properties).toContain("noWait");
       expect(properties).not.toContain("fleetRequestId");
       expect(properties).not.toContain("metadata");
-      expect(properties).not.toContain("requires");
       expect(properties).not.toContain("runId");
       expect(properties).toContain("physical");
 
@@ -204,6 +203,30 @@ describe("MCP server (smoke)", () => {
       expect((await call(mcpClient, "lease_simulator", ask)).isError).not.toBe(true);
       const again = client.calls.filter((entry) => entry.method === "requestLease");
       expect(again[1]?.input).not.toHaveProperty("label");
+    } finally {
+      await close();
+    }
+  });
+
+  it("the lease tool lists requires and sends the names a call gives, and none when it gives none", async () => {
+    const client = new FakeSimlockClient();
+    client.requestLeaseImpl = () => Promise.resolve(sampleGrant());
+    const { mcpClient, close } = await connectedServer(client);
+    try {
+      const tools = await mcpClient.request({ method: "tools/list" }, ListToolsResultSchema);
+      const leaseTool = tools.tools.find((tool) => tool.name === "lease_simulator");
+      expect(Object.keys(leaseTool?.inputSchema.properties ?? {})).toContain("requires");
+
+      const ask = { model: "iPhone 17 Pro", platform: "ios" } as const;
+      expect(
+        (await call(mcpClient, "lease_simulator", { ...ask, requires: ["bank-network"] })).isError,
+      ).not.toBe(true);
+      const sent = client.calls.filter((entry) => entry.method === "requestLease");
+      expect(sent[0]?.input).toMatchObject({ requires: ["bank-network"] });
+      await call(mcpClient, "release_simulator", { leaseId: "lease-1" });
+      expect((await call(mcpClient, "lease_simulator", ask)).isError).not.toBe(true);
+      const again = client.calls.filter((entry) => entry.method === "requestLease");
+      expect(again[1]?.input).not.toHaveProperty("requires");
     } finally {
       await close();
     }
