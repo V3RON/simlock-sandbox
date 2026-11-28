@@ -197,6 +197,7 @@ function assessLeading(
 ): Rejection | undefined {
   if (takersOf(request, views).length === 0) return noWorker();
 
+  if (views.some(isUnread)) return undefined;
   const known = views.filter(isKnown);
   const platform = request.platform;
   if (!known.some((worker) => hasPlatform(worker, request))) {
@@ -253,7 +254,12 @@ function assessServing(
       : takers.some(
           (worker) => servesMode(worker, request) && matchRequest(worker, request) !== undefined,
         );
-  return fits ? undefined : noWorker();
+  return fits || views.some(isUnread) ? undefined : noWorker();
+}
+
+// why: a connected worker whose first catalog read has not landed (as after a gateway restart) comes by itself, so a request waits for it like for an updating worker (ADR 0009 §4).
+function isUnread(worker: WorkerView): boolean {
+  return worker.connection === "connected" && !worker.drained && worker.catalog === undefined;
 }
 
 function isKnown(worker: WorkerView): boolean {

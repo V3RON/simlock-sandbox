@@ -191,15 +191,6 @@ describe("assess", () => {
     });
   });
 
-  it("judges a request on the other workers when one has no catalog at all", () => {
-    const { catalog: _catalog, ...unread } = view("wrk_a", IOS, { catalogReadAt: undefined });
-
-    expect(assess(REQUEST, [unread, view("wrk_b")])).toEqual({ kind: "route-or-wait" });
-    expect(rejectionOf([unread, view("wrk_b")], { ...REQUEST, model: "iPhone 99" }).code).toBe(
-      "UNKNOWN_MODEL",
-    );
-  });
-
   it("makes a request wait, not fail UNKNOWN_MODEL, NO_DRIVER or RUNTIME_MISSING, while a connected worker's catalog is not read yet", () => {
     // why: the view `WorkerRegistry.connected` builds for a worker the gateway never read, as after a gateway restart, until the link's first full refresh.
     const unread: WorkerView = {

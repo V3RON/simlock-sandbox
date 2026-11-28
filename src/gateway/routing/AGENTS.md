@@ -27,6 +27,7 @@ Serviceability (`assess`):
 - A known worker is one that is not `incompatible`. What no known worker could serve is rejected
   with its own code; what a known worker could serve but none taking requests can is `NO_CAPACITY`.
   An updating worker counts as taking requests here, so a request only it can serve waits.
+- A connected, undrained worker with no catalog yet (after a gateway restart) ends no request on the model, driver, runtime or capacity rows: the request waits for it.
 - `can-serve` and `assess` ask the same helpers in the same order, so the reason
   `can-serve` gives is the code the table would reject with. `has-baseline` and `assess` share
   `baselineEntry` and `withBaseline`; no field of a baseline is compared in the gateway.
