@@ -227,6 +227,18 @@ describe("MCP server (smoke)", () => {
       expect((await call(mcpClient, "lease_simulator", ask)).isError).not.toBe(true);
       const again = client.calls.filter((entry) => entry.method === "requestLease");
       expect(again[1]?.input).not.toHaveProperty("requires");
+
+      for (const requires of [
+        [""],
+        ["Bank"],
+        ["a", "a"],
+        Array.from({ length: 9 }, (_, i) => `c${i}`),
+      ]) {
+        const refused = await call(mcpClient, "lease_simulator", { ...ask, requires });
+        expect(refused.isError).toBe(true);
+        expect((JSON.parse(text(refused)) as { code: string }).code).toBe("BAD_REQUEST");
+      }
+      expect(client.calls.filter((entry) => entry.method === "requestLease")).toHaveLength(2);
     } finally {
       await close();
     }

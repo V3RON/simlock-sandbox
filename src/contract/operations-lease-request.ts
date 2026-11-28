@@ -71,11 +71,8 @@ const leaseRequestBaseSchema = z
     fleetRequestId: z.string().min(1).max(200).optional(),
     // why: A plain record of plain strings, bounded by `refuseBadMetadata` as one object-level check, like `except`: a bound on the field itself would be checked by the MCP SDK before the handler.
     metadata: z.record(z.string(), z.string()).optional(),
-    requires: z
-      .array(capabilityNameSchema)
-      .max(8)
-      .refine((names) => new Set(names).size === names.length, "a capability name appears twice")
-      .optional(),
+    // why: A plain array of plain strings, bounded by `refuseBadRequires` as one object-level check, like `metadata`: a bound or a refinement on the field itself would be checked by the MCP SDK before the handler, which answers -32602 and no `BAD_REQUEST`.
+    requires: z.array(z.string()).optional(),
   })
   .strict();
 
@@ -186,6 +183,45 @@ function exceptRefusal(
   return undefined;
 }
 
+const REQUIRES_MAX = 8;
+
+export function refuseBadRequires(): <
+  T extends { readonly requires?: readonly string[] | undefined },
+>(
+  input: T,
+  context: z.RefinementCtx,
+) => void {
+  return (input, context) => {
+    const { requires } = input;
+    if (requires === undefined) return;
+    if (requires.length > REQUIRES_MAX) {
+      context.addIssue({
+        code: "custom",
+        message: `requires names at most ${REQUIRES_MAX} capabilities`,
+        path: ["requires"],
+      });
+      return;
+    }
+    const bad = requires.find((name) => !capabilityNameSchema.safeParse(name).success);
+    if (bad !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: `requires: "${bad}" is not a capability name`,
+        path: ["requires"],
+      });
+      return;
+    }
+    const twice = requires.find((name, index) => requires.indexOf(name) !== index);
+    if (twice !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: `requires names "${twice}" twice`,
+        path: ["requires"],
+      });
+    }
+  };
+}
+
 const METADATA_MAX_KEYS = 16;
 const METADATA_KEY_MAX = 64;
 const METADATA_VALUE_MAX = 256;
@@ -290,6 +326,7 @@ const leaseRequestInputSchema = leaseRequestBaseSchema
   .superRefine(refuseBadOsVersion())
   .superRefine(refuseBadExcept())
   .superRefine(refuseBadMetadata())
+  .superRefine(refuseBadRequires())
   .superRefine(refuseBadRunId())
   .superRefine(refuseBadLabel())
   .superRefine(refusePhysicalWithImageFields());

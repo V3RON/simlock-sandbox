@@ -9,6 +9,7 @@ import {
   OPERATIONS,
   physicalClassSchema,
   platformSchema,
+  refuseBadRequires,
   refuseModelWithClass,
 } from "../contract/index.js";
 
@@ -18,8 +19,8 @@ import {
  * caller-supplied, for the same reason the daemon never lets a request rename its own
  * principal), `fleetRequestId` (a gateway's own mark on its dispatch to a worker, ADR 0021) and
  * `metadata` (context for a gateway's admission command, ADR 0074 §3: not an agent session's need).
- * `requires` is inherited: ADR 0091 §4 lets every frontend name the capabilities a worker must have, and the
- * contract checks the names.
+ * `requires` is inherited: ADR 0091 §4 lets every frontend name the capabilities a worker must have. It is a plain
+ * array here, checked by the contract's own `refuseBadRequires` in the handler, so a bad name is `BAD_REQUEST` and never the SDK's -32602.
  * `ttlMs` is no longer omitted: ADR 0004 accepts it on every request, so this tool
  * inherits it from the contract like every other field -- `lease.defaultTtlMs` when the caller
  * names none, `BAD_REQUEST` above `lease.maxTtlMs`. `mode` is the device mode, inherited the
@@ -38,11 +39,12 @@ export const leaseSimulatorInputSchema = leaseRequestFields.omit({
 });
 
 /**
- * why: The tool's input with the contract's model-or-class check on top, for the handler to run
+ * why: The tool's input with the contract's model-or-class and `requires` checks on top, for the handler to run
  * before asking: the SDK lists and validates the plain object above, which is all it can read.
  */
-export const leaseSimulatorCheckedInputSchema =
-  leaseSimulatorInputSchema.superRefine(refuseModelWithClass());
+export const leaseSimulatorCheckedInputSchema = leaseSimulatorInputSchema
+  .superRefine(refuseModelWithClass())
+  .superRefine(refuseBadRequires());
 
 /** `lease.request`'s output verbatim -- the device/lease/timing grant. */
 export const leaseSimulatorOutputSchema = OPERATIONS["lease.request"].output;

@@ -78,6 +78,7 @@ export {
   leaseIdSchema,
   refuseModelWithClass,
   refuseBadLabel,
+  refuseBadRequires,
   refuseBadRunId,
   RUN_ID_PATTERN,
   leaseRequestFields,
