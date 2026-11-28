@@ -240,9 +240,9 @@ export async function createDriver(
     processRunner: runner,
     simlockHome: "/home/.simlock",
   });
-  // why: a seed row a test planted stands for a simulator `simctl clone` made in the sources set, which the scripted runner cannot; the folders come after the driver's start, which refuses a root holding anything unmarked, and a test of a seed deleted by hand removes its folder afterwards.
+  // why: a ready source row a test planted stands for a simulator `simctl clone` made in the sources set, which the scripted runner cannot; the folders come after the driver's start, which refuses a root holding anything unmarked, and a test of a seed deleted by hand removes its folder afterwards.
   for (const row of sources
-    .prepare("SELECT udid FROM ios_source_data WHERE kind = 'seed' AND state = 'ready'")
+    .prepare("SELECT udid FROM ios_source_data WHERE state = 'ready'")
     .all()) {
     if (typeof row.udid === "string") await filesystem.mkdirp(join(sourcesSetPath, row.udid));
   }
