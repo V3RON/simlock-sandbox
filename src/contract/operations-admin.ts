@@ -96,7 +96,7 @@ export const nukeRun = defineOperation({
   name: "nuke.run",
   role: "admin",
   effect: "write",
-  input: z.object({ deleteDevices: z.boolean().optional() }),
+  input: z.object({ deleteDevices: z.boolean().optional(), platform: platformSchema.optional() }),
   output: nukeReportSchema,
 });
 

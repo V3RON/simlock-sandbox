@@ -1,4 +1,5 @@
 import type { NukeExecutor } from "./core-ports.js";
+import type { Platform } from "./domain.js";
 import type { Registry } from "./registry.js";
 
 export interface NukeOptions {
@@ -8,6 +9,7 @@ export interface NukeOptions {
 
 export interface NukeRunOptions {
   readonly deleteDevices: boolean;
+  readonly platform?: Platform;
 }
 
 export class Nuke {
@@ -20,9 +22,13 @@ export class Nuke {
   }> {
     const before = this.options.registry.snapshot.devices
       .filter((device) => device.state !== "deleted")
+      .filter(
+        (device) => options.platform === undefined || device.spec.platform === options.platform,
+      )
       .map((device) => device.id);
     const { releasedLeaseIds, removedBaselines } = await this.options.executor.nuke(
       options.deleteDevices,
+      options.platform,
     );
     const deleted = new Set(
       this.options.registry.snapshot.devices

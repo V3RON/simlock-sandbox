@@ -214,10 +214,20 @@ export class LearnedKinds {
     database.prepare(`DELETE FROM warm_kinds WHERE ${where}`).run(...key);
   }
 
-  clear(): void {
+  clear(platform?: Platform): void {
     this.#state.transaction(() => {
-      this.#state.database.exec("DELETE FROM warm_kind_leases");
-      this.#state.database.exec("DELETE FROM warm_kinds");
+      const database = this.#state.database;
+      if (platform === undefined) {
+        database.exec("DELETE FROM warm_kind_leases");
+        database.exec("DELETE FROM warm_kinds");
+        return;
+      }
+      database
+        .prepare(
+          "DELETE FROM warm_kind_leases WHERE kind_id IN (SELECT id FROM warm_kinds WHERE platform = ?)",
+        )
+        .run(platform);
+      database.prepare("DELETE FROM warm_kinds WHERE platform = ?").run(platform);
     });
   }
 

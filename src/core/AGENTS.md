@@ -27,6 +27,7 @@ Lock, claims and commits:
 Devices:
 
 - The state machine is `transition` in `domain.ts`. `markDeviceMissing` writes `deleted` from any state of a device with no lease. A `deleted` record stays in `state.db` and `status.get` for `devices.deletedRetentionMs`, counted from `deletedAt`, then `snapshot` stops listing it and the next commit drops it, with no event; a row already `deleted` at the first start after the upgrade gets that start's time.
+- A nuke given a platform (`simlock nuke --platform`) scopes leases ended, devices reset, seeds, baselines and learned warm kinds to it; the maintenance gate stays one, so every waiting request of both platforms is still cancelled `killed`.
 - Destroy only what the registry holds. One exception: `doctor --purge-orphans`, opt-in.
 - Nothing in core acts on a leased device, except `recoverLeased`, under the lease: it reboots with no commit and no event.
 - Grant paths select by exact state. `mayBeGranted` refuses every virtual device that has ended a lease, whatever its `leaseIdentity` (ADR 0061 §2).
@@ -57,7 +58,7 @@ Baselines (ADR 0061 §4):
 
 - One save or remove at a time. A save: leasing's `releaseToSave` ends the lease, then `ReclaimCoordinator.retireSaved` calls `driver.saveSource` under the `reclaim` claim. A driver failure quarantines the device and answers `BASELINE_SAVE_FAILED`.
 - A replace keeps the leased devices of older versions. An older version is dropped only when no device record and no provision (`hold`) has it; that is checked after a save, on every `device.deleted` and at startup.
-- `remove` refuses a baseline a lease uses, and destroys each source before its row. `removeAll` (nuke) deletes rows first.
+- `remove` refuses a baseline a lease uses, and destroys each source before its row. `removeAll` (nuke) deletes rows first; given a platform, only that platform's.
 - `checkStale` runs before `list` and `doctor`, after `component.removed`, after a save, and at startup. A failure is logged and goes on, except before `list`, which fails with it.
 
 ## Known gaps

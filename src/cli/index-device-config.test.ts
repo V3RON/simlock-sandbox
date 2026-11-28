@@ -846,4 +846,69 @@ describe("CLI: --yes / confirm guards (safety rule 5)", () => {
     ).resolves.toBe(2);
     expect(connected).toBe(false);
   });
+
+  it("nuke takes --platform <ios|android>, sends it, names it in the prompt, and refuses any other value with a usage error", async () => {
+    const run = async (argv: readonly string[], answer = true) => {
+      const output = outputCapture();
+      const sent: unknown[] = [];
+      const prompts: string[] = [];
+      let connected = false;
+      const code = await runCli(
+        argv,
+        output.environmentWith({
+          confirm: async (prompt: string) => {
+            prompts.push(prompt);
+            return answer;
+          },
+          connectAdmin: async () => {
+            connected = true;
+            return fakeClient({
+              runNuke: (input) => {
+                sent.push(input);
+                return Promise.resolve({
+                  deletedDevices: [],
+                  releasedLeaseIds: [],
+                  removedBaselines: [],
+                });
+              },
+            });
+          },
+        }),
+      );
+      return { code, connected, prompts, sent, stderr: output.stderr, stdout: output.stdout };
+    };
+
+    const ios = await run(["nuke", "--delete-devices", "--platform", "ios"]);
+    const android = await run(["nuke", "--platform", "android", "--yes"]);
+    const absent = await run(["nuke"]);
+
+    expect([ios.code, ios.sent, ios.prompts]).toEqual([
+      0,
+      [{ deleteDevices: true, platform: "ios" }],
+      ["Nuke Simlock-managed ios devices? [y/N] "],
+    ]);
+    expect([android.code, android.sent, android.prompts]).toEqual([
+      0,
+      [{ deleteDevices: false, platform: "android" }],
+      [],
+    ]);
+    expect([absent.code, absent.prompts]).toEqual([0, ["Nuke Simlock-managed devices? [y/N] "]]);
+    expect(absent.sent).toEqual([{ deleteDevices: false }]);
+    expect(absent.sent[0]).not.toHaveProperty("platform");
+    for (const [argv, message] of [
+      [["nuke", "--platform", "windows", "--yes"], "nuke --platform must be ios or android"],
+      [["nuke", "--platform", "iOS", "--yes"], "nuke --platform must be ios or android"],
+      [["nuke", "--platform"], "Option '--platform <value>' argument missing"],
+    ] as const) {
+      const refused = await run(argv);
+      expect(refused.code, argv.join(" ")).toBe(2);
+      expect(refused.connected, argv.join(" ")).toBe(false);
+      expect(JSON.parse(refused.stderr), argv.join(" ")).toEqual({
+        error: { code: "USAGE", message },
+      });
+    }
+    expect((await run(["nuke", "--help"])).stdout).toBe(
+      "Usage: simlock nuke [--delete-devices] [--platform <ios|android>] [--yes]\n",
+    );
+  });
 });

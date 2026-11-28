@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { afterEach, expect, it, describe } from "vitest";
 import { DriverCrashError, BootTimeoutError } from "../../core/index.js";
 import { ScriptedProcessRunner, FakeClock, MemoryFilesystem } from "../../ports/index.js";
@@ -518,6 +519,7 @@ describe("IosSimctlDriver", () => {
     edit: (catalog: Catalog) => void;
     planted?: Partial<PlantedSource>;
     persists?: true;
+    gone?: true;
     reason: string | undefined;
   }>([
     { name: "healthy", edit: () => undefined, reason: undefined },
@@ -575,9 +577,32 @@ describe("IosSimctlDriver", () => {
       },
       reason: `device type ${driverData.deviceTypeId} is not available`,
     },
+    {
+      name: "a seed's simulator is gone from the sources set",
+      edit: () => undefined,
+      gone: true,
+      reason: "its simulator is gone; the next lease of its kind makes it again",
+    },
+    {
+      name: "a baseline's simulator is gone from the sources set",
+      edit: () => undefined,
+      gone: true,
+      planted: { kind: "baseline" },
+      reason: "its simulator is gone; save it again",
+    },
+    {
+      name: "its runtime is gone and so is its simulator, the runtime reason winning",
+      edit: (catalog: Catalog) => {
+        catalog.runtimes = catalog.runtimes.filter(
+          (entry) => entry.identifier !== driverData.runtimeId,
+        );
+      },
+      gone: true,
+      reason: `runtime ${driverData.runtimeId} is not installed`,
+    },
   ])(
     "lists a ready source with its model, version and size, and its staleReason when $name, which clears once it is back",
-    async ({ edit, persists, planted, reason }) => {
+    async ({ edit, gone, persists, planted, reason }) => {
       const catalogOf = (change: (catalog: Catalog) => void) => {
         const catalog = JSON.parse(listFixture) as Catalog;
         for (const entry of catalog.runtimes) {
@@ -601,7 +626,9 @@ describe("IosSimctlDriver", () => {
         udid: seedUdid,
         ...planted,
       });
-      const driver = await createDriver(runner, new FakeClock(), undefined, database);
+      const filesystem = new MemoryFilesystem();
+      const driver = await createDriver(runner, new FakeClock(), filesystem, database);
+      if (gone === true) await filesystem.rm(join(sourcesSetPath, seedUdid));
 
       expect(await driver.listSources()).toMatchObject([
         {
@@ -612,6 +639,7 @@ describe("IosSimctlDriver", () => {
           ...(reason === undefined ? {} : { staleReason: reason }),
         },
       ]);
+      if (gone === true) await plantSeedClone(filesystem);
       // why: a lineage the source never had does not come back with the catalog, so its reason stays.
       const again = (await driver.listSources())[0];
       if (persists === true) expect(again).toHaveProperty("staleReason", reason);

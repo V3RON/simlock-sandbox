@@ -46,8 +46,14 @@ export const leaseSimulatorCheckedInputSchema = leaseSimulatorInputSchema
   .superRefine(refuseModelWithClass())
   .superRefine(refuseBadRequires());
 
-/** `lease.request`'s output verbatim -- the device/lease/timing grant. */
-export const leaseSimulatorOutputSchema = OPERATIONS["lease.request"].output;
+/**
+ * why: `lease.request`'s output plus this tool's own `hint`: the one line a slim iOS lease says,
+ * naming the categories off and the way out. Beside `releaseSimulatorOutputSchema`'s `released`,
+ * it lives here and not in the daemon's contract, so the protocol stays as it is.
+ */
+export const leaseSimulatorOutputSchema = OPERATIONS["lease.request"].output.extend({
+  hint: z.string().max(1024).optional(),
+});
 
 export const listDevicesInputSchema = OPERATIONS["catalog.get"].input;
 
