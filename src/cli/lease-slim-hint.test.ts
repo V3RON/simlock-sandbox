@@ -129,70 +129,83 @@ const CASES: readonly Case[] = [
   { name: "--export-env", args: ["--export-env", "--detach"], line: [lineOf(CATEGORIES)] },
 ];
 
+interface Ran {
+  readonly code: number;
+  readonly stderr: string;
+  readonly stdout: string;
+  readonly catalogCalls: number;
+}
+
+async function runCase(testCase: Case): Promise<Ran> {
+  const where = `case ${testCase.name}`;
+  const output = outputCapture();
+  const clock = new FakeClock(0);
+  let catalogCalls = 0;
+  const grant = grantOf(testCase.device ?? {});
+  const client = fakeClient({
+    requestLease: () => Promise.resolve(grant),
+    getCatalog: () => {
+      catalogCalls += 1;
+      return (testCase.catalog ?? ALL)(clock);
+    },
+  });
+  let code: number | undefined;
+  const signals = new EventEmitter();
+  const running = runCli(
+    [
+      "lease",
+      "--platform",
+      "ios",
+      "--mode",
+      "slim",
+      ...(testCase.held === true ? [] : ["--detach"]),
+      ...(testCase.args ?? []),
+    ],
+    output.environmentWith({
+      clock,
+      connectAdmin: async () => client,
+      signals: signals as unknown as CliEnvironment["signals"],
+    }),
+  ).then((exit) => (code = exit));
+  // why: the command module loads lazily, so the fake clock starts only once the grant is out.
+  await vi.waitFor(() => expect(output.stdout, `${where}: no grant written`).not.toBe(""));
+  for (let tick = 0; tick < 10 && code === undefined; tick += 1) {
+    await settle();
+    clock.advance(500);
+    if (testCase.held === true && tick === 6) signals.emit("SIGINT");
+  }
+  expect(code, `${where}: the command had not finished by 5 s on the fake clock`).toBeDefined();
+  await running;
+  return { code: code as number, stderr: output.stderr, stdout: output.stdout, catalogCalls };
+}
+
+function slimNotices(ran: Ran, where: string): string[] {
+  return ran.stderr
+    .trim()
+    .split("\n")
+    .map((line) => {
+      try {
+        return String((JSON.parse(line) as { notice?: unknown }).notice);
+      } catch {
+        throw new Error(`${where}: ${ran.stderr}`);
+      }
+    })
+    .filter((notice) => notice.startsWith("slim:"));
+}
+
 describe("simlock lease: the slim hint line", () => {
   it("a slim iOS lease writes one stderr notice naming the categories off, in catalog order, and never changes the grant or the exit code", async () => {
     for (const testCase of CASES) {
-      const output = outputCapture();
-      const clock = new FakeClock(0);
-      let catalogCalls = 0;
-      const grant = grantOf(testCase.device ?? {});
-      const client = fakeClient({
-        requestLease: () => Promise.resolve(grant),
-        getCatalog: () => {
-          catalogCalls += 1;
-          return (testCase.catalog ?? ALL)(clock);
-        },
-      });
-      let code: number | undefined;
-      const signals = new EventEmitter();
-      const running = runCli(
-        [
-          "lease",
-          "--platform",
-          "ios",
-          "--mode",
-          "slim",
-          ...(testCase.held === true ? [] : ["--detach"]),
-          ...(testCase.args ?? []),
-        ],
-        output.environmentWith({
-          clock,
-          connectAdmin: async () => client,
-          signals: signals as unknown as CliEnvironment["signals"],
-        }),
-      ).then((exit) => (code = exit));
-      // why: the command module loads lazily, so the fake clock starts only once the grant is out.
-      await vi.waitFor(() =>
-        expect(output.stdout, `case ${testCase.name}: no grant written`).not.toBe(""),
-      );
-      for (let tick = 0; tick < 10 && code === undefined; tick += 1) {
-        await settle();
-        clock.advance(500);
-        if (testCase.held === true && tick === 6) signals.emit("SIGINT");
-      }
       const where = `case ${testCase.name}`;
-      expect(code, `${where}: the command had not finished by 5 s on the fake clock`).toBeDefined();
-      await running;
-      const notices = output.stderr
-        .trim()
-        .split("\n")
-        .map((line) => {
-          try {
-            return JSON.parse(line) as Record<string, unknown>;
-          } catch {
-            throw new Error(`${where}: ${output.stderr}`);
-          }
-        })
-        .map((line) => String(line.notice))
-        .filter((notice) => notice.startsWith("slim:"));
-      expect(notices, where).toEqual(testCase.line ?? []);
-      expect(code, where).toBe(0);
-      expect(catalogCalls, where).toBe(testCase.catalogCalls ?? 1);
+      const ran = await runCase(testCase);
+      expect(slimNotices(ran, where), where).toEqual(testCase.line ?? []);
+      expect(ran.code, where).toBe(0);
+      expect(ran.catalogCalls, where).toBe(testCase.catalogCalls ?? 1);
       if (testCase.args?.includes("--export-env") === true) {
-        expect(output.stdout, where).toMatch(/^export /m);
-        expect(output.stdout, where).not.toContain("slim:");
+        expect(ran.stdout, where).toMatch(/^export /m);
+        expect(ran.stdout, where).not.toContain("slim:");
       } else {
-        expect(JSON.parse(output.stdout), where).toMatchObject({ lease: { id: "lse_1" } });
+        expect(JSON.parse(ran.stdout), where).toMatchObject({ lease: { id: "lse_1" } });
       }
     }
   });
