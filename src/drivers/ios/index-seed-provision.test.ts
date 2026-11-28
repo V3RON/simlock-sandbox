@@ -21,6 +21,7 @@ import {
   waitForCalls,
   simctl,
   instanceId,
+  overridesFolder,
   unownedSourcesSet,
 } from "./test-slim.js";
 import {
@@ -180,6 +181,71 @@ describe("IosSimctlDriver", () => {
     expect(database.prepare("SELECT udid, state FROM ios_source_data").all()).toEqual([
       { state: "ready", udid: seedUdid },
     ]);
+  });
+
+  it("an iOS lease of a kind whose seed simulator is not in the sources set is granted on a new seed made without any simctl call on the gone one, and one present is cloned", async () => {
+    const copyUdid = "00000000-0000-0000-0000-000000000002";
+    const secondCopy = "00000000-0000-0000-0000-000000000003";
+    const newSeed = "00000000-0000-0000-0000-0000000000cc";
+    const goneRow = `planted-${seedUdid}-${driverData.runtimeId}`;
+    const cases = [
+      { label: "folder present", planted: "present", makes: 0, provisions: 1 },
+      { label: "deleted by hand", planted: "set-without-it", makes: 1, provisions: 1 },
+      { label: "sources set missing", planted: "no-set", makes: 1, provisions: 1 },
+      { label: "two provisions at once", planted: "set-without-it", makes: 1, provisions: 2 },
+    ] as const;
+    for (const { label, makes, planted, provisions } of cases) {
+      const seed = makes === 0 ? seedUdid : newSeed;
+      const copyClone = sourcesSimctl("clone", seed, driverData.name, deviceRoot);
+      const runner = new ScriptedProcessRunner([
+        ...Array.from({ length: provisions }, () => ({
+          match: listInvocation,
+          result: { code: 0, stderr: "", stdout: listFixture },
+        })),
+        ...(makes === 0 ? [] : throwawaySeedSteps(newSeed)),
+        { match: copyClone, result: { code: 0, stderr: "", stdout: `${copyUdid}\n` } },
+        ...(provisions === 2
+          ? [{ match: copyClone, result: { code: 0, stderr: "", stdout: `${secondCopy}\n` } }]
+          : []),
+      ]);
+      const filesystem = new MemoryFilesystem();
+      const database = await seededDatabase({
+        files: [{ kind: "file", relativePath: "data/x.db" }],
+      });
+      const driver = await createDriver(runner, new FakeClock(), filesystem, database);
+      await plantManagedDevice(filesystem);
+      if (planted === "present") await plantSeedClone(filesystem);
+      if (planted === "set-without-it") await filesystem.mkdirp(sourcesSetPath);
+      if (makes === 1) await plantSeedClone(filesystem, sourcesSetPath, newSeed);
+      await filesystem.mkdirp(`${deviceRoot}/${copyUdid}/data`);
+      await filesystem.mkdirp(`${deviceRoot}/${secondCopy}/data`);
+      await filesystem.mkdirp(overridesFolder(seedUdid));
+
+      const granted = await Promise.all(
+        Array.from({ length: provisions }, () => driver.provision(spec)),
+      );
+
+      expect(
+        granted.map((device) => device.deviceId),
+        label,
+      ).toEqual(provisions === 2 ? [copyUdid, secondCopy] : [copyUdid]);
+      expect(
+        runner.calls.filter((call) => call.args[3] === "create"),
+        label,
+      ).toHaveLength(makes);
+      expect(
+        runner.calls.some((call) => call.args.includes(seedUdid)),
+        label,
+      ).toBe(makes === 0);
+      expect(database.prepare("SELECT udid, state FROM ios_source_data").all(), label).toEqual([
+        { state: "ready", udid: seed },
+      ]);
+      expect(
+        database.prepare("SELECT source_id FROM ios_source_files WHERE source_id = ?").all(goneRow),
+        label,
+      ).toHaveLength(makes === 0 ? 1 : 0);
+      expect(await filesystem.exists(overridesFolder(seedUdid)), label).toBe(makes === 0);
+    }
   });
 
   it("two provisions at once make one seed, and the clones of one seed run one at a time", async () => {
