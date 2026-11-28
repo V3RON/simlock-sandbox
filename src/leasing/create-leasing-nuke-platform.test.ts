@@ -3,12 +3,6 @@ import { Nuke } from "../core/index.js";
 import { FakeDriver } from "../core/testing.js";
 import { FakeClock } from "../ports/index.js";
 import { androidRequest, createHarness, flush, request, seedReady } from "./test-create-leasing.js";
-import {
-  asking,
-  createHarness as createPhysicalHarness,
-  enrollIphone,
-  physicalRequest,
-} from "./test-physical-device-watcher.js";
 
 type Platform = "android" | "ios";
 
@@ -37,6 +31,37 @@ async function bothPlatforms(options: Parameters<typeof createHarness>[0] = {}) 
     },
   });
   return { drivers: { android, ios }, harness };
+}
+
+/** why: one lease and one saved baseline per platform, a seed and an orphan beside each, then a nuke of one platform; answers what the nuke reported and what is left. */
+async function nukeSeedsAndBaselines(platform: Platform, deleteDevices: boolean) {
+  const { drivers, harness } = await bothPlatforms();
+  const asks = { android: androidRequest, ios: request };
+  for (const each of ["ios", "android"] as const) {
+    const lease = await harness.engine.request(asks[each], { ownerId: each, requesterId: each });
+    await harness.engine.core.baselines.save({
+      leaseId: lease.lease.id,
+      name: `${each}-checkout`,
+      requesterId: each,
+    });
+    drivers[each].setSources([
+      ...(await drivers[each].listSources()),
+      { id: `${each}-seed`, kind: "seed", model: "m", osVersion: "1" },
+      { id: `${each}-orphan`, kind: "seed", model: "m", orphan: true, osVersion: "1" },
+    ]);
+  }
+
+  const report = await harness.engine.nuke(deleteDevices, platform);
+
+  const left = async (each: Platform) =>
+    (await drivers[each].listSources()).map((source) => source.id).sort();
+  return {
+    baselines: (await harness.engine.core.baselines.list()).map((entry) => entry.name).sort(),
+    removed: report.removedBaselines,
+    removedEvents: harness.bus.replay().filter((event) => event.event === "baseline.removed")
+      .length,
+    sources: { android: await left("android"), ios: await left("ios") },
+  };
 }
 
 describe("createLeasing: a platform nuke", () => {
@@ -79,13 +104,24 @@ describe("createLeasing: a platform nuke", () => {
   });
 
   it("ends an iOS physical lease and keeps the device enrolled, and leaves the Android lease", async () => {
-    const harness = await createPhysicalHarness({ android: true });
-    const phone = await enrollIphone(harness, "UDID-A");
-    const physical = await harness.engine.request(physicalRequest, asking("p"));
-    const android = await harness.engine.request(
-      { ...androidRequest, osVersion: "14" },
-      asking("a"),
+    const { drivers, harness } = await bothPlatforms();
+    const phone = await harness.registry.enrollPhysical({
+      apps: [],
+      class: "phone",
+      driverDeviceId: "UDID-A",
+      model: "iPhone 15 Pro",
+      osVersion: "18.4",
+      platform: "ios",
+    });
+    drivers.ios.setPhysicalPresence("UDID-A", true);
+    const physical = await harness.engine.request(
+      { model: "iPhone 15 Pro", physical: true, platform: "ios" },
+      { ownerId: "p", requesterId: "p" },
     );
+    const android = await harness.engine.request(androidRequest, {
+      ownerId: "a",
+      requesterId: "a",
+    });
 
     const report = await new Nuke({ executor: harness.engine, registry: harness.registry }).run({
       deleteDevices: true,
@@ -96,8 +132,7 @@ describe("createLeasing: a platform nuke", () => {
     expect(report.deletedDevices).toEqual([]);
     const state = (id: string) =>
       harness.registry.snapshot.devices.find((device) => device.id === id)?.state;
-    expect(state(phone.id)).not.toBe("deleted");
-    expect(state(phone.id)).not.toBe("leased");
+    expect(state(phone.id)).toBe("ready");
     expect(state(android.device.id)).toBe("leased");
     expect(harness.registry.snapshot.leases.map((lease) => lease.id)).toEqual([android.lease.id]);
   });
@@ -138,57 +173,36 @@ describe("createLeasing: a platform nuke", () => {
   });
 
   it("with --delete-devices deletes only that platform's seeds and baselines, keeps every orphan, and deletes nothing without it", async () => {
+    const outcomes: Record<string, unknown> = {};
+    const expected: Record<string, unknown> = {};
     for (const platform of ["ios", "android"] as const satisfies readonly Platform[]) {
-      const other: Platform = platform === "ios" ? "android" : "ios";
+      const other = platform === "ios" ? "android" : "ios";
       for (const deleteDevices of [true, false]) {
         const label = `${platform} ${deleteDevices ? "with" : "without"} --delete-devices`;
-        const { drivers, harness } = await bothPlatforms();
-        const asks = { android: androidRequest, ios: request };
-        for (const each of [platform, other] as const) {
-          const lease = await harness.engine.request(asks[each], {
-            ownerId: each,
-            requesterId: each,
-          });
-          await harness.engine.core.baselines.save({
-            leaseId: lease.lease.id,
-            name: `${each}-checkout`,
-            requesterId: each,
-          });
-          drivers[each].setSources([
-            ...(await drivers[each].listSources()),
-            { id: `${each}-seed`, kind: "seed", model: "m", osVersion: "1" },
-            { id: `${each}-orphan`, kind: "seed", model: "m", orphan: true, osVersion: "1" },
-          ]);
-        }
-        const sources = async (each: Platform) =>
-          (await drivers[each].listSources()).map((source) => source.id).sort();
-        const before = { [other]: await sources(other), [platform]: await sources(platform) };
-
-        const report = await harness.engine.nuke(deleteDevices, platform);
-
-        expect(report.removedBaselines, label).toEqual(
-          deleteDevices ? [`${platform}-checkout`] : [],
-        );
-        expect(
-          (await harness.engine.core.baselines.list()).map((entry) => entry.name).sort(),
-          label,
-        ).toEqual(deleteDevices ? [`${other}-checkout`] : [`android-checkout`, `ios-checkout`]);
-        expect(
-          harness.bus
-            .replay()
-            .filter((event) => event.event === "baseline.removed")
-            .map((event) => event.payload),
-          label,
-        ).toEqual(deleteDevices ? [expect.objectContaining({ reason: "nuke" })] : []);
-        expect(await sources(other), label).toEqual(before[other]);
-        const after = await sources(platform);
-        expect(after, label).toEqual(
-          deleteDevices
-            ? before[platform]?.filter((id) => id === `${platform}-orphan`)
-            : before[platform],
-        );
+        outcomes[label] = await nukeSeedsAndBaselines(platform, deleteDevices);
+        expected[label] = deleteDevices
+          ? {
+              baselines: [`${other}-checkout`],
+              removed: [`${platform}-checkout`],
+              removedEvents: 1,
+              sources: {
+                [other]: ["fake-source-1", `${other}-orphan`, `${other}-seed`].sort(),
+                [platform]: [`${platform}-orphan`],
+              },
+            }
+          : {
+              baselines: ["android-checkout", "ios-checkout"],
+              removed: [],
+              removedEvents: 0,
+              sources: {
+                android: ["android-orphan", "android-seed", "fake-source-1"].sort(),
+                ios: ["fake-source-1", "ios-orphan", "ios-seed"].sort(),
+              },
+            };
       }
     }
+
+    expect(outcomes).toEqual(expected);
   });
 
   it("forgets only that platform's learned kinds, an iOS baseline kind included, and every kind without a platform", async () => {

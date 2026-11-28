@@ -843,12 +843,16 @@ function sourceStaleReason(
   if (!catalog.deviceTypes.some((entry) => entry.identifier === row.deviceTypeId)) {
     return `device type ${row.deviceTypeId} is not available`;
   }
-  if (present !== undefined && row.udid !== undefined && !present.has(row.udid.toUpperCase())) {
-    return row.kind === "baseline"
-      ? "its simulator is gone; save it again"
-      : "its simulator is gone; the next lease of its kind makes it again";
+  return goneReason(row, present);
+}
+
+function goneReason(row: SourceRow, present: ReadonlySet<string> | undefined): string | undefined {
+  if (present === undefined || row.udid === undefined || present.has(row.udid.toUpperCase())) {
+    return undefined;
   }
-  return undefined;
+  return row.kind === "baseline"
+    ? "its simulator is gone; save it again"
+    : "its simulator is gone; the next lease of its kind makes it again";
 }
 
 function seedSpecKey(resolved: ResolvedIosSpec): string {
