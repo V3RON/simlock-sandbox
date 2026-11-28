@@ -14,6 +14,15 @@ async function simctl(set: string, ...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+async function deviceState(set: string, udid: string): Promise<string | undefined> {
+  const listed = JSON.parse(await simctl(set, "list", "devices", "-j")) as {
+    devices: Record<string, { udid: string; state: string }[]>;
+  };
+  return Object.values(listed.devices)
+    .flat()
+    .find((d) => d.udid === udid)?.state;
+}
+
 describe("simctl delete after a shutdown that timed out (#98)", () => {
   it("removes a simulator whose simctl shutdown was killed before it finished", async () => {
     const set = await mkdtemp(join(tmpdir(), "simlock-delete-after-shutdown-"));
@@ -36,6 +45,12 @@ describe("simctl delete after a shutdown that timed out (#98)", () => {
       const shutdown = spawn("xcrun", ["simctl", "--set", set, "shutdown", udid], {
         stdio: "ignore",
       });
+      // why: killing in the same tick as spawn() can stop simctl before CoreSimulator hears of the shutdown; wait until the device has left "Booted" so the kill lands mid-shutdown.
+      const deadline = Date.now() + 15_000;
+      while ((await deviceState(set, udid)) === "Booted") {
+        expect(Date.now(), "the device never began shutting down").toBeLessThan(deadline);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
       shutdown.kill("SIGKILL");
       await new Promise((resolve) => shutdown.once("close", resolve));
 
