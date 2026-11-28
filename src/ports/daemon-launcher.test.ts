@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -14,6 +14,11 @@ import {
   type ServiceState,
   TaskSchedulerServiceManager,
 } from "./index.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, mkdir: vi.fn(actual.mkdir) };
+});
 
 describe("NodeDaemonLauncher", () => {
   it("rejects asynchronous spawn failures", async () => {
@@ -116,6 +121,36 @@ describe("NodeDaemonLauncher", () => {
       }
     },
   );
+
+  it("launches with a SIMLOCK_HOME whose existing parent refuses a recursive mkdir with EPERM", async () => {
+    // why: #78: Node on Windows rejects `mkdir("D:\\", { recursive: true })` with EPERM although the
+    // drive root exists. No POSIX root does that, so a temporary folder stands in for `D:\`.
+    const driveRoot = await mkdtemp(join(tmpdir(), "simlock-launcher-"));
+    const home = join(driveRoot, "simlock");
+    const logPath = join(home, "daemon.log");
+    const real = vi.mocked(mkdir).getMockImplementation() as typeof mkdir;
+    vi.mocked(mkdir).mockImplementation(async (path, options) => {
+      if (path === driveRoot && typeof options === "object" && options?.recursive === true) {
+        throw Object.assign(new Error(`EPERM: operation not permitted, mkdir '${driveRoot}'`), {
+          code: "EPERM",
+        });
+      }
+      return real(path, options);
+    });
+    try {
+      const launch = new NodeDaemonLauncher({
+        args: ["-e", "console.log('out')"],
+        command: process.execPath,
+        logPath,
+        simlockHome: home,
+      }).launch();
+      await expect(launch).resolves.toHaveProperty("exited");
+      await expect.poll(async () => (await readFile(logPath, "utf8")).trim()).toBe("out");
+    } finally {
+      vi.mocked(mkdir).mockImplementation(real);
+      await rm(driveRoot, { force: true, recursive: true });
+    }
+  });
 
   it("combines stdout and stderr in an append-only log", async () => {
     const directory = await mkdtemp(join(tmpdir(), "simlock-launcher-"));
