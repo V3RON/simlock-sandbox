@@ -393,17 +393,21 @@ export class BaselineService {
   }
 
   /**
-   * why: nuke's removal of every baseline: the rows go first, then the sources, so a source that
+   * why: nuke's removal of every baseline, or of one platform's: the rows go first, then the sources, so a source that
    * will not delete is an orphan `doctor` lists and not a baseline that points at nothing. Every
    * source is tried; the names whose rows went are answered with the first failure, if any.
    */
   async removeAll(
-    _platform?: Platform,
+    platform?: Platform,
   ): Promise<{ readonly failure?: unknown; readonly names: readonly string[] }> {
+    const where = platform === undefined ? "" : " WHERE platform = ?";
+    const bound = platform === undefined ? [] : [platform];
     const rows = this.options.state.database
-      .prepare("SELECT name, version, platform, source_id FROM baselines ORDER BY name, version")
-      .all();
-    this.options.state.database.prepare("DELETE FROM baselines").run();
+      .prepare(
+        `SELECT name, version, platform, source_id FROM baselines${where} ORDER BY name, version`,
+      )
+      .all(...bound);
+    this.options.state.database.prepare(`DELETE FROM baselines${where}`).run(...bound);
     let failure: unknown;
     for (const row of rows) {
       this.options.eventBus.emit(

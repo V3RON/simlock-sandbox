@@ -45,7 +45,7 @@ export interface NukeServiceOptions {
   readonly devices: NukeDeviceLifecycle;
   readonly acquisition: AcquisitionMaintenance;
   readonly leases: LeaseMaintenance;
-  /** why: nuke --delete-devices removes every baseline and answers their names. */
+  /** why: nuke --delete-devices removes every baseline of the platform (or of both) and answers their names. */
   readonly baselines: {
     removeAll(
       platform?: Platform,
@@ -121,8 +121,8 @@ export class NukeService implements NukeExecutor {
         }
       }
 
-      if (deleteDevices) await this.#destroySeeds();
-      const removedBaselines = deleteDevices ? await this.#removeBaselines() : [];
+      if (deleteDevices) await this.#destroySeeds(platform);
+      const removedBaselines = deleteDevices ? await this.#removeBaselines(platform) : [];
 
       return { releasedLeaseIds, removedBaselines };
     } finally {
@@ -135,8 +135,8 @@ export class NukeService implements NukeExecutor {
   }
 
   /** why: a baseline source that will not delete must not fail the reset; its row is already gone, so every name is reported, and `doctor` lists the source that stayed. */
-  async #removeBaselines(): Promise<readonly string[]> {
-    const { failure, names } = await this.options.baselines.removeAll();
+  async #removeBaselines(platform?: Platform): Promise<readonly string[]> {
+    const { failure, names } = await this.options.baselines.removeAll(platform);
     if (failure !== undefined) {
       this.#logger.error("nuke could not remove every baseline", { error: stableError(failure) });
     }
@@ -144,8 +144,9 @@ export class NukeService implements NukeExecutor {
   }
 
   /** why: one unreadable or stuck seed must not stop the rest of the reset; the seed stays and `doctor` lists it. */
-  async #destroySeeds(): Promise<void> {
+  async #destroySeeds(platform?: Platform): Promise<void> {
     for (const driver of this.options.drivers) {
+      if (platform !== undefined && driver.platform !== platform) continue;
       try {
         for (const source of await driver.listSources()) {
           if (source.kind !== "seed" || source.orphan === true) continue;
