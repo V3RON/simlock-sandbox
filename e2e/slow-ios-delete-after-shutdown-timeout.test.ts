@@ -1,0 +1,55 @@
+import { execFile, spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import { describe, expect, it } from "vitest";
+
+const execFileAsync = promisify(execFile);
+
+async function simctl(set: string, ...args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("xcrun", ["simctl", "--set", set, ...args], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return stdout.trim();
+}
+
+describe("simctl delete after a shutdown that timed out (#98)", () => {
+  it("removes a simulator whose simctl shutdown was killed before it finished", async () => {
+    const set = await mkdtemp(join(tmpdir(), "simlock-delete-after-shutdown-"));
+    try {
+      const runtimes = JSON.parse(await simctl(set, "list", "runtimes", "-j")) as {
+        runtimes: { identifier: string; isAvailable: boolean; name: string }[];
+      };
+      const runtime = runtimes.runtimes.find((r) => r.isAvailable && r.name.startsWith("iOS"));
+      expect(runtime, "this lane needs an installed iOS runtime").toBeDefined();
+      const udid = await simctl(
+        set,
+        "create",
+        "simlock-98",
+        "iPhone 15",
+        runtime?.identifier ?? "",
+      );
+      await simctl(set, "boot", udid);
+      await simctl(set, "bootstatus", udid, "-b");
+
+      const shutdown = spawn("xcrun", ["simctl", "--set", set, "shutdown", udid], {
+        stdio: "ignore",
+      });
+      shutdown.kill("SIGKILL");
+      await new Promise((resolve) => shutdown.once("close", resolve));
+
+      await simctl(set, "delete", udid);
+      const listed = JSON.parse(await simctl(set, "list", "devices", "-j")) as {
+        devices: Record<string, { udid: string }[]>;
+      };
+      expect(
+        Object.values(listed.devices)
+          .flat()
+          .map((d) => d.udid),
+      ).not.toContain(udid);
+    } finally {
+      await rm(set, { recursive: true, force: true });
+    }
+  }, 300_000);
+});
