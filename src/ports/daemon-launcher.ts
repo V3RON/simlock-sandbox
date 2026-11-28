@@ -91,15 +91,30 @@ export interface NodeDaemonLauncherOptions {
  * import), their parents left to the default and an existing one left as it is. `chmod` because the umask can only take bits from `mkdir`'s mode.
  */
 async function createDataDirectory(directory: string): Promise<void> {
-  await mkdir(dirname(directory), { recursive: true });
+  // why: the directory is made first and its parent only when that is missing: Node on Windows
+  // refuses `mkdir` of a drive root with EPERM even with `recursive`, so a home directly under
+  // `D:\` must never reach a `mkdir` of its parent while that parent exists.
+  const created = await makeOwnerOnly(directory).catch(async (error: unknown) => {
+    if (errorCode(error) !== "ENOENT") throw error;
+    await mkdir(dirname(directory), { recursive: true });
+    return makeOwnerOnly(directory);
+  });
+  if (created) await chmod(directory, 0o700);
+}
+
+/** why: false when the directory already existed, which is left as it is. */
+async function makeOwnerOnly(directory: string): Promise<boolean> {
   try {
     await mkdir(directory, { mode: 0o700 });
+    return true;
   } catch (error: unknown) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST")
-      return;
+    if (errorCode(error) === "EEXIST") return false;
     throw error;
   }
-  await chmod(directory, 0o700);
+}
+
+function errorCode(error: unknown): unknown {
+  return typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
 }
 
 export class NodeDaemonLauncher implements DaemonLauncher {
