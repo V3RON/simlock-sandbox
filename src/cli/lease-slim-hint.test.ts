@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { LeaseGrant } from "../client/index.js";
 import { runCli } from "./index.js";
-import { fakeClient, outputCapture } from "./test-index.js";
+import { FakeClock } from "../ports/index.js";
+import { fakeClient, outputCapture, settle } from "./test-index.js";
 
 const CATEGORIES = [
   "widgets",
@@ -42,7 +43,7 @@ function iosCatalog(slimCategories: readonly string[] | undefined) {
 
 function grantOf(device: Partial<LeaseGrant["device"]>): LeaseGrant {
   return {
-    environment: {},
+    environment: { SIMULATOR_UDID: "dev_1" },
     device: {
       physical: false,
       id: "dev_1",
@@ -71,27 +72,92 @@ function grantOf(device: Partial<LeaseGrant["device"]>): LeaseGrant {
   };
 }
 
+const ANDROID_SPEC = { physical: false, platform: "android", model: "Pixel 8", osVersion: "35" };
+
+interface Case {
+  readonly name: string;
+  readonly args?: readonly string[];
+  readonly device?: Partial<LeaseGrant["device"]>;
+  readonly catalog?: () => Promise<ReturnType<typeof iosCatalog>>;
+  readonly line?: readonly string[];
+  readonly catalogCalls?: number;
+}
+
+const ALL = (): Promise<ReturnType<typeof iosCatalog>> => Promise.resolve(iosCatalog(CATEGORIES));
+const lineOf = (names: readonly string[]) =>
+  `slim: ${names.join(", ")} off; use --except <name> or --mode full`;
+
+const CASES: readonly Case[] = [
+  { name: "all 16, no except", line: [lineOf(CATEGORIES)], catalogCalls: 1 },
+  {
+    name: "except siri names the other 15",
+    device: { except: ["siri"] },
+    line: [lineOf(CATEGORIES.filter((name) => name !== "siri"))],
+  },
+  { name: "except covers the list", device: { except: CATEGORIES.slice(0, 16) } },
+  { name: "slimCategories []", catalog: () => Promise.resolve(iosCatalog([])) },
+  { name: "slimCategories absent", catalog: () => Promise.resolve(iosCatalog(undefined)) },
+  { name: "no iOS entry", catalog: () => Promise.resolve({ platforms: [] }) },
+  { name: "full", device: { mode: "full" }, catalogCalls: 0 },
+  {
+    name: "Android",
+    device: { spec: ANDROID_SPEC, mode: undefined } as Partial<LeaseGrant["device"]>,
+    catalogCalls: 0,
+  },
+  { name: "physical", device: { physical: true, mode: undefined }, catalogCalls: 0 },
+  { name: "catalog.get rejects", catalog: () => Promise.reject(new Error("daemon went away")) },
+  { name: "catalog.get unanswered", catalog: () => new Promise(() => {}) },
+  { name: "--detach", args: ["--detach"], line: [lineOf(CATEGORIES)] },
+  { name: "--export-env", args: ["--export-env", "--detach"], line: [lineOf(CATEGORIES)] },
+];
+
 describe("simlock lease: the slim hint line", () => {
-  it("a slim iOS lease writes one stderr notice naming the categories off, in catalog order", async () => {
-    const output = outputCapture();
-    const client = fakeClient({
-      requestLease: () => Promise.resolve(grantOf({})),
-      getCatalog: () => Promise.resolve(iosCatalog(CATEGORIES)),
-    });
-    const code = await runCli(
-      ["lease", "--platform", "ios", "--mode", "slim", "--detach"],
-      output.environmentWith({ connectAdmin: async () => client }),
-    );
-    expect(code).toBe(0);
-    const notices = output.stderr
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((line) => String(line.notice).startsWith("slim:"));
-    expect(notices).toEqual([
-      {
-        notice: `slim: ${CATEGORIES.join(", ")} off; use --except <name> or --mode full`,
-      },
-    ]);
+  it("a slim iOS lease writes one stderr notice naming the categories off, in catalog order, and never changes the grant or the exit code", async () => {
+    for (const testCase of CASES) {
+      const output = outputCapture();
+      const clock = new FakeClock(0);
+      let catalogCalls = 0;
+      const grant = grantOf(testCase.device ?? {});
+      const client = fakeClient({
+        requestLease: () => Promise.resolve(grant),
+        getCatalog: () => {
+          catalogCalls += 1;
+          return (testCase.catalog ?? ALL)();
+        },
+      });
+      let code: number | undefined;
+      const running = runCli(
+        ["lease", "--platform", "ios", "--mode", "slim", "--detach", ...(testCase.args ?? [])],
+        output.environmentWith({ clock, connectAdmin: async () => client }),
+      ).then((exit) => (code = exit));
+      for (let tick = 0; tick < 10 && code === undefined; tick += 1) {
+        await settle();
+        clock.advance(500);
+      }
+      const where = `case ${testCase.name}`;
+      expect(code, `${where}: the command had not finished by 5 s on the fake clock`).toBeDefined();
+      await running;
+      const notices = output.stderr
+        .trim()
+        .split("\n")
+        .map((line) => {
+          try {
+            return JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            throw new Error(`${where}: ${output.stderr}`);
+          }
+        })
+        .map((line) => String(line.notice))
+        .filter((notice) => notice.startsWith("slim:"));
+      expect(notices, where).toEqual(testCase.line ?? []);
+      expect(code, where).toBe(0);
+      expect(catalogCalls, where).toBe(testCase.catalogCalls ?? 1);
+      if (testCase.args?.includes("--export-env") === true) {
+        expect(output.stdout, where).toMatch(/^export /m);
+        expect(output.stdout, where).not.toContain("slim:");
+      } else {
+        expect(JSON.parse(output.stdout), where).toMatchObject({ lease: { id: "lse_1" } });
+      }
+    }
   });
 });
