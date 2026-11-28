@@ -132,9 +132,10 @@ export class Seeds {
     const orphans = await this.#orphanSources();
     if (rows.length === 0) return orphans;
     const catalog = await this.#simctl.loadCatalog();
+    const present = await this.#presentUdids();
     return [
       ...rows.map((row) => {
-        const staleReason = sourceStaleReason(row, catalog);
+        const staleReason = sourceStaleReason(row, catalog, present);
         return {
           id: row.sourceId,
           kind: row.kind,
@@ -534,8 +535,11 @@ export class Seeds {
 
   /** why: a simulator whose folder is not in the sources set this process uses is gone (deleted by hand, or left in the other device set), and `simctl --set` on a set that is not there fails, so no `simctl` call decides it. */
   async #isGone(udid: string): Promise<boolean> {
-    const present = new Set((await this.#sourceFolders()).map((folder) => folder.toUpperCase()));
-    return !present.has(udid.toUpperCase());
+    return !(await this.#presentUdids()).has(udid.toUpperCase());
+  }
+
+  async #presentUdids(): Promise<ReadonlySet<string>> {
+    return new Set((await this.#sourceFolders()).map((folder) => folder.toUpperCase()));
   }
 
   /** why: the simulator is already gone, so only what Simlock kept about it goes: its row with its files rows, and its overrides folder. */
@@ -816,7 +820,12 @@ function seedIsStale(seed: ReadySeed, resolved: ResolvedIosSpec): boolean {
 }
 
 /** why: the phrase reads after "is stale:" in `doctor`, and is what a person acts on, so it names the runtime or device type by id. */
-function sourceStaleReason(row: SourceRow, catalog: SimctlCatalog): string | undefined {
+/** why: `present` is the UDIDs in the sources set; a caller that did not read the set passes none, and no source is judged gone. */
+function sourceStaleReason(
+  row: SourceRow,
+  catalog: SimctlCatalog,
+  present?: ReadonlySet<string>,
+): string | undefined {
   if (row.kind === "baseline" && row.lineage === undefined) {
     return row.savedWithoutLineage
       ? "saved from a simulator made before simulators stopped sharing folders; save it again from a new lease"
@@ -833,6 +842,11 @@ function sourceStaleReason(row: SourceRow, catalog: SimctlCatalog): string | und
   }
   if (!catalog.deviceTypes.some((entry) => entry.identifier === row.deviceTypeId)) {
     return `device type ${row.deviceTypeId} is not available`;
+  }
+  if (present !== undefined && row.udid !== undefined && !present.has(row.udid.toUpperCase())) {
+    return row.kind === "baseline"
+      ? "its simulator is gone; save it again"
+      : "its simulator is gone; the next lease of its kind makes it again";
   }
   return undefined;
 }
