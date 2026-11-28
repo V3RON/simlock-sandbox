@@ -64,6 +64,7 @@ Leases one simulator, emulator or enrolled phone for this session, and waits for
 | `timeoutMs` | number | Longest wait in the queue, then `QUEUE_TIMEOUT`. Default: no limit. |
 | `ttlMs` | number | The lease's time to live. Default `lease.defaultTtlMs`; above `lease.maxTtlMs` is `BAD_REQUEST`. |
 | `leaseId` | string | The lease's id, in place of a generated one: 1 to 64 letters, digits, `-` or `_`, starting with a letter or digit. Unique for all time. |
+| `requires` | array of strings | Up to 8 capability names the serving worker must have, each once: an optional module that is on, or a tag from the worker's `tags` configuration. The lease goes only to a worker that has every name; none is `CAPABILITY_MISSING`. |
 | `label` | string | A display name for the lease, 1 to 64 characters, no control characters. On Android and phones it shows on the lease only. |
 | `idempotencyKey` | string, 1 to 200 characters | Sending the same key again joins the request already made. Against a farm the server sets its own key and ignores this one. |
 
