@@ -103,7 +103,11 @@ describe("MCP lease_simulator: the slim hint", () => {
           await new Promise((resolve) => setTimeout(resolve, 0));
           clock.advance(2_001);
         }
-        await pending;
+        const answered = await Promise.race([
+          pending.then(() => true),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 2_000)),
+        ]);
+        expect(answered, `${where}: no answer within 2 s real time`).toBe(true);
         expect(result?.isError, where).not.toBe(true);
         const structured = result?.structuredContent as Record<string, unknown>;
         const { hint, ...rest } = structured;
