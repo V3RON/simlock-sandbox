@@ -150,13 +150,14 @@ async function noTokenStopsAtStart(): Promise<void> {
 
 async function toolsUseTheFarm(): Promise<void> {
   const served = await serveRemoteMcp();
-  const granted = await served.tool("lease_simulator", lease);
+  const granted = await served.tool("lease_simulator", { ...lease, requires: ["bank-network"] });
   expect((granted.lease as { id: string }).id).toBe("lse_env");
   expect(served.farm.requests.find(({ type }) => type === "lease.request")?.payload).toEqual(
     expect.objectContaining({
       idempotencyKey: expect.stringMatching(/\S/),
       platform: "ios",
       requesterId: "agent-a",
+      requires: ["bank-network"],
     }),
   );
   expect(

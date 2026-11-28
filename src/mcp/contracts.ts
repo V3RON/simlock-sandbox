@@ -13,11 +13,13 @@ import {
 } from "../contract/index.js";
 
 /**
- * why: `lease.request`'s input, minus the fields this tool never lets the caller set (also `requires`, ADR 0026):
+ * why: `lease.request`'s input, minus the fields this tool never lets the caller set:
  * `requesterId` (session-controlled -- see `main.ts`'s requester resolution, never
  * caller-supplied, for the same reason the daemon never lets a request rename its own
  * principal), `fleetRequestId` (a gateway's own mark on its dispatch to a worker, ADR 0021) and
  * `metadata` (context for a gateway's admission command, ADR 0074 §3: not an agent session's need).
+ * `requires` is inherited: ADR 0091 §4 lets every frontend name the capabilities a worker must have, and the
+ * contract checks the names.
  * `ttlMs` is no longer omitted: ADR 0004 accepts it on every request, so this tool
  * inherits it from the contract like every other field -- `lease.defaultTtlMs` when the caller
  * names none, `BAD_REQUEST` above `lease.maxTtlMs`. `mode` is the device mode, inherited the
@@ -32,7 +34,6 @@ export const leaseSimulatorInputSchema = leaseRequestFields.omit({
   fleetRequestId: true,
   metadata: true,
   requesterId: true,
-  requires: true,
   runId: true,
 });
 
