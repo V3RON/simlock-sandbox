@@ -103,7 +103,7 @@ export class ConnectionRequests {
     return undefined;
   }
 
-  // fallow-ignore-next-line complexity -- one case per request type that needs more than one dispatch call; `PASSTHROUGH_OPERATIONS` holds the rest.
+  // fallow-ignore-next-line complexity -- one case per request type outside `PASSTHROUGH_OPERATIONS`, which holds the plain dispatches of payload and session.
   async handle(
     connection: Connection,
     frame: RequestFrame,
