@@ -225,7 +225,10 @@ describe("createLeasing: a platform nuke", () => {
         await flush();
       };
       await learn(request, "plain");
-      await learn(androidRequest, "android");
+      // why: two Android leases held at once make its kind's count 2, which lives in the lease rows an iOS nuke must not touch.
+      await harness.engine.request(androidRequest, { ownerId: "a1", requesterId: "a1" });
+      await harness.engine.request(androidRequest, { ownerId: "a2", requesterId: "a2" });
+      await flush();
       const saver = await harness.engine.request(request, {
         ownerId: "saver",
         requesterId: "saver",
@@ -243,10 +246,10 @@ describe("createLeasing: a platform nuke", () => {
           .targets.filter((target) => target.origin === "learned")
           .map(
             (target) =>
-              `${target.platform}:${target.baseline === undefined ? "plain" : "baseline"}`,
+              `${target.platform}:${target.baseline === undefined ? "plain" : "baseline"}x${target.count}`,
           )
           .sort();
-      expect(learned()).toEqual(["android:plain", "ios:baseline", "ios:plain"]);
+      expect(learned()).toEqual(["android:plainx2", "ios:baselinex1", "ios:plainx1"]);
 
       await harness.engine.nuke(false, platform);
       await harness.engine.core.passWarmPool();
@@ -255,8 +258,8 @@ describe("createLeasing: a platform nuke", () => {
         platform === undefined
           ? []
           : platform === "ios"
-            ? ["android:plain"]
-            : ["ios:baseline", "ios:plain"],
+            ? ["android:plainx2"]
+            : ["ios:baselinex1", "ios:plainx1"],
       );
     }
   });
