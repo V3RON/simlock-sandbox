@@ -12,7 +12,10 @@ import { NoopLogger } from "../ports/index.js";
 import type { DrainStore } from "./drain-store.js";
 import { errorMessage } from "../shared/index.js";
 
-export type WorkerView = z.infer<typeof workerViewSchema>;
+export type WorkerView = z.infer<typeof workerViewSchema> & {
+  /** why: set on a routing view only: this session's first catalog read failed or timed out, so routing stops waiting for it. */
+  readonly catalogReadFailed?: true;
+};
 
 export type WorkerViewSnapshot = Pick<
   WorkerView,
@@ -117,6 +120,8 @@ export class WorkerRegistry {
    * set is what `load()` restores and what `setDrained` writes back.
    */
   readonly #drained = new Set<string>();
+  /** why: workers whose first catalog read of this session failed or timed out; routing then judges requests without waiting for them (ADR 0009 §4). */
+  readonly #catalogReadFailed = new Set<string>();
   readonly #viewsChangedListeners = new Set<() => void>();
   readonly #logger: Logger;
 
@@ -155,6 +160,7 @@ export class WorkerRegistry {
         view.devices === undefined ? this.#lastPhysicalDevices.get(view.id) : undefined;
       return {
         ...view,
+        ...(this.#catalogReadFailed.has(view.id) ? { catalogReadFailed: true as const } : {}),
         ...(catalog === undefined ? {} : { catalog }),
         ...(baselines === undefined ? {} : { baselines }),
         ...(physical === undefined || physical.length === 0 ? {} : { devices: physical }),
@@ -224,6 +230,7 @@ export class WorkerRegistry {
     const { catalogReadAt: _stale, ...existing } = withoutLoad<Partial<WorkerView>>(
       this.#workers.get(workerId) ?? {},
     );
+    this.#catalogReadFailed.delete(workerId);
     const view: WorkerView = {
       ...existing,
       connection: "connected",
@@ -357,8 +364,21 @@ export class WorkerRegistry {
     const next = built.connection === "connected" ? built : withoutLoad(built);
     this.#workers.set(workerId, next);
     this.#keepLastReads(workerId, snapshot);
+    if (snapshot.catalog !== undefined) this.#catalogReadFailed.delete(workerId);
     if (grantedDevices !== undefined) this.#grantedDevices.set(workerId, grantedDevices);
     this.#warnOnLowerMaxTtl(existing, next);
+    this.#notifyViewsChanged();
+  }
+
+  /**
+   * why: a connected worker's first catalog read of this session failed or timed out, so a request
+   * stops waiting for it (ADR 0009 §4). A view that holds a catalog, or is not connected, changes nothing.
+   */
+  catalogReadFailed(workerId: string): void {
+    const view = this.#workers.get(workerId);
+    if (view === undefined || view.connection !== "connected" || view.catalog !== undefined) return;
+    if (this.#catalogReadFailed.has(workerId)) return;
+    this.#catalogReadFailed.add(workerId);
     this.#notifyViewsChanged();
   }
 
@@ -587,6 +607,7 @@ export class WorkerRegistry {
     this.#workers.delete(view.id);
     this.#grantedDevices.delete(view.id);
     this.#lastCatalog.delete(view.id);
+    this.#catalogReadFailed.delete(view.id);
     this.#lastBaselines.delete(view.id);
     this.#lastLeases.delete(view.id);
     this.#lastPhysicalDevices.delete(view.id);

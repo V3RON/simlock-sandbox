@@ -191,12 +191,67 @@ describe("assess", () => {
     });
   });
 
-  it("judges a request on the other workers when one has no catalog at all", () => {
-    const { catalog: _catalog, ...unread } = view("wrk_a", IOS, { catalogReadAt: undefined });
+  it("makes a request wait, not fail UNKNOWN_MODEL, NO_DRIVER or RUNTIME_MISSING, while a connected worker's catalog is not read yet, but not for a drained or disconnected one", () => {
+    // why: the view `WorkerRegistry.connected` builds for a worker the gateway never read, as after a gateway restart, until the link's first full refresh.
+    const unread: WorkerView = {
+      connection: "connected",
+      drained: false,
+      id: "wrk_a",
+      lastSeenAt: 1,
+    };
+    const other = view("wrk_b", { models: ["iPhone 16"], platform: "ios", runtimes: ["26.0"] });
+    const views = [unread, other];
 
-    expect(assess(REQUEST, [unread, view("wrk_b")])).toEqual({ kind: "route-or-wait" });
-    expect(rejectionOf([unread, view("wrk_b")], { ...REQUEST, model: "iPhone 99" }).code).toBe(
+    expect(assess(REQUEST, views)).toEqual({ kind: "route-or-wait" });
+    expect(assess({ model: "Pixel 9", platform: "android" }, views)).toEqual({
+      kind: "route-or-wait",
+    });
+    expect(assess({ ...REQUEST, model: "iPhone 16", osVersion: "27.0" }, views)).toEqual({
+      kind: "route-or-wait",
+    });
+
+    for (const gone of [
+      { ...unread, drained: true },
+      { ...unread, connection: "disconnected" as const },
+    ]) {
+      expect(rejectionOf([gone, other], { ...REQUEST, model: "iPhone 99" }).code).toBe(
+        "UNKNOWN_MODEL",
+      );
+    }
+  });
+
+  it("judges a request on the other workers once a connected worker's first catalog read has failed", () => {
+    const failed: WorkerView = {
+      catalogReadFailed: true,
+      connection: "connected",
+      drained: false,
+      id: "wrk_a",
+      lastSeenAt: 1,
+    };
+    const other = view("wrk_b", { models: ["iPhone 16"], platform: "ios", runtimes: ["26.0"] });
+
+    expect(rejectionOf([failed, other], { ...REQUEST, model: "iPhone 99" }).code).toBe(
       "UNKNOWN_MODEL",
+    );
+    expect(assess({ ...REQUEST, model: "iPhone 16" }, [failed, other])).toEqual({
+      kind: "route-or-wait",
+    });
+  });
+
+  it("keeps rejecting a request whose requires or except no worker meets at once while a connected worker's catalog is not read yet", () => {
+    const unread: WorkerView = {
+      connection: "connected",
+      drained: false,
+      id: "wrk_a",
+      lastSeenAt: 1,
+    };
+    const other = view("wrk_b", IOS, { capabilities: [{ name: "agent-device", state: "off" }] });
+
+    expect(rejectionOf([unread, other], { ...REQUEST, requires: ["agent-device"] }).code).toBe(
+      "CAPABILITY_MISSING",
+    );
+    expect(rejectionOf([unread, other], { ...REQUEST, except: ["no-such"] }).code).toBe(
+      "BAD_REQUEST",
     );
   });
 

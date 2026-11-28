@@ -197,7 +197,15 @@ function assessLeading(
 ): Rejection | undefined {
   if (takersOf(request, views).length === 0) return noWorker();
 
-  const known = views.filter(isKnown);
+  if (views.some(isUnread)) return undefined;
+  return assessKnown(request, views.filter(isKnown));
+}
+
+// why: the rows over the known workers' catalogs: driver, mode, model, runtime.
+function assessKnown(
+  request: RoutableRequest,
+  known: readonly WorkerView[],
+): Rejection | undefined {
   const platform = request.platform;
   if (!known.some((worker) => hasPlatform(worker, request))) {
     return {
@@ -253,7 +261,17 @@ function assessServing(
       : takers.some(
           (worker) => servesMode(worker, request) && matchRequest(worker, request) !== undefined,
         );
-  return fits ? undefined : noWorker();
+  return fits || views.some(isUnread) ? undefined : noWorker();
+}
+
+// why: a connected worker whose first catalog read has not landed (as after a gateway restart) comes by itself, so a request waits for it like for an updating worker, until that read fails or times out (ADR 0009 §4).
+function isUnread(worker: WorkerView): boolean {
+  return (
+    worker.connection === "connected" &&
+    !worker.drained &&
+    worker.catalog === undefined &&
+    worker.catalogReadFailed !== true
+  );
 }
 
 function isKnown(worker: WorkerView): boolean {

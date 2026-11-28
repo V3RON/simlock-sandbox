@@ -321,6 +321,7 @@ export class WorkerLink {
         message: errorMessage(error),
       });
       this.#countTimeout(error);
+      if (!this.#superseded()) this.options.registry.catalogReadFailed(this.workerId);
     } finally {
       this.#refreshing = false;
       const queued = this.#queuedRefresh;

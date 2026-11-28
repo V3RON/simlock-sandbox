@@ -91,7 +91,7 @@ The gateway does not queue a request no worker could ever serve. It fails at onc
 | `BASELINE_MISMATCH` | Every copy of the baseline differs from a field the request names. |
 | `BASELINE_STALE` | Every copy that fits is stale. |
 
-While a connected worker that is not drained has not sent its catalog yet, as just after a gateway restart, the request waits instead of failing with `UNKNOWN_MODEL`, `NO_DRIVER` or `RUNTIME_MISSING`: that worker may be the one that can serve it.
+While a connected worker that is not drained has not sent its catalog yet, as just after a gateway restart, the request waits instead of failing with `UNKNOWN_MODEL`, `NO_DRIVER` or `RUNTIME_MISSING`: that worker may be the one that can serve it. It waits only until that worker's first refresh fails or times out; after that the gateway judges the request on the other workers. A request with `requires` or `except` that no worker meets still fails at once.
 
 The gateway checks again while a request waits. If the last worker that could serve it disconnects or is drained, even for a moment, the request fails with `NO_CAPACITY`. If every worker that tries fails to create the device, it fails with `PROVISION_FAILED`. Exit codes are in [Errors](/simlock/docs/reference/errors).
 
